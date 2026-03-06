@@ -121,6 +121,8 @@ class SparseProximityMixin:
         self._diag_offset: Optional[int] = None
         self._n_train_samples: Optional[int] = None
         self._n_total_features: Optional[int] = None
+        self._oob_surrogate_estimators_: Optional[List[Any]] = None
+        self._oob_surrogate_leaf_matrix_: Optional[np.ndarray] = None
 
     def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "SparseProximityMixin":
         """
@@ -166,10 +168,28 @@ class SparseProximityMixin:
         """
         check_is_fitted(cast(Any, self))
 
+        self._oob_surrogate_estimators_ = None
+        self._oob_surrogate_leaf_matrix_ = None
+
         apply_fn = getattr(self, "apply", None)
         if apply_fn is None:
             raise RuntimeError("Estimator must implement apply(X) to use proximity methods.")
-        leaves = np.asarray(apply_fn(X))
+
+        leaves: Optional[np.ndarray] = None
+
+        if self.prox_method in ("oob", "rfgap"):
+            n_samples = int(len(X))
+            oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples, X=X, y=y)
+            self.oob_mask_ = oob_mask.astype(np.int8)
+            self.in_bag_counts_ = in_bag_counts.astype(np.float32)
+
+            surrogate_leaves = getattr(self, "_oob_surrogate_leaf_matrix_", None)
+            if surrogate_leaves is not None and surrogate_leaves.shape[0] == n_samples:
+                leaves = np.asarray(surrogate_leaves)
+
+        if leaves is None:
+            leaves = np.asarray(apply_fn(X))
+
         if leaves.ndim != 2:
             raise ValueError("apply(X) must return a 2D array of shape (n_samples, n_estimators)")
 
@@ -177,11 +197,6 @@ class SparseProximityMixin:
         self._n_train_samples = n_samples
         self.leaf_matrix_ = leaves
         self._leaf_encoding = self._build_leaf_encoding(leaves)
-
-        if self.prox_method in ("oob", "rfgap"):
-            oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples, X=X, y=y)
-            self.oob_mask_ = oob_mask.astype(np.int8)
-            self.in_bag_counts_ = in_bag_counts.astype(np.float32)
 
         self._build_W_matrix()
 
@@ -240,10 +255,15 @@ class SparseProximityMixin:
         """
         self._check_proximity_ready()
 
-        apply_fn = getattr(self, "apply", None)
-        if apply_fn is None:
-            raise RuntimeError("Estimator must implement apply(X) to use proximity methods.")
-        leaves_new = np.asarray(apply_fn(X_new))
+        surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
+        if _is_rotation_forest_instance(self) and surrogate_estimators is not None:
+            leaves_new = self._rotation_forest_apply_surrogates(X_new)
+        else:
+            apply_fn = getattr(self, "apply", None)
+            if apply_fn is None:
+                raise RuntimeError("Estimator must implement apply(X) to use proximity methods.")
+            leaves_new = np.asarray(apply_fn(X_new))
+
         Q_new = self._build_Q_matrix(leaves_new, is_training=False)
         W = self.W_mat
         if W is None:
@@ -448,6 +468,38 @@ class SparseProximityMixin:
             dtype=np.float32,
         )
 
+    def _rotation_forest_apply_surrogates(self, X: Any) -> np.ndarray:
+        surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
+        if surrogate_estimators is None:
+            raise RuntimeError("RotationForest surrogate estimators are not initialized.")
+
+        X_proc = self._check_X(X)
+        X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+        X_proc = X_proc[:, self._useful_atts]
+        X_proc = (X_proc - self._min) / self._ptp
+
+        leaves: List[np.ndarray] = []
+        for t, surrogate in enumerate(surrogate_estimators):
+            pcas = self._pcas[t]
+            groups = self._groups[t]
+
+            X_t = np.concatenate(
+                [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
+                axis=1,
+            )
+            X_t = X_t.astype(np.float32)
+            X_t = np.nan_to_num(
+                X_t,
+                copy=False,
+                nan=0.0,
+                posinf=float(np.finfo(np.float32).max),
+                neginf=float(np.finfo(np.float32).min),
+            )
+
+            leaves.append(surrogate.apply(X_t))
+
+        return np.column_stack(leaves)
+
     def _compute_bootstrap_stats(
         self,
         n_samples: int,
@@ -475,27 +527,74 @@ class SparseProximityMixin:
         if _is_rotation_forest_instance(self):
             if X is not None and y is not None:
                 try:
-                    oob_model = clone(self)
-                    if hasattr(oob_model, "_fit_rotf") and hasattr(oob_model, "_train_probas_for_estimator"):
-                        y_arr = np.asarray(y)
-                        X_t = oob_model._fit_rotf(X, y_arr, save_transformed_data=True)
+                    train_estimate_fn = getattr(self, "_train_probas_for_estimator", None)
+                    if train_estimate_fn is None:
+                        train_estimate_fn = getattr(self, "_train_preds_for_estimator", None)
 
-                        rng = check_random_state(getattr(oob_model, "random_state", None))
+                    if callable(train_estimate_fn):
+                        y_arr = np.asarray(y)
+
+                        X_proc = self._check_X(X)
+                        X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+                        X_proc = X_proc[:, self._useful_atts]
+                        X_proc = (X_proc - self._min) / self._ptp
+
+                        X_t = [
+                            np.nan_to_num(
+                                np.concatenate(
+                                    [
+                                        self._pcas[t][g_idx].transform(X_proc[:, group])
+                                        for g_idx, group in enumerate(self._groups[t])
+                                    ],
+                                    axis=1,
+                                ).astype(np.float32),
+                                copy=False,
+                                nan=0.0,
+                                posinf=float(np.finfo(np.float32).max),
+                                neginf=float(np.finfo(np.float32).min),
+                            )
+                            for t in range(n_trees)
+                        ]
+
+                        n_cases = int(getattr(self, "n_cases_", n_samples))
+                        if n_cases != n_samples:
+                            raise ValueError("RotationForest n_cases_ does not match fit sample size.")
+
+                        rng = check_random_state(getattr(self, "random_state", None))
                         max_int = np.iinfo(np.int32).max
+                        surrogate_estimators: List[Any] = []
+                        surrogate_leaves: List[np.ndarray] = []
+
+                        base_estimator = getattr(self, "_base_estimator", None)
 
                         for t in range(n_trees):
-                            est_rng = check_random_state(rng.randint(max_int))
+                            est_seed = rng.randint(max_int)
+                            est_rng = check_random_state(est_seed)
 
-                            state = est_rng.get_state()
-                            sampled = est_rng.choice(n_samples, size=n_samples, replace=True)
-                            est_rng.set_state(state)
+                            sampled = est_rng.choice(n_cases, size=n_cases, replace=True)
 
-                            _, oob_idx = oob_model._train_probas_for_estimator(X_t, y_arr, t, est_rng)
+                            if base_estimator is not None:
+                                surrogate = clone(base_estimator)
+                            else:
+                                surrogate = clone(self.estimators_[t])
+                            if hasattr(surrogate, "random_state"):
+                                surrogate.random_state = est_rng
+                            surrogate.fit(X_t[t][sampled], y_arr[sampled])
+                            surrogate_estimators.append(surrogate)
+                            surrogate_leaves.append(np.asarray(surrogate.apply(X_t[t])))
+
+                            sampled_unique = np.unique(sampled)
+                            oob_col = np.ones(n_cases, dtype=np.int8)
+                            oob_col[sampled_unique] = 0
+                            oob_idx = np.flatnonzero(oob_col == 1)
 
                             idx, cnt = np.unique(sampled, return_counts=True)
                             in_bag_counts[idx, t] = cnt.astype(np.float32)
                             oob_mask[:, t] = 0
                             oob_mask[np.asarray(oob_idx, dtype=np.int64), t] = 1
+
+                        self._oob_surrogate_estimators_ = surrogate_estimators
+                        self._oob_surrogate_leaf_matrix_ = np.column_stack(surrogate_leaves)
 
                         return oob_mask, in_bag_counts
                 except Exception:
@@ -691,6 +790,108 @@ class _RotationForestOOBAdapter:
         if y is None:
             return
         y_arr = np.asarray(y)
+
+        # Prefer OOB attributes computed via RotationForest's bootstrap
+        # train-estimate routines, driven by the same per-tree RNG stream used
+        # for RF-GAP OOB extraction.
+        try:
+            train_proba_fn = getattr(self, "_train_probas_for_estimator", None)
+            train_pred_fn = getattr(self, "_train_preds_for_estimator", None)
+            n_trees = int(getattr(self, "_n_estimators", 0))
+
+            if (
+                hasattr(self, "estimators_")
+                and n_trees > 0
+                and hasattr(self, "_pcas")
+                and hasattr(self, "_groups")
+                and hasattr(self, "_check_X")
+                and (callable(train_proba_fn) or callable(train_pred_fn))
+            ):
+                X_proc = self._check_X(X)
+                X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+                X_proc = X_proc[:, self._useful_atts]
+                X_proc = (X_proc - self._min) / self._ptp
+
+                X_t = [
+                    np.nan_to_num(
+                        np.concatenate(
+                            [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
+                            axis=1,
+                        ).astype(np.float32),
+                        copy=False,
+                        nan=0.0,
+                        posinf=float(np.finfo(np.float32).max),
+                        neginf=float(np.finfo(np.float32).min),
+                    )
+                    for pcas, groups in zip(self._pcas, self._groups)
+                ]
+
+                rng = check_random_state(getattr(self, "random_state", None))
+                max_int = np.iinfo(np.int32).max
+                n_samples = X_proc.shape[0]
+
+                if hasattr(self, "classes_") and callable(train_proba_fn):
+                    p = [
+                        train_proba_fn(
+                            X_t,
+                            y_arr,
+                            t,
+                            check_random_state(rng.randint(max_int)),
+                        )
+                        for t in range(n_trees)
+                    ]
+                    y_probas, oobs = zip(*p)
+
+                    results = np.sum(y_probas, axis=0)
+                    divisors = np.zeros(n_samples, dtype=np.float64)
+                    for oob in oobs:
+                        for inst in oob:
+                            divisors[inst] += 1.0
+
+                    n_classes = int(getattr(self, "n_classes_", 0))
+                    for i in range(n_samples):
+                        if divisors[i] == 0:
+                            results[i] = np.ones(n_classes, dtype=np.float64) * (1.0 / max(n_classes, 1))
+                        else:
+                            results[i] = results[i] / (np.ones(n_classes, dtype=np.float64) * divisors[i])
+
+                    classes = np.asarray(self.classes_)
+                    self.oob_decision_function_ = np.asarray(results, dtype=np.float64)
+                    y_pred = classes[np.argmax(self.oob_decision_function_, axis=1)]
+                    self.oob_score_ = float(accuracy_score(y_arr, y_pred))
+                    return
+
+                if callable(train_pred_fn):
+                    p = [
+                        train_pred_fn(
+                            X_t,
+                            y_arr,
+                            t,
+                            check_random_state(rng.randint(max_int)),
+                        )
+                        for t in range(n_trees)
+                    ]
+                    y_preds, oobs = zip(*p)
+
+                    results = np.sum(y_preds, axis=0)
+                    divisors = np.zeros(n_samples, dtype=np.float64)
+                    for oob in oobs:
+                        for inst in oob:
+                            divisors[inst] += 1.0
+
+                    label_average = float(getattr(self, "_label_average", np.mean(y_arr)))
+                    for i in range(n_samples):
+                        if divisors[i] == 0:
+                            results[i] = label_average
+                        else:
+                            results[i] = results[i] / divisors[i]
+
+                    self.oob_prediction_ = np.asarray(results, dtype=np.float64)
+                    self.oob_score_ = float(r2_score(y_arr, self.oob_prediction_))
+                    return
+        except Exception:
+            pass
+
         try:
             oob_model = clone(self)
 
