@@ -7,6 +7,9 @@ from typing import Any, List, Literal, Optional, Protocol, Sequence, Tuple, Type
 
 import numpy as np
 from scipy import sparse
+from sklearn.base import clone
+from sklearn.metrics import accuracy_score, r2_score
+from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted, validate_data
 
 try:
@@ -22,6 +25,18 @@ MatrixLike = Union[np.ndarray, sparse.csr_matrix]
 ProxMethod = Literal["original", "oob", "rfgap"]
 MatrixType = Literal["sparse", "dense"]
 SymmMode = Literal["arithmetic", "geometric", "none", None]
+
+
+def _is_rotation_forest_instance(obj: Any) -> bool:
+    if any("RotationForest" in cls.__name__ for cls in type(obj).mro()):
+        return True
+    return all(hasattr(obj, attr) for attr in ("_pcas", "_groups", "_useful_atts"))
+
+
+def _is_rotation_forest_class(base_cls: Type[Any]) -> bool:
+    if any("RotationForest" in cls.__name__ for cls in base_cls.mro()):
+        return True
+    return all(hasattr(base_cls, attr) for attr in ("fit_predict", "fit_predict_proba"))
 
 
 @runtime_checkable
@@ -131,10 +146,16 @@ class SparseProximityMixin:
         else:
             base_fit(X, y, **fit_kwargs)
 
-        self.prox_fit(X)
+        self.prox_fit(X, y)
+        self._set_rotation_forest_oob_attributes(X, y)
         return self
 
-    def prox_fit(self, X: Any) -> None:
+    def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
+        super_hook = getattr(super(), "_set_rotation_forest_oob_attributes", None)
+        if callable(super_hook):
+            super_hook(X, y)
+
+    def prox_fit(self, X: Any, y: Optional[Any] = None) -> None:
         """
         Build sparse factors required for proximity computations.
 
@@ -158,7 +179,7 @@ class SparseProximityMixin:
         self._leaf_encoding = self._build_leaf_encoding(leaves)
 
         if self.prox_method in ("oob", "rfgap"):
-            oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples)
+            oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples, X=X, y=y)
             self.oob_mask_ = oob_mask.astype(np.int8)
             self.in_bag_counts_ = in_bag_counts.astype(np.float32)
 
@@ -310,7 +331,7 @@ class SparseProximityMixin:
             raise RuntimeError("Cannot build W before leaf structures are initialized.")
 
         n_samples, n_trees = self.leaf_matrix_.shape
-        rows, cols, tree_ids = self._map_leaves_to_global(self.leaf_matrix_)
+        rows, cols, tree_ids = self._map_leaves_to_global(self.leaf_matrix_) # TODO: check tree_ids usage for proximity forests case
         if rows.size == 0:
             raise RuntimeError("No valid leaf mappings found while building W matrix.")
 
@@ -388,7 +409,7 @@ class SparseProximityMixin:
         rows, cols, tree_ids = self._map_leaves_to_global(leaves)
 
         if self.prox_method == "original":
-            vals = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
+            vals = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32) #TODO: Verify need for np.sqrt() here
 
         elif self.prox_method == "oob":
             vals = np.full(rows.shape[0], np.sqrt(n_trees) / n_trees, dtype=np.float32)
@@ -427,7 +448,12 @@ class SparseProximityMixin:
             dtype=np.float32,
         )
 
-    def _compute_bootstrap_stats(self, n_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+    def _compute_bootstrap_stats(
+        self,
+        n_samples: int,
+        X: Optional[Any] = None,
+        y: Optional[Any] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute OOB mask and in-bag multiplicities for each sample/tree.
 
@@ -445,6 +471,49 @@ class SparseProximityMixin:
         n_trees = len(estimators)
         oob_mask = np.zeros((n_samples, n_trees), dtype=np.int8)
         in_bag_counts = np.zeros((n_samples, n_trees), dtype=np.float32)
+
+        if _is_rotation_forest_instance(self):
+            if X is not None and y is not None:
+                try:
+                    oob_model = clone(self)
+                    if hasattr(oob_model, "_fit_rotf") and hasattr(oob_model, "_train_probas_for_estimator"):
+                        y_arr = np.asarray(y)
+                        X_t = oob_model._fit_rotf(X, y_arr, save_transformed_data=True)
+
+                        rng = check_random_state(getattr(oob_model, "random_state", None))
+                        max_int = np.iinfo(np.int32).max
+
+                        for t in range(n_trees):
+                            est_rng = check_random_state(rng.randint(max_int))
+
+                            state = est_rng.get_state()
+                            sampled = est_rng.choice(n_samples, size=n_samples, replace=True)
+                            est_rng.set_state(state)
+
+                            _, oob_idx = oob_model._train_probas_for_estimator(X_t, y_arr, t, est_rng)
+
+                            idx, cnt = np.unique(sampled, return_counts=True)
+                            in_bag_counts[idx, t] = cnt.astype(np.float32)
+                            oob_mask[:, t] = 0
+                            oob_mask[np.asarray(oob_idx, dtype=np.int64), t] = 1
+
+                        return oob_mask, in_bag_counts
+                except Exception:
+                    pass
+
+            rng = check_random_state(getattr(self, "random_state", None))
+            max_int = np.iinfo(np.int32).max
+
+            for t in range(n_trees):
+                est_rng = check_random_state(rng.randint(max_int))
+                sampled = est_rng.choice(n_samples, size=n_samples, replace=True)
+
+                idx, cnt = np.unique(sampled, return_counts=True)
+                in_bag_counts[idx, t] = cnt.astype(np.float32)
+                oob_mask[:, t] = 1
+                oob_mask[idx, t] = 0
+
+            return oob_mask, in_bag_counts
 
         estimators_samples = getattr(self, "estimators_samples_", None)
         if estimators_samples is not None:
@@ -531,18 +600,21 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
     ...     pass
     """
 
-    needs_rotation_adapter = not callable(getattr(base_cls, "apply", None)) and any(
-        "RotationForest" in cls.__name__ for cls in base_cls.mro()
-    )
+    is_rotation_forest = _is_rotation_forest_class(base_cls)
+    needs_rotation_apply_adapter = is_rotation_forest and not callable(getattr(base_cls, "apply", None))
 
     wrapped_base: Type[Any] = base_cls
-    if needs_rotation_adapter:
-        class RotationForestWithApply(_RotationForestApplyAdapter, base_cls):
-            pass
+    if is_rotation_forest:
+        if needs_rotation_apply_adapter:
+            class RotationForestWithAdapters(_RotationForestOOBAdapter, _RotationForestApplyAdapter, base_cls):
+                pass
+        else:
+            class RotationForestWithAdapters(_RotationForestOOBAdapter, base_cls):
+                pass
 
-        RotationForestWithApply.__name__ = f"{base_cls.__name__}WithApplyAdapter"
-        RotationForestWithApply.__qualname__ = RotationForestWithApply.__name__
-        wrapped_base = RotationForestWithApply
+        RotationForestWithAdapters.__name__ = f"{base_cls.__name__}WithApplyAdapter"
+        RotationForestWithAdapters.__qualname__ = RotationForestWithAdapters.__name__
+        wrapped_base = RotationForestWithAdapters
 
     class ProximityEnabled(SparseProximityMixin, wrapped_base):
         def __init__(
@@ -605,9 +677,36 @@ class _RotationForestApplyAdapter:
                 X_t,
                 copy=False,
                 nan=0.0,
-                posinf=np.finfo(np.float32).max,
-                neginf=np.finfo(np.float32).min,
+                posinf=float(np.finfo(np.float32).max),
+                neginf=float(np.finfo(np.float32).min),
             )
             leaves.append(estimator.apply(X_t))
 
         return np.column_stack(leaves)
+
+
+class _RotationForestOOBAdapter:
+    def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
+        if y is None:
+            return
+        y_arr = np.asarray(y)
+        try:
+            oob_model = clone(self)
+
+            if hasattr(self, "classes_") and hasattr(oob_model, "fit_predict_proba"):
+                oob_proba = np.asarray(oob_model.fit_predict_proba(X, y_arr), dtype=np.float64)
+                classes = np.asarray(getattr(oob_model, "classes_", self.classes_))
+
+                self.oob_decision_function_ = oob_proba
+                pred_idx = np.argmax(oob_proba, axis=1)
+                y_pred = classes[pred_idx]
+                self.oob_score_ = float(accuracy_score(y_arr, y_pred))
+                return
+
+            if hasattr(oob_model, "fit_predict"):
+                oob_prediction = np.asarray(oob_model.fit_predict(X, y_arr), dtype=np.float64)
+                self.oob_prediction_ = oob_prediction
+                self.oob_score_ = float(r2_score(y_arr, oob_prediction))
+                return
+        except Exception:
+            pass
