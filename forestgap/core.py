@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import inspect
 from inspect import Parameter, Signature
 from typing import Any, List, Literal, Optional, Protocol, Sequence, Tuple, Type, TypeVar, Union, cast, runtime_checkable
+import warnings
+from warnings import warn
 
 import numpy as np
 from scipy import sparse
@@ -11,6 +14,14 @@ from sklearn.base import clone
 from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted, validate_data
+
+# aeon RotationForest still uses sklearn's deprecated _validate_data path on
+# current releases; suppress this single known deprecation at library boundary.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*BaseEstimator\._validate_data.*",
+    category=FutureWarning,
+)
 
 try:
     from sklearn.ensemble import _forest as _sk_forest
@@ -27,16 +38,40 @@ MatrixType = Literal["sparse", "dense"]
 SymmMode = Literal["arithmetic", "geometric", "none", None]
 
 
+@contextmanager
+def _suppress_base_validate_data_futurewarning() -> Any:
+    """Suppress aeon/sklearn deprecation warning for BaseEstimator._validate_data."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*BaseEstimator\._validate_data.*",
+            category=FutureWarning,
+        )
+        yield
+
+
 def _is_rotation_forest_instance(obj: Any) -> bool:
     if any("RotationForest" in cls.__name__ for cls in type(obj).mro()):
         return True
     return all(hasattr(obj, attr) for attr in ("_pcas", "_groups", "_useful_atts"))
 
 
+def _is_isolation_forest_instance(obj: Any) -> bool:
+    if any("IsolationForest" in cls.__name__ for cls in type(obj).mro()):
+        return True
+    return hasattr(obj, "estimators_features_") and hasattr(obj, "score_samples")
+
+
 def _is_rotation_forest_class(base_cls: Type[Any]) -> bool:
     if any("RotationForest" in cls.__name__ for cls in base_cls.mro()):
         return True
     return all(hasattr(base_cls, attr) for attr in ("fit_predict", "fit_predict_proba"))
+
+
+def _is_isolation_forest_class(base_cls: Type[Any]) -> bool:
+    if any("IsolationForest" in cls.__name__ for cls in base_cls.mro()):
+        return True
+    return hasattr(base_cls, "score_samples") and hasattr(base_cls, "decision_function")
 
 
 @runtime_checkable
@@ -143,10 +178,17 @@ class SparseProximityMixin:
             Fitted estimator with sparse proximity factors cached.
         """
         base_fit = getattr(super(), "fit")
-        if y is None:
-            base_fit(X, **fit_kwargs)
+        if _is_rotation_forest_instance(self):
+            with _suppress_base_validate_data_futurewarning():
+                if y is None:
+                    base_fit(X, **fit_kwargs)
+                else:
+                    base_fit(X, y, **fit_kwargs)
         else:
-            base_fit(X, y, **fit_kwargs)
+            if y is None:
+                base_fit(X, **fit_kwargs)
+            else:
+                base_fit(X, y, **fit_kwargs)
 
         self.prox_fit(X, y)
         self._set_rotation_forest_oob_attributes(X, y)
@@ -156,6 +198,13 @@ class SparseProximityMixin:
         super_hook = getattr(super(), "_set_rotation_forest_oob_attributes", None)
         if callable(super_hook):
             super_hook(X, y)
+
+    def predict(self, X: Any) -> Any:
+        base_predict = getattr(super(), "predict")
+        if _is_rotation_forest_instance(self):
+            with _suppress_base_validate_data_futurewarning():
+                return base_predict(X)
+        return base_predict(X)
 
     def prox_fit(self, X: Any, y: Optional[Any] = None) -> None:
         """
@@ -473,30 +522,31 @@ class SparseProximityMixin:
         if surrogate_estimators is None:
             raise RuntimeError("RotationForest surrogate estimators are not initialized.")
 
-        X_proc = self._check_X(X)
-        X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-        X_proc = X_proc[:, self._useful_atts]
-        X_proc = (X_proc - self._min) / self._ptp
+        with _suppress_base_validate_data_futurewarning():
+            X_proc = self._check_X(X)
+            X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+            X_proc = X_proc[:, self._useful_atts]
+            X_proc = (X_proc - self._min) / self._ptp
 
-        leaves: List[np.ndarray] = []
-        for t, surrogate in enumerate(surrogate_estimators):
-            pcas = self._pcas[t]
-            groups = self._groups[t]
+            leaves: List[np.ndarray] = []
+            for t, surrogate in enumerate(surrogate_estimators):
+                pcas = self._pcas[t]
+                groups = self._groups[t]
 
-            X_t = np.concatenate(
-                [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-                axis=1,
-            )
-            X_t = X_t.astype(np.float32)
-            X_t = np.nan_to_num(
-                X_t,
-                copy=False,
-                nan=0.0,
-                posinf=float(np.finfo(np.float32).max),
-                neginf=float(np.finfo(np.float32).min),
-            )
+                X_t = np.concatenate(
+                    [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
+                    axis=1,
+                )
+                X_t = X_t.astype(np.float32)
+                X_t = np.nan_to_num(
+                    X_t,
+                    copy=False,
+                    nan=0.0,
+                    posinf=float(np.finfo(np.float32).max),
+                    neginf=float(np.finfo(np.float32).min),
+                )
 
-            leaves.append(surrogate.apply(X_t))
+                leaves.append(surrogate.apply(X_t))
 
         return np.column_stack(leaves)
 
@@ -534,27 +584,28 @@ class SparseProximityMixin:
                     if callable(train_estimate_fn):
                         y_arr = np.asarray(y)
 
-                        X_proc = self._check_X(X)
-                        X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-                        X_proc = X_proc[:, self._useful_atts]
-                        X_proc = (X_proc - self._min) / self._ptp
+                        with _suppress_base_validate_data_futurewarning():
+                            X_proc = self._check_X(X)
+                            X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+                            X_proc = X_proc[:, self._useful_atts]
+                            X_proc = (X_proc - self._min) / self._ptp
 
-                        X_t = [
-                            np.nan_to_num(
-                                np.concatenate(
-                                    [
-                                        self._pcas[t][g_idx].transform(X_proc[:, group])
-                                        for g_idx, group in enumerate(self._groups[t])
-                                    ],
-                                    axis=1,
-                                ).astype(np.float32),
-                                copy=False,
-                                nan=0.0,
-                                posinf=float(np.finfo(np.float32).max),
-                                neginf=float(np.finfo(np.float32).min),
-                            )
-                            for t in range(n_trees)
-                        ]
+                            X_t = [
+                                np.nan_to_num(
+                                    np.concatenate(
+                                        [
+                                            self._pcas[t][g_idx].transform(X_proc[:, group])
+                                            for g_idx, group in enumerate(self._groups[t])
+                                        ],
+                                        axis=1,
+                                    ).astype(np.float32),
+                                    copy=False,
+                                    nan=0.0,
+                                    posinf=float(np.finfo(np.float32).max),
+                                    neginf=float(np.finfo(np.float32).min),
+                                )
+                                for t in range(n_trees)
+                            ]
 
                         n_cases = int(getattr(self, "n_cases_", n_samples))
                         if n_cases != n_samples:
@@ -571,6 +622,21 @@ class SparseProximityMixin:
                             est_seed = rng.randint(max_int)
                             est_rng = check_random_state(est_seed)
 
+                            # Pull OOB indices from RotationForest's own
+                            # train-estimate routine so masks match the
+                            # original model definition exactly.
+                            with _suppress_base_validate_data_futurewarning():
+                                train_result = train_estimate_fn(
+                                    X_t,
+                                    y_arr,
+                                    t,
+                                    check_random_state(est_seed),
+                                )
+                            if not isinstance(train_result, (tuple, list)) or len(train_result) != 2:
+                                raise RuntimeError("RotationForest train-estimate function returned an unexpected result.")
+                            oob_idx_model = train_result[1]
+                            oob_idx_model = np.asarray(oob_idx_model, dtype=np.int64)
+
                             sampled = est_rng.choice(n_cases, size=n_cases, replace=True)
 
                             if base_estimator is not None:
@@ -583,22 +649,17 @@ class SparseProximityMixin:
                             surrogate_estimators.append(surrogate)
                             surrogate_leaves.append(np.asarray(surrogate.apply(X_t[t])))
 
-                            sampled_unique = np.unique(sampled)
-                            oob_col = np.ones(n_cases, dtype=np.int8)
-                            oob_col[sampled_unique] = 0
-                            oob_idx = np.flatnonzero(oob_col == 1)
-
                             idx, cnt = np.unique(sampled, return_counts=True)
                             in_bag_counts[idx, t] = cnt.astype(np.float32)
                             oob_mask[:, t] = 0
-                            oob_mask[np.asarray(oob_idx, dtype=np.int64), t] = 1
+                            oob_mask[oob_idx_model, t] = 1
 
                         self._oob_surrogate_estimators_ = surrogate_estimators
                         self._oob_surrogate_leaf_matrix_ = np.column_stack(surrogate_leaves)
 
                         return oob_mask, in_bag_counts
                 except Exception:
-                    pass
+                    raise
 
             rng = check_random_state(getattr(self, "random_state", None))
             max_int = np.iinfo(np.int32).max
@@ -617,6 +678,19 @@ class SparseProximityMixin:
         estimators_samples = getattr(self, "estimators_samples_", None)
         if estimators_samples is not None:
             for t, sample_indices in enumerate(estimators_samples):
+                idx, cnt = np.unique(np.asarray(sample_indices), return_counts=True)
+                in_bag_counts[idx, t] = cnt.astype(np.float32)
+                oob_mask[:, t] = 1
+                oob_mask[idx, t] = 0
+            return oob_mask, in_bag_counts
+
+        get_indices_fn = getattr(self, "_get_estimators_indices", None)
+        if callable(get_indices_fn):
+            for t, estimators_index in enumerate(cast(Any, get_indices_fn()) or []):
+                sample_indices = estimators_index
+                if isinstance(estimators_index, tuple) and len(estimators_index) == 2:
+                    sample_indices = estimators_index[1]
+
                 idx, cnt = np.unique(np.asarray(sample_indices), return_counts=True)
                 in_bag_counts[idx, t] = cnt.astype(np.float32)
                 oob_mask[:, t] = 1
@@ -701,7 +775,9 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
     """
 
     is_rotation_forest = _is_rotation_forest_class(base_cls)
+    is_isolation_forest = _is_isolation_forest_class(base_cls)
     needs_rotation_apply_adapter = is_rotation_forest and not callable(getattr(base_cls, "apply", None))
+    needs_isolation_apply_adapter = is_isolation_forest and not callable(getattr(base_cls, "apply", None))
 
     wrapped_base: Type[Any] = base_cls
     if is_rotation_forest:
@@ -715,6 +791,13 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
         RotationForestWithAdapters.__name__ = f"{base_cls.__name__}WithApplyAdapter"
         RotationForestWithAdapters.__qualname__ = RotationForestWithAdapters.__name__
         wrapped_base = RotationForestWithAdapters
+    elif is_isolation_forest and needs_isolation_apply_adapter:
+        class IsolationForestWithAdapters(_IsolationForestApplyAdapter, base_cls):
+            pass
+
+        IsolationForestWithAdapters.__name__ = f"{base_cls.__name__}WithApplyAdapter"
+        IsolationForestWithAdapters.__qualname__ = IsolationForestWithAdapters.__name__
+        wrapped_base = IsolationForestWithAdapters
 
     class ProximityEnabled(SparseProximityMixin, wrapped_base):
         def __init__(
@@ -728,6 +811,45 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
             **kwargs: Any,
         ) -> None:
             base_sig = inspect.signature(base_cls.__init__)
+            has_oob_param = "oob_score" in base_sig.parameters
+
+            # Determine wrapper-level oob_score request with sane defaults.
+            if "oob_score" in kwargs:
+                requested_oob_score = bool(kwargs["oob_score"])
+            elif has_oob_param and base_sig.parameters["oob_score"].default is not inspect._empty:
+                requested_oob_score = bool(base_sig.parameters["oob_score"].default)
+            elif is_rotation_forest:
+                requested_oob_score = True
+            else:
+                requested_oob_score = False
+
+            # Support user-passed oob_score even for classes that do not natively
+            # expose it (e.g., aeon RotationForest).
+            if not has_oob_param and "oob_score" in kwargs:
+                kwargs.pop("oob_score")
+
+            # Quietly disable incompatible bootstrap/oob combinations instead of
+            # propagating model-specific ValueError in adapter usage.
+            effective_oob_score = requested_oob_score
+            if has_oob_param:
+                bootstrap_param = base_sig.parameters.get("bootstrap")
+                bootstrap_val = kwargs.get("bootstrap", None)
+                if bootstrap_val is None and bootstrap_param is not None and bootstrap_param.default is not inspect._empty:
+                    bootstrap_val = bootstrap_param.default
+
+                if requested_oob_score and bootstrap_val is False:
+                    kwargs["oob_score"] = False
+                    effective_oob_score = False
+                elif "oob_score" in kwargs:
+                    kwargs["oob_score"] = bool(kwargs["oob_score"])
+                    effective_oob_score = bool(kwargs["oob_score"])
+
+            # IsolationForest does not provide a meaningful supervised-style OOB
+            # score path for this mixin; keep it as a quiet no-op flag.
+            if is_isolation_forest and has_oob_param and "oob_score" not in kwargs:
+                kwargs["oob_score"] = False
+                effective_oob_score = False
+
             bound = base_sig.bind_partial(self, *args, **kwargs)
             base_cls.__init__(*bound.args, **bound.kwargs)
             self._init_sparse_proximity(
@@ -737,6 +859,12 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
                 symm_mode=symm_mode,
                 max_normalize=max_normalize,
             )
+            if is_rotation_forest:
+                self._rotation_oob_score = bool(effective_oob_score)
+            if is_isolation_forest:
+                self._isolation_oob_score = bool(requested_oob_score)
+                effective_oob_score = False
+            self.oob_score = bool(effective_oob_score)
 
     base_sig = inspect.signature(base_cls.__init__)
     base_params = [p for n, p in base_sig.parameters.items() if n != "self"]
@@ -747,6 +875,8 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
         Parameter("symm_mode", kind=Parameter.KEYWORD_ONLY, default=None),
         Parameter("max_normalize", kind=Parameter.KEYWORD_ONLY, default=False),
     ]
+    if (is_rotation_forest or is_isolation_forest) and "oob_score" not in base_sig.parameters:
+        prox_params.append(Parameter("oob_score", kind=Parameter.KEYWORD_ONLY, default=True))
     init_sig = Signature(parameters=[Parameter("self", kind=Parameter.POSITIONAL_OR_KEYWORD)] + base_params + prox_params)
     ProximityEnabled.__init__.__signature__ = init_sig
 
@@ -756,37 +886,111 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
 
 
 class _RotationForestApplyAdapter:
+    # def apply(self, X):
+    #     X_proc = self._check_X(X)
+    #     X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+    #     X_proc = X_proc[:, self._useful_atts]
+    #     X_proc = (X_proc - self._min) / self._ptp
+
+    #     leaves = []
+    #     for i in range(self._n_estimators):
+    #         estimator = self.estimators_[i]
+    #         pcas = self._pcas[i]
+    #         groups = self._groups[i]
+
+    #         X_t = np.concatenate(
+    #             [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
+    #             axis=1,
+    #         )
+    #         X_t = X_t.astype(np.float32)
+    #         X_t = np.nan_to_num(
+    #             X_t,
+    #             copy=False,
+    #             nan=0.0,
+    #             posinf=float(np.finfo(np.float32).max),
+    #             neginf=float(np.finfo(np.float32).min),
+    #         )
+    #         leaves.append(estimator.apply(X_t))
+
+    #     return np.column_stack(leaves)
+
+    # CHAT Version
     def apply(self, X):
-        X_proc = self._check_X(X)
-        X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-        X_proc = X_proc[:, self._useful_atts]
-        X_proc = (X_proc - self._min) / self._ptp
+        """
+        Return terminal node indices for each sample and each estimator.
 
-        leaves = []
-        for i in range(self._n_estimators):
-            estimator = self.estimators_[i]
-            pcas = self._pcas[i]
-            groups = self._groups[i]
+        Returns
+        -------
+        nodes : np.ndarray, shape=(n_samples, n_estimators)
+            nodes[i, j] is the terminal node id for sample i in estimator j.
+        """
+        if not hasattr(self, "_is_fitted") or not self._is_fitted:
+            from sklearn.exceptions import NotFittedError
+            raise NotFittedError("This RotationForestClassifier instance is not fitted yet.")
 
-            X_t = np.concatenate(
-                [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-                axis=1,
-            )
+        # same input checks / preprocessing used in predict_proba
+        with _suppress_base_validate_data_futurewarning():
+            X = self._check_X(X)
+            from sklearn.utils.validation import validate_data
+            X = validate_data(self, X=X, reset=False, accept_sparse=False)
+
+        # remove attributes that were dropped at fit
+        X = X[:, self._useful_atts]
+
+        # normalize using stored min/ptp from training
+        X = (X - self._min) / self._ptp
+
+        # for each estimator, build its transformed feature matrix and call .apply()
+        n_samples = X.shape[0]
+        n_estimators = self._n_estimators
+        nodes = np.empty((n_samples, n_estimators), dtype=np.int64)
+
+        # optional: use joblib to parallelize if you want speed
+        from joblib import Parallel, delayed
+
+        def _apply_est(i):
+            pcas = self._pcas[i]      # list of PCA objects used for estimator i
+            groups = self._groups[i]  # list of attribute index arrays for estimator i
+            # reconstruct transformed features for this estimator
+            X_t = np.concatenate([pcas[j].transform(X[:, grp]) for j, grp in enumerate(groups)], axis=1)
             X_t = X_t.astype(np.float32)
-            X_t = np.nan_to_num(
-                X_t,
-                copy=False,
-                nan=0.0,
-                posinf=float(np.finfo(np.float32).max),
-                neginf=float(np.finfo(np.float32).min),
-            )
-            leaves.append(estimator.apply(X_t))
+            X_t = np.nan_to_num(X_t, False, 0, np.finfo(np.float32).max, np.finfo(np.float32).min)
+            return self.estimators_[i].apply(X_t)
+
+        results = Parallel(n_jobs=self._n_jobs, prefer="threads")(
+            delayed(_apply_est)(i) for i in range(n_estimators)
+        )
+
+        # results is list of length n_estimators, each shape (n_samples,)
+        # stack as (n_samples, n_estimators)
+        nodes = np.column_stack(results)
+        return nodes
+
+
+class _IsolationForestApplyAdapter:
+    def apply(self, X: Any) -> np.ndarray:
+        X_checked = validate_data(self, X=X, reset=False, accept_sparse=True)
+
+        estimators = getattr(self, "estimators_", None)
+        if estimators is None:
+            raise RuntimeError("IsolationForest estimators_ are not initialized.")
+
+        features_per_estimator = getattr(self, "estimators_features_", None)
+        if features_per_estimator is None:
+            raise RuntimeError("IsolationForest estimators_features_ are not initialized.")
+
+        leaves: List[np.ndarray] = []
+        for est, features in zip(estimators, features_per_estimator):
+            X_sub = X_checked[:, features]
+            leaves.append(np.asarray(est.apply(X_sub)))
 
         return np.column_stack(leaves)
 
-
 class _RotationForestOOBAdapter:
     def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
+        if not bool(getattr(self, "_rotation_oob_score", True)):
+            return
+
         if y is None:
             return
         y_arr = np.asarray(y)
@@ -807,39 +1011,102 @@ class _RotationForestOOBAdapter:
                 and hasattr(self, "_check_X")
                 and (callable(train_proba_fn) or callable(train_pred_fn))
             ):
-                X_proc = self._check_X(X)
-                X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-                X_proc = X_proc[:, self._useful_atts]
-                X_proc = (X_proc - self._min) / self._ptp
+                with _suppress_base_validate_data_futurewarning():
+                    X_proc = self._check_X(X)
+                    X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
+                    X_proc = X_proc[:, self._useful_atts]
+                    X_proc = (X_proc - self._min) / self._ptp
 
-                X_t = [
-                    np.nan_to_num(
-                        np.concatenate(
-                            [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-                            axis=1,
-                        ).astype(np.float32),
-                        copy=False,
-                        nan=0.0,
-                        posinf=float(np.finfo(np.float32).max),
-                        neginf=float(np.finfo(np.float32).min),
-                    )
-                    for pcas, groups in zip(self._pcas, self._groups)
-                ]
+                    X_t = [
+                        np.nan_to_num(
+                            np.concatenate(
+                                [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
+                                axis=1,
+                            ).astype(np.float32),
+                            copy=False,
+                            nan=0.0,
+                            posinf=float(np.finfo(np.float32).max),
+                            neginf=float(np.finfo(np.float32).min),
+                        )
+                        for pcas, groups in zip(self._pcas, self._groups)
+                    ]
 
                 rng = check_random_state(getattr(self, "random_state", None))
                 max_int = np.iinfo(np.int32).max
                 n_samples = X_proc.shape[0]
+                surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
+                oob_mask = getattr(self, "oob_mask_", None)
+
+                if surrogate_estimators is not None and oob_mask is not None:
+                    divisors = oob_mask.sum(axis=1).astype(np.float64)
+
+                    if hasattr(self, "classes_"):
+                        classes = np.asarray(self.classes_)
+                        class_to_col = {cls: i for i, cls in enumerate(classes)}
+                        results = np.zeros((n_samples, classes.shape[0]), dtype=np.float64)
+
+                        for t, surrogate in enumerate(surrogate_estimators):
+                            oob_idx = np.flatnonzero(oob_mask[:, t] == 1)
+                            if oob_idx.size == 0:
+                                continue
+
+                            probas = np.asarray(surrogate.predict_proba(X_t[t][oob_idx]), dtype=np.float64)
+                            mapped = np.zeros((oob_idx.size, classes.shape[0]), dtype=np.float64)
+                            surrogate_classes = np.asarray(getattr(surrogate, "classes_", classes))
+                            for j, cls in enumerate(surrogate_classes):
+                                mapped[:, class_to_col[cls]] = probas[:, j]
+
+                            results[oob_idx] += mapped
+
+                        if (divisors == 0).any():
+                            warn(
+                                (
+                                    "Some inputs do not have OOB scores. This probably means "
+                                    "too few trees were used to compute any reliable OOB "
+                                    "estimates."
+                                ),
+                                UserWarning,
+                            )
+                            divisors[divisors == 0] = 1.0
+
+                        self.oob_decision_function_ = results / divisors[:, None]
+                        y_pred = classes[np.argmax(self.oob_decision_function_, axis=1)]
+                        self.oob_score_ = float(accuracy_score(y_arr, y_pred))
+                        return
+
+                    results = np.zeros(n_samples, dtype=np.float64)
+                    for t, surrogate in enumerate(surrogate_estimators):
+                        oob_idx = np.flatnonzero(oob_mask[:, t] == 1)
+                        if oob_idx.size == 0:
+                            continue
+                        results[oob_idx] += np.asarray(surrogate.predict(X_t[t][oob_idx]), dtype=np.float64)
+
+                    if (divisors == 0).any():
+                        warn(
+                            (
+                                "Some inputs do not have OOB scores. This probably means "
+                                "too few trees were used to compute any reliable OOB "
+                                "estimates."
+                            ),
+                            UserWarning,
+                        )
+                        divisors[divisors == 0] = 1.0
+
+                    self.oob_prediction_ = results / divisors
+                    self.oob_score_ = float(r2_score(y_arr, self.oob_prediction_))
+                    return
 
                 if hasattr(self, "classes_") and callable(train_proba_fn):
-                    p = [
-                        train_proba_fn(
-                            X_t,
-                            y_arr,
-                            t,
-                            check_random_state(rng.randint(max_int)),
-                        )
-                        for t in range(n_trees)
-                    ]
+                    with _suppress_base_validate_data_futurewarning():
+                        p = [
+                            train_proba_fn(
+                                X_t,
+                                y_arr,
+                                t,
+                                check_random_state(rng.randint(max_int)),
+                            )
+                            for t in range(n_trees)
+                        ]
                     y_probas, oobs = zip(*p)
 
                     results = np.sum(y_probas, axis=0)
@@ -848,12 +1115,18 @@ class _RotationForestOOBAdapter:
                         for inst in oob:
                             divisors[inst] += 1.0
 
-                    n_classes = int(getattr(self, "n_classes_", 0))
-                    for i in range(n_samples):
-                        if divisors[i] == 0:
-                            results[i] = np.ones(n_classes, dtype=np.float64) * (1.0 / max(n_classes, 1))
-                        else:
-                            results[i] = results[i] / (np.ones(n_classes, dtype=np.float64) * divisors[i])
+                    if (divisors == 0).any():
+                        warn(
+                            (
+                                "Some inputs do not have OOB scores. This probably means "
+                                "too few trees were used to compute any reliable OOB "
+                                "estimates."
+                            ),
+                            UserWarning,
+                        )
+                        divisors[divisors == 0] = 1.0
+
+                    results = results / divisors[:, None]
 
                     classes = np.asarray(self.classes_)
                     self.oob_decision_function_ = np.asarray(results, dtype=np.float64)
@@ -862,15 +1135,16 @@ class _RotationForestOOBAdapter:
                     return
 
                 if callable(train_pred_fn):
-                    p = [
-                        train_pred_fn(
-                            X_t,
-                            y_arr,
-                            t,
-                            check_random_state(rng.randint(max_int)),
-                        )
-                        for t in range(n_trees)
-                    ]
+                    with _suppress_base_validate_data_futurewarning():
+                        p = [
+                            train_pred_fn(
+                                X_t,
+                                y_arr,
+                                t,
+                                check_random_state(rng.randint(max_int)),
+                            )
+                            for t in range(n_trees)
+                        ]
                     y_preds, oobs = zip(*p)
 
                     results = np.sum(y_preds, axis=0)
@@ -879,24 +1153,31 @@ class _RotationForestOOBAdapter:
                         for inst in oob:
                             divisors[inst] += 1.0
 
-                    label_average = float(getattr(self, "_label_average", np.mean(y_arr)))
-                    for i in range(n_samples):
-                        if divisors[i] == 0:
-                            results[i] = label_average
-                        else:
-                            results[i] = results[i] / divisors[i]
+                    if (divisors == 0).any():
+                        warn(
+                            (
+                                "Some inputs do not have OOB scores. This probably means "
+                                "too few trees were used to compute any reliable OOB "
+                                "estimates."
+                            ),
+                            UserWarning,
+                        )
+                        divisors[divisors == 0] = 1.0
+
+                    results = results / divisors
 
                     self.oob_prediction_ = np.asarray(results, dtype=np.float64)
                     self.oob_score_ = float(r2_score(y_arr, self.oob_prediction_))
                     return
         except Exception:
-            pass
+            raise
 
         try:
             oob_model = clone(self)
 
             if hasattr(self, "classes_") and hasattr(oob_model, "fit_predict_proba"):
-                oob_proba = np.asarray(oob_model.fit_predict_proba(X, y_arr), dtype=np.float64)
+                with _suppress_base_validate_data_futurewarning():
+                    oob_proba = np.asarray(oob_model.fit_predict_proba(X, y_arr), dtype=np.float64)
                 classes = np.asarray(getattr(oob_model, "classes_", self.classes_))
 
                 self.oob_decision_function_ = oob_proba
@@ -906,9 +1187,10 @@ class _RotationForestOOBAdapter:
                 return
 
             if hasattr(oob_model, "fit_predict"):
-                oob_prediction = np.asarray(oob_model.fit_predict(X, y_arr), dtype=np.float64)
+                with _suppress_base_validate_data_futurewarning():
+                    oob_prediction = np.asarray(oob_model.fit_predict(X, y_arr), dtype=np.float64)
                 self.oob_prediction_ = oob_prediction
                 self.oob_score_ = float(r2_score(y_arr, oob_prediction))
                 return
         except Exception:
-            pass
+            raise
