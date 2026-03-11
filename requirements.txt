@@ -1,0 +1,9 @@
+numpy
+scipy
+scikit-learn
+pandas
+matplotlib
+phate
+aeon
+scikit-tree
+ipykernel
