@@ -694,16 +694,23 @@ class SparseProximityMixin:
 
         get_indices_fn = getattr(self, "_get_estimators_indices", None)
         if callable(get_indices_fn):
-            for t, estimators_index in enumerate(cast(Any, get_indices_fn()) or []):
-                sample_indices = estimators_index
-                if isinstance(estimators_index, tuple) and len(estimators_index) == 2:
-                    sample_indices = estimators_index[1]
+            try:
+                for t, estimators_index in enumerate(cast(Any, get_indices_fn()) or []):
+                    sample_indices = estimators_index
+                    if isinstance(estimators_index, tuple) and len(estimators_index) == 2:
+                        sample_indices = estimators_index[1]
 
-                idx, cnt = np.unique(np.asarray(sample_indices), return_counts=True)
-                in_bag_counts[idx, t] = cnt.astype(np.float32)
-                oob_mask[:, t] = 1
-                oob_mask[idx, t] = 0
-            return oob_mask, in_bag_counts
+                    idx, cnt = np.unique(np.asarray(sample_indices), return_counts=True)
+                    in_bag_counts[idx, t] = cnt.astype(np.float32)
+                    oob_mask[:, t] = 1
+                    oob_mask[idx, t] = 0
+                return oob_mask, in_bag_counts
+            except AttributeError:
+                # Some sktree forests (e.g. UnsupervisedRandomForest) expose
+                # _get_estimators_indices but lack _n_samples; fall through to
+                # the _generate_sample_indices fallback.
+                oob_mask[:] = 0
+                in_bag_counts[:] = 0
 
         if _generate_sample_indices is None or _generate_unsampled_indices is None:
             raise RuntimeError(
@@ -873,6 +880,16 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
                 kwargs["oob_score"] = False
                 effective_oob_score = False
 
+            # sktree ForestCluster (UnsupervisedRandomForest) has a buggy
+            # _set_oob_score_and_attributes; always disable the base model's
+            # oob_score and let the mixin handle OOB computation itself.
+            _is_forest_cluster = any(
+                c.__name__ == "ForestCluster" for c in base_cls.mro()
+            )
+            if _is_forest_cluster and has_oob_param:
+                kwargs["oob_score"] = False
+                effective_oob_score = False
+
             bound = base_sig.bind_partial(self, *args, **kwargs)
             base_cls.__init__(*bound.args, **bound.kwargs)
             self._init_sparse_proximity(
@@ -900,7 +917,12 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
     ]
     if (is_rotation_forest or is_isolation_forest) and "oob_score" not in base_sig.parameters:
         prox_params.append(Parameter("oob_score", kind=Parameter.KEYWORD_ONLY, default=True))
-    init_sig = Signature(parameters=[Parameter("self", kind=Parameter.POSITIONAL_OR_KEYWORD)] + base_params + prox_params)
+    # Insert prox_params before any VAR_KEYWORD (**kwargs) parameter to maintain
+    # valid Python parameter ordering.
+    var_kw = [p for p in base_params if p.kind == Parameter.VAR_KEYWORD]
+    non_var_kw = [p for p in base_params if p.kind != Parameter.VAR_KEYWORD]
+    ordered_params = [Parameter("self", kind=Parameter.POSITIONAL_OR_KEYWORD)] + non_var_kw + prox_params + var_kw
+    init_sig = Signature(parameters=ordered_params)
     ProximityEnabled.__init__.__signature__ = init_sig
 
     ProximityEnabled.__name__ = f"{base_cls.__name__}WithSparseProximity"

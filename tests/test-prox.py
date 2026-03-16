@@ -32,6 +32,22 @@ except Exception:
     RotationForestRegressor = None
     _HAS_AEON = False
 
+try:
+    from sktree import (
+        ObliqueRandomForestClassifier,
+        ObliqueRandomForestRegressor,
+        PatchObliqueRandomForestClassifier,
+        PatchObliqueRandomForestRegressor,
+        ExtraObliqueRandomForestClassifier,
+        ExtraObliqueRandomForestRegressor,
+        HonestForestClassifier,
+        UnsupervisedRandomForest,
+        ExtendedIsolationForest,
+    )
+    _HAS_SKTREE = True
+except Exception:
+    _HAS_SKTREE = False
+
 
 class TestSparseProximityMixin(unittest.TestCase):
     PROX_METHODS = ("original", "oob", "rfgap")
@@ -105,6 +121,13 @@ class TestSparseProximityMixin(unittest.TestCase):
         ]
         if _HAS_AEON:
             models.append(("RotationForestClassifier", RotationForestClassifier))
+        if _HAS_SKTREE:
+            models.extend([
+                ("ObliqueRandomForestClassifier", ObliqueRandomForestClassifier),
+                ("PatchObliqueRandomForestClassifier", PatchObliqueRandomForestClassifier),
+                ("ExtraObliqueRandomForestClassifier", ExtraObliqueRandomForestClassifier),
+                ("HonestForestClassifier", HonestForestClassifier),
+            ])
         return models
 
     def _regression_models(self):
@@ -114,7 +137,37 @@ class TestSparseProximityMixin(unittest.TestCase):
         ]
         if _HAS_AEON:
             models.append(("RotationForestRegressor", RotationForestRegressor))
+        if _HAS_SKTREE:
+            models.extend([
+                ("ObliqueRandomForestRegressor", ObliqueRandomForestRegressor),
+                ("PatchObliqueRandomForestRegressor", PatchObliqueRandomForestRegressor),
+                ("ExtraObliqueRandomForestRegressor", ExtraObliqueRandomForestRegressor),
+            ])
         return models
+
+    def _unsupervised_models(self):
+        models = [
+            ("IsolationForest", IsolationForest),
+        ]
+        if _HAS_SKTREE:
+            models.extend([
+                ("UnsupervisedRandomForest", UnsupervisedRandomForest),
+                ("ExtendedIsolationForest", ExtendedIsolationForest),
+            ])
+        return models
+
+    def _classification_models_oob_matchable(self):
+        """Classification models whose OOB outputs match prox @ y exactly.
+
+        HonestForestClassifier is excluded because honest splitting computes
+        OOB predictions from a held-out honest subset, which structurally
+        differs from the bootstrap-based proximity OOB.
+        """
+        return [(n, c) for n, c in self._classification_models()
+                if "Honest" not in n]
+
+    def _regression_models_oob_matchable(self):
+        return self._regression_models()
 
     def test_fit_predict_get_proximities_all_models_methods(self):
         Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
@@ -143,21 +196,28 @@ class TestSparseProximityMixin(unittest.TestCase):
                     self.assertEqual(prox.shape, (Xr_tr.shape[0], Xr_tr.shape[0]))
                     self.assertEqual(prox_ext.shape, (Xr_te.shape[0], Xr_tr.shape[0]))
 
-        for method in self.PROX_METHODS:
-            with self.subTest(model="IsolationForest", prox_method=method):
-                model = self._build_model(IsolationForest, method, n_estimators=20, random_state=3)
-                self._fit(model, Xu_tr)
-                _ = model.predict(Xu_te)
-                prox = model.get_proximities()
-                prox_ext = model.prox_extend(Xu_te)
-                self.assertEqual(prox.shape, (Xu_tr.shape[0], Xu_tr.shape[0]))
-                self.assertEqual(prox_ext.shape, (Xu_te.shape[0], Xu_tr.shape[0]))
+        for name, cls in self._unsupervised_models():
+            for method in self.PROX_METHODS:
+                with self.subTest(model=name, prox_method=method):
+                    kwargs = {}
+                    # UnsupervisedRandomForest defaults to bootstrap=False;
+                    # enable it for oob/rfgap methods.
+                    base_sig = inspect.signature(cls.__init__)
+                    if "bootstrap" in base_sig.parameters:
+                        kwargs["bootstrap"] = method in ("oob", "rfgap")
+                    model = self._build_model(cls, method, n_estimators=20, random_state=3, **kwargs)
+                    self._fit(model, Xu_tr)
+                    _ = model.predict(Xu_te)
+                    prox = model.get_proximities()
+                    prox_ext = model.prox_extend(Xu_te)
+                    self.assertEqual(prox.shape, (Xu_tr.shape[0], Xu_tr.shape[0]))
+                    self.assertEqual(prox_ext.shape, (Xu_te.shape[0], Xu_tr.shape[0]))
 
     def test_supervised_rfgap_proximity_matches_oob_outputs(self):
         Xc_tr, yc_tr, _, _ = self._classification_data()
         Xr_tr, yr_tr, _, _ = self._regression_data()
 
-        for name, cls in self._classification_models():
+        for name, cls in self._classification_models_oob_matchable():
             with self.subTest(task="classification", model=name, prox_method="rfgap"):
                 kwargs = {"oob_score": True}
                 if "bootstrap" in inspect.signature(cls.__init__).parameters:
@@ -179,7 +239,7 @@ class TestSparseProximityMixin(unittest.TestCase):
                 oob_prob = np.asarray(model.oob_decision_function_, dtype=np.float64)
                 np.testing.assert_allclose(prox_prob, oob_prob, rtol=1e-6, atol=1e-6)
 
-        for name, cls in self._regression_models():
+        for name, cls in self._regression_models_oob_matchable():
             with self.subTest(task="regression", model=name, prox_method="rfgap"):
                 kwargs = {"oob_score": True}
                 if "bootstrap" in inspect.signature(cls.__init__).parameters:
@@ -201,7 +261,7 @@ class TestSparseProximityMixin(unittest.TestCase):
         families = []
         families.extend((name, cls, "classification") for name, cls in self._classification_models())
         families.extend((name, cls, "regression") for name, cls in self._regression_models())
-        families.append(("IsolationForest", IsolationForest, "unsupervised"))
+        families.extend((name, cls, "unsupervised") for name, cls in self._unsupervised_models())
 
         for name, cls, task in families:
             base_sig = inspect.signature(cls.__init__)
