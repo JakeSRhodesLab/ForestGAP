@@ -13,7 +13,15 @@ from scipy import sparse
 from sklearn.base import clone
 from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils import check_random_state
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
+
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    # sklearn < 1.6: validate_data is not a standalone function;
+    # fall back to the estimator's _validate_data method.
+    def validate_data(estimator, **kwargs):
+        return estimator._validate_data(**kwargs)
 
 # aeon RotationForest still uses sklearn's deprecated _validate_data path on
 # current releases; suppress this single known deprecation at library boundary.
@@ -751,15 +759,20 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
     """
     Class decorator/factory to attach `SparseProximityMixin` to an estimator class.
 
+    Can also be called with an **instance** for convenience; in that case a new
+    ``ProximityEnabled`` class is built from the instance's class and a fresh
+    instance is returned with the same parameters.
+
     Parameters
     ----------
-    base_cls : type
-        Forest-like estimator class to extend.
+    base_cls : type or estimator instance
+        Forest-like estimator class (or instance) to extend.
 
     Returns
     -------
-    type
-        New class inheriting `(SparseProximityMixin, base_cls)`.
+    type or estimator instance
+        New class inheriting `(SparseProximityMixin, base_cls)`, or an instance
+        of that class when an instance was passed.
 
     Examples
     --------
@@ -772,7 +785,17 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
     >>> @with_sparse_proximity
     ... class ProxExtraTrees(ExtraTreesClassifier):
     ...     pass
+
+    With an already-constructed instance:
+    >>> model = with_sparse_proximity(RandomForestClassifier(n_estimators=200))
     """
+
+    # If an instance was passed, wrap its class and return a new instance
+    # with the same parameters.
+    if not isinstance(base_cls, type):
+        instance = base_cls
+        cls = with_sparse_proximity(type(instance))
+        return cls(**instance.get_params())
 
     is_rotation_forest = _is_rotation_forest_class(base_cls)
     is_isolation_forest = _is_isolation_forest_class(base_cls)
@@ -931,7 +954,6 @@ class _RotationForestApplyAdapter:
         # same input checks / preprocessing used in predict_proba
         with _suppress_base_validate_data_futurewarning():
             X = self._check_X(X)
-            from sklearn.utils.validation import validate_data
             X = validate_data(self, X=X, reset=False, accept_sparse=False)
 
         # remove attributes that were dropped at fit
