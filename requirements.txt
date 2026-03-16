@@ -1,9 +1,9 @@
 numpy
-scipy
-scikit-learn
+scipy>=1.5.0,<1.14
+scikit-learn>=1.4.1,<1.6
 pandas
 matplotlib
 phate
 aeon
-scikit-tree
+scikit-tree>=0.8.0
 ipykernel
