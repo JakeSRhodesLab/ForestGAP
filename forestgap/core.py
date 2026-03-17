@@ -424,10 +424,10 @@ class SparseProximityMixin:
 
     def impute(
         self,
-        X: np.ndarray,
+        X: Any,
         categorical_features: Optional[Sequence[int]] = None,
-        X_test: Optional[np.ndarray] = None,
-    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        X_test: Optional[Any] = None,
+    ) -> Any:
         """
         Impute missing values using proximity-weighted replacement.
 
@@ -439,30 +439,49 @@ class SparseProximityMixin:
         For each missing categorical value, the fill is the most frequent
         non-missing category weighted by proximity.
 
+        Accepts numpy arrays or pandas DataFrames.  When a DataFrame is
+        passed the result is returned as a DataFrame with the original
+        index and columns preserved.
+
         Parameters
         ----------
-        X : np.ndarray of shape (n_samples, n_features)
-            Training data with ``np.nan`` marking missing entries.
+        X : array-like or DataFrame of shape (n_samples, n_features)
+            Training data with ``np.nan`` / ``NaN`` marking missing entries.
         categorical_features : sequence of int, optional
             Column indices of categorical features.  All other columns
             are treated as continuous.
-        X_test : np.ndarray of shape (n_test, n_features), optional
-            Test data with ``np.nan`` marking missing entries.  If
-            provided, imputed using ``prox_extend`` proximities against
+        X_test : array-like or DataFrame of shape (n_test, n_features), optional
+            Test data with ``np.nan`` / ``NaN`` marking missing entries.
+            If provided, imputed using ``prox_extend`` proximities against
             training points.
 
         Returns
         -------
-        X_imputed : np.ndarray
+        X_imputed : np.ndarray or DataFrame
             Copy of *X* with missing values filled.
-        X_test_imputed : np.ndarray
+        X_test_imputed : np.ndarray or DataFrame
             Returned only when *X_test* is provided.
         """
         self._check_proximity_ready()
 
+        try:
+            import pandas as pd
+            _has_pandas = True
+        except ImportError:
+            _has_pandas = False
+
+        X_is_df = _has_pandas and isinstance(X, pd.DataFrame)
+        Xt_is_df = _has_pandas and X_test is not None and isinstance(X_test, pd.DataFrame)
+
+        X_idx = X.index if X_is_df else None
+        X_cols = X.columns if X_is_df else None
+        Xt_idx = X_test.index if Xt_is_df else None
+        Xt_cols = X_test.columns if Xt_is_df else None
+
         cat_set = set(categorical_features) if categorical_features is not None else set()
 
-        X_imp = np.array(X, dtype=np.float64, copy=True)
+        X_vals = X.to_numpy(dtype=np.float64, copy=True, na_value=np.nan) if X_is_df else np.array(X, dtype=np.float64, copy=True)
+        X_imp = X_vals
         missing_train = np.isnan(X_imp)
 
         P_train = self.get_proximities()
@@ -477,7 +496,8 @@ class SparseProximityMixin:
         )
 
         if X_test is not None:
-            X_test_imp = np.array(X_test, dtype=np.float64, copy=True)
+            X_test_vals = X_test.to_numpy(dtype=np.float64, copy=True, na_value=np.nan) if Xt_is_df else np.array(X_test, dtype=np.float64, copy=True)
+            X_test_imp = X_test_vals
             missing_test = np.isnan(X_test_imp)
 
             P_test = self.prox_extend(X_test)
@@ -490,9 +510,11 @@ class SparseProximityMixin:
                 X_ref=X_imp, missing_ref=missing_train,
                 P=P_test, cat_set=cat_set,
             )
-            return X_imp, X_test_imp
+            out_tr = pd.DataFrame(X_imp, index=X_idx, columns=X_cols) if X_is_df else X_imp
+            out_te = pd.DataFrame(X_test_imp, index=Xt_idx, columns=Xt_cols) if Xt_is_df else X_test_imp
+            return out_tr, out_te
 
-        return X_imp
+        return pd.DataFrame(X_imp, index=X_idx, columns=X_cols) if X_is_df else X_imp
 
     @staticmethod
     def _prox_impute_inplace(
@@ -565,7 +587,7 @@ class SparseProximityMixin:
         self,
         y: Any,
         scaling: Optional[Literal["normalize", "log"]] = None,
-    ) -> np.ndarray:
+    ) -> Any:
         """
         Compute class-relative outlier scores from the proximity matrix.
 
@@ -578,9 +600,13 @@ class SparseProximityMixin:
         3. Within each class, standardise by subtracting the median and
            dividing by the median absolute deviation (MAD).
 
+        Accepts numpy arrays or pandas Series / DataFrames for *y*.  When
+        a pandas object with an index is passed, the result is returned as
+        a ``pandas.Series`` with the same index.
+
         Parameters
         ----------
-        y : array-like of shape (n_samples,)
+        y : array-like, Series, or DataFrame of shape (n_samples,)
             Class labels for training samples.
         scaling : {None, 'normalize', 'log'}, optional
             Post-processing applied to the standardised scores.
@@ -591,10 +617,20 @@ class SparseProximityMixin:
 
         Returns
         -------
-        scores : np.ndarray of shape (n_samples,)
+        scores : np.ndarray or pandas.Series of shape (n_samples,)
             Outlier scores (higher = more outlier-like).
         """
         self._check_proximity_ready()
+
+        try:
+            import pandas as pd
+            _has_pandas = True
+        except ImportError:
+            _has_pandas = False
+
+        y_is_pandas = _has_pandas and isinstance(y, (pd.Series, pd.DataFrame))
+        y_index = y.index if y_is_pandas else None
+
         y_arr = np.asarray(y)
         n_samples = len(y_arr)
 
@@ -651,6 +687,8 @@ class SparseProximityMixin:
             else:
                 scores = np.zeros_like(scores)
 
+        if y_is_pandas:
+            return pd.Series(scores, index=y_index, name="outlier_score")
         return scores
 
     def _check_proximity_ready(self) -> None:

@@ -547,6 +547,235 @@ class TestSparseProximityMixin(unittest.TestCase):
         self.assertTrue(np.isfinite(logged).all())
         self.assertGreaterEqual(logged.min(), 0.0)
 
+    # ---- DataFrame tests ------------------------------------------------
+
+    def test_impute_dataframe(self):
+        """impute accepts DataFrames and returns DataFrames with preserved index/columns."""
+        import pandas as pd
+
+        rng = np.random.RandomState(42)
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+
+        cols = [f"feat_{i}" for i in range(Xc_tr.shape[1])]
+        idx_tr = pd.RangeIndex(100, 100 + Xc_tr.shape[0])
+        idx_te = pd.RangeIndex(200, 200 + Xc_te.shape[0])
+
+        df_tr = pd.DataFrame(Xc_tr, columns=cols, index=idx_tr)
+        df_te = pd.DataFrame(Xc_te, columns=cols, index=idx_te)
+
+        # Inject ~10% missing values
+        mask_tr = rng.rand(*Xc_tr.shape) < 0.10
+        mask_te = rng.rand(*Xc_te.shape) < 0.10
+        df_miss_tr = df_tr.copy()
+        df_miss_te = df_te.copy()
+        df_miss_tr[mask_tr] = np.nan
+        df_miss_te[mask_te] = np.nan
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=50,
+            random_state=14, bootstrap=True,
+        )
+        X_init = df_miss_tr.fillna(df_miss_tr.median())
+        self._fit(model, X_init.values, yc_tr)
+
+        imp_tr, imp_te = model.impute(df_miss_tr, X_test=df_miss_te)
+
+        # Returns DataFrames
+        self.assertIsInstance(imp_tr, pd.DataFrame)
+        self.assertIsInstance(imp_te, pd.DataFrame)
+
+        # Index and columns preserved
+        pd.testing.assert_index_equal(imp_tr.index, idx_tr)
+        pd.testing.assert_index_equal(imp_te.index, idx_te)
+        self.assertListEqual(list(imp_tr.columns), cols)
+        self.assertListEqual(list(imp_te.columns), cols)
+
+        # No NaN remaining
+        self.assertFalse(imp_tr.isna().any().any())
+        self.assertFalse(imp_te.isna().any().any())
+
+        # Observed entries unchanged
+        np.testing.assert_array_equal(
+            imp_tr.values[~mask_tr], Xc_tr[~mask_tr],
+        )
+
+    def test_impute_dataframe_train_only(self):
+        """impute returns a single DataFrame (not tuple) when X_test is omitted."""
+        import pandas as pd
+
+        rng = np.random.RandomState(55)
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+
+        cols = [f"f{i}" for i in range(Xc_tr.shape[1])]
+        df = pd.DataFrame(Xc_tr, columns=cols)
+        mask = rng.rand(*Xc_tr.shape) < 0.10
+        df_miss = df.copy()
+        df_miss[mask] = np.nan
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=50,
+            random_state=14, bootstrap=True,
+        )
+        self._fit(model, df_miss.fillna(df_miss.median()).values, yc_tr)
+
+        result = model.impute(df_miss)
+
+        self.assertIsInstance(result, pd.DataFrame)
+        self.assertListEqual(list(result.columns), cols)
+        self.assertFalse(result.isna().any().any())
+
+    def test_outlier_scores_dataframe(self):
+        """outlier_scores accepts a pandas Series and returns a Series with preserved index."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+        idx = pd.RangeIndex(500, 500 + len(yc_tr))
+        y_series = pd.Series(yc_tr, index=idx, name="label")
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=50,
+            random_state=16, bootstrap=True,
+        )
+        self._fit(model, Xc_tr, yc_tr)
+
+        scores = model.outlier_scores(y_series)
+
+        self.assertIsInstance(scores, pd.Series)
+        pd.testing.assert_index_equal(scores.index, idx)
+        self.assertTrue(np.isfinite(scores).all())
+        self.assertGreaterEqual(scores.min(), 0.0)
+
+    def test_fit_predict_dataframe(self):
+        """fit / predict / get_proximities work when X and y are DataFrames / Series."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, yc_te = self._classification_data()
+        cols = [f"feat_{i}" for i in range(Xc_tr.shape[1])]
+
+        df_tr = pd.DataFrame(Xc_tr, columns=cols)
+        df_te = pd.DataFrame(Xc_te, columns=cols)
+        s_tr = pd.Series(yc_tr, name="target")
+
+        for method in self.PROX_METHODS:
+            with self.subTest(prox_method=method):
+                model = self._build_model(
+                    RandomForestClassifier, method, n_estimators=20,
+                    random_state=1, bootstrap=True,
+                )
+                self._fit(model, df_tr, s_tr)
+                preds = model.predict(df_te)
+                prox = model.get_proximities()
+                prox_ext = model.prox_extend(df_te)
+
+                self.assertEqual(preds.shape[0], Xc_te.shape[0])
+                self.assertEqual(prox.shape, (Xc_tr.shape[0], Xc_tr.shape[0]))
+                self.assertEqual(prox_ext.shape, (Xc_te.shape[0], Xc_tr.shape[0]))
+
+    def test_prox_predict_dataframe(self):
+        """prox_predict(DataFrame) reproduces forest predictions when fitted with DataFrames."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        Xr_tr, yr_tr, Xr_te, _ = self._regression_data()
+
+        cols_c = [f"f{i}" for i in range(Xc_tr.shape[1])]
+        cols_r = [f"f{i}" for i in range(Xr_tr.shape[1])]
+
+        # Classification
+        df_tr = pd.DataFrame(Xc_tr, columns=cols_c)
+        df_te = pd.DataFrame(Xc_te, columns=cols_c)
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=20,
+            random_state=10, bootstrap=True,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        prox_prob = model.prox_predict(df_te)
+        forest_prob = np.asarray(model.predict_proba(df_te), dtype=np.float64)
+        np.testing.assert_allclose(prox_prob, forest_prob, rtol=1e-4, atol=1e-4)
+
+        # Regression
+        df_tr_r = pd.DataFrame(Xr_tr, columns=cols_r)
+        df_te_r = pd.DataFrame(Xr_te, columns=cols_r)
+        model_r = self._build_model(
+            RandomForestRegressor, "rfgap", n_estimators=20,
+            random_state=11, bootstrap=True,
+        )
+        self._fit(model_r, df_tr_r, yr_tr)
+
+        prox_pred = model_r.prox_predict(df_te_r)
+        forest_pred = np.asarray(model_r.predict(df_te_r), dtype=np.float64)
+        np.testing.assert_allclose(prox_pred, forest_pred, rtol=1e-4, atol=1e-4)
+
+    def test_prox_predict_oob_dataframe(self):
+        """prox_predict() OOB matches oob_decision_function_ when fitted with DataFrames."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+        cols = [f"f{i}" for i in range(Xc_tr.shape[1])]
+        df_tr = pd.DataFrame(Xc_tr, columns=cols)
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=20,
+            random_state=12, oob_score=True, bootstrap=True,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        prox_prob = model.prox_predict()
+        oob_prob = np.asarray(model.oob_decision_function_, dtype=np.float64)
+        np.testing.assert_allclose(prox_prob, oob_prob, rtol=1e-6, atol=1e-6)
+
+    def test_extend_matches_predictions_dataframe(self):
+        """Extended rfgap proximities reproduce predictions when using DataFrames."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        cols = [f"f{i}" for i in range(Xc_tr.shape[1])]
+        df_tr = pd.DataFrame(Xc_tr, columns=cols)
+        df_te = pd.DataFrame(Xc_te, columns=cols)
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=20,
+            random_state=8, bootstrap=True,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        prox_ext = self._to_dense(model.prox_extend(df_te))
+        classes = np.asarray(model.classes_)
+        y_idx = np.searchsorted(classes, yc_tr)
+        y_hot = np.eye(classes.shape[0], dtype=np.float64)[y_idx]
+
+        prox_prob = prox_ext @ y_hot
+        forest_prob = np.asarray(model.predict_proba(df_te), dtype=np.float64)
+        np.testing.assert_allclose(prox_prob, forest_prob, rtol=1e-4, atol=1e-4)
+
+    def test_oob_proximity_matches_dataframe(self):
+        """OOB rfgap proximities match oob_decision_function_ when fitted with DataFrames."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+        cols = [f"f{i}" for i in range(Xc_tr.shape[1])]
+        df_tr = pd.DataFrame(Xc_tr, columns=cols)
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=20,
+            random_state=4, oob_score=True, bootstrap=True,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        classes = np.asarray(model.classes_)
+        y_idx = np.searchsorted(classes, yc_tr)
+        y_hot = np.eye(classes.shape[0], dtype=np.float64)[y_idx]
+
+        prox = self._to_dense(model.get_proximities())
+        prox_prob = prox @ y_hot
+        rs = prox_prob.sum(axis=1, keepdims=True)
+        rs[rs == 0] = 1.0
+        prox_prob = prox_prob / rs
+
+        oob_prob = np.asarray(model.oob_decision_function_, dtype=np.float64)
+        np.testing.assert_allclose(prox_prob, oob_prob, rtol=1e-6, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
