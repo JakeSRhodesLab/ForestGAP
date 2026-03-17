@@ -500,7 +500,17 @@ class SparseProximityMixin:
             X_test_imp = X_test_vals
             missing_test = np.isnan(X_test_imp)
 
-            P_test = self.prox_extend(X_test)
+            # prox_extend calls apply() which rejects NaN, so pass a
+            # rough-filled copy (column medians from the already-imputed
+            # training data) for leaf assignment only.
+            X_test_filled = X_test_imp.copy()
+            col_medians = np.nanmedian(X_imp, axis=0)
+            for col in range(X_test_filled.shape[1]):
+                nans = np.isnan(X_test_filled[:, col])
+                if nans.any():
+                    X_test_filled[nans, col] = col_medians[col]
+
+            P_test = self.prox_extend(X_test_filled)
             if not sparse.issparse(P_test):
                 P_test = sparse.csr_matrix(P_test)
 
