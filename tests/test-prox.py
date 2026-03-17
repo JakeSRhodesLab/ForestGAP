@@ -414,6 +414,139 @@ class TestSparseProximityMixin(unittest.TestCase):
         self.assertTrue(np.isfinite(prox).all())
         self.assertGreaterEqual(prox.min(), 0.0)
 
+    def test_impute_fills_missing_values(self):
+        """impute fills NaN entries and leaves observed entries unchanged."""
+        rng = np.random.RandomState(42)
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+
+        # Inject ~10% missing values at random
+        mask_tr = rng.rand(*Xc_tr.shape) < 0.10
+        mask_te = rng.rand(*Xc_te.shape) < 0.10
+        X_miss_tr = Xc_tr.copy()
+        X_miss_te = Xc_te.copy()
+        X_miss_tr[mask_tr] = np.nan
+        X_miss_te[mask_te] = np.nan
+
+        model = self._build_model(RandomForestClassifier, "rfgap", n_estimators=50, random_state=14, bootstrap=True)
+        # Fit on the rough-filled data (median init)
+        X_init = X_miss_tr.copy()
+        col_medians = np.nanmedian(X_init, axis=0)
+        for m in range(X_init.shape[1]):
+            nans = np.isnan(X_init[:, m])
+            X_init[nans, m] = col_medians[m]
+        self._fit(model, X_init, yc_tr)
+
+        # Impute with train + test
+        X_imp_tr, X_imp_te = model.impute(X_miss_tr, X_test=X_miss_te)
+
+        # 1. No NaN remaining
+        self.assertFalse(np.isnan(X_imp_tr).any(), "Train imputation left NaN values")
+        self.assertFalse(np.isnan(X_imp_te).any(), "Test imputation left NaN values")
+
+        # 2. Observed entries are unchanged
+        np.testing.assert_array_equal(X_imp_tr[~mask_tr], Xc_tr[~mask_tr])
+        np.testing.assert_array_equal(X_imp_te[~mask_te], Xc_te[~mask_te])
+
+        # 3. All values are finite
+        self.assertTrue(np.isfinite(X_imp_tr).all())
+        self.assertTrue(np.isfinite(X_imp_te).all())
+
+    def test_impute_categorical(self):
+        """impute correctly imputes categorical features via weighted vote."""
+        rng = np.random.RandomState(99)
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+
+        # Add a categorical column (integer-valued)
+        cat_col = yc_tr.copy().astype(float)
+        X_with_cat = np.column_stack([Xc_tr, cat_col])
+
+        # Inject missing in the categorical column
+        miss_idx = rng.choice(X_with_cat.shape[0], size=5, replace=False)
+        X_miss = X_with_cat.copy()
+        X_miss[miss_idx, -1] = np.nan
+
+        model = self._build_model(RandomForestClassifier, "rfgap", n_estimators=50, random_state=15, bootstrap=True)
+        X_init = X_miss.copy()
+        col_medians = np.nanmedian(X_init, axis=0)
+        for m in range(X_init.shape[1]):
+            nans = np.isnan(X_init[:, m])
+            X_init[nans, m] = col_medians[m]
+        self._fit(model, X_init, yc_tr)
+
+        X_imp = model.impute(X_miss, categorical_features=[X_with_cat.shape[1] - 1])
+
+        # No NaN remaining
+        self.assertFalse(np.isnan(X_imp).any())
+
+        # Categorical column should contain only original category values
+        orig_cats = set(np.unique(cat_col))
+        imputed_cats = set(np.unique(X_imp[:, -1]))
+        self.assertTrue(imputed_cats.issubset(orig_cats))
+
+    def test_outlier_scores_basic(self):
+        """outlier_scores returns finite, non-negative scores for every sample."""
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+
+        for method in self.PROX_METHODS:
+            with self.subTest(prox_method=method):
+                model = self._build_model(
+                    RandomForestClassifier, method, n_estimators=50,
+                    random_state=16, bootstrap=True,
+                )
+                self._fit(model, Xc_tr, yc_tr)
+
+                scores = model.outlier_scores(yc_tr)
+                self.assertEqual(scores.shape, (Xc_tr.shape[0],))
+                self.assertTrue(np.isfinite(scores).all())
+                self.assertGreaterEqual(scores.min(), 0.0)
+
+    def test_outlier_scores_detects_corruption(self):
+        """outlier_scores assigns higher scores to corrupted samples."""
+        rng = np.random.RandomState(77)
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+
+        # Corrupt 3 samples by adding very large noise
+        corrupt_idx = rng.choice(Xc_tr.shape[0], size=3, replace=False)
+        X_corrupt = Xc_tr.copy()
+        X_corrupt[corrupt_idx] += rng.normal(0, 50, size=(3, Xc_tr.shape[1]))
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=100,
+            random_state=17, bootstrap=True,
+        )
+        self._fit(model, X_corrupt, yc_tr)
+
+        scores = model.outlier_scores(yc_tr)
+
+        # Corrupted samples should have above-median scores
+        median_score = np.median(scores)
+        self.assertTrue(
+            (scores[corrupt_idx] >= median_score).all(),
+            "Corrupted samples should have scores at or above the median",
+        )
+
+    def test_outlier_scores_scaling(self):
+        """outlier_scores respects normalize and log scaling options."""
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=50,
+            random_state=18, bootstrap=True,
+        )
+        self._fit(model, Xc_tr, yc_tr)
+
+        raw = model.outlier_scores(yc_tr)
+        normed = model.outlier_scores(yc_tr, scaling="normalize")
+        logged = model.outlier_scores(yc_tr, scaling="log")
+
+        # Normalised scores lie in [0, 1]
+        self.assertGreaterEqual(normed.min(), 0.0)
+        self.assertLessEqual(normed.max(), 1.0)
+
+        # Log scores are non-negative and finite
+        self.assertTrue(np.isfinite(logged).all())
+        self.assertGreaterEqual(logged.min(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

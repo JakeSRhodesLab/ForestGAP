@@ -422,6 +422,237 @@ class SparseProximityMixin:
         result = P @ y
         return np.asarray(result.todense()).ravel() if sparse.issparse(result) else np.asarray(result).ravel()
 
+    def impute(
+        self,
+        X: np.ndarray,
+        categorical_features: Optional[Sequence[int]] = None,
+        X_test: Optional[np.ndarray] = None,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Impute missing values using proximity-weighted replacement.
+
+        For each missing continuous value ``X[n, m]``, the fill is a
+        weighted average of non-missing values of feature *m*, where
+        weights are the proximities between sample *n* and all samples
+        with observed feature *m*.
+
+        For each missing categorical value, the fill is the most frequent
+        non-missing category weighted by proximity.
+
+        Parameters
+        ----------
+        X : np.ndarray of shape (n_samples, n_features)
+            Training data with ``np.nan`` marking missing entries.
+        categorical_features : sequence of int, optional
+            Column indices of categorical features.  All other columns
+            are treated as continuous.
+        X_test : np.ndarray of shape (n_test, n_features), optional
+            Test data with ``np.nan`` marking missing entries.  If
+            provided, imputed using ``prox_extend`` proximities against
+            training points.
+
+        Returns
+        -------
+        X_imputed : np.ndarray
+            Copy of *X* with missing values filled.
+        X_test_imputed : np.ndarray
+            Returned only when *X_test* is provided.
+        """
+        self._check_proximity_ready()
+
+        cat_set = set(categorical_features) if categorical_features is not None else set()
+
+        X_imp = np.array(X, dtype=np.float64, copy=True)
+        missing_train = np.isnan(X_imp)
+
+        P_train = self.get_proximities()
+        if not sparse.issparse(P_train):
+            P_train = sparse.csr_matrix(P_train)
+
+        # Training imputation: query=train, reference=train
+        self._prox_impute_inplace(
+            X_query=X_imp, missing_query=missing_train,
+            X_ref=X_imp, missing_ref=missing_train,
+            P=P_train, cat_set=cat_set,
+        )
+
+        if X_test is not None:
+            X_test_imp = np.array(X_test, dtype=np.float64, copy=True)
+            missing_test = np.isnan(X_test_imp)
+
+            P_test = self.prox_extend(X_test)
+            if not sparse.issparse(P_test):
+                P_test = sparse.csr_matrix(P_test)
+
+            # Test imputation: query=test, reference=train (already imputed)
+            self._prox_impute_inplace(
+                X_query=X_test_imp, missing_query=missing_test,
+                X_ref=X_imp, missing_ref=missing_train,
+                P=P_test, cat_set=cat_set,
+            )
+            return X_imp, X_test_imp
+
+        return X_imp
+
+    @staticmethod
+    def _prox_impute_inplace(
+        X_query: np.ndarray,
+        missing_query: np.ndarray,
+        X_ref: np.ndarray,
+        missing_ref: np.ndarray,
+        P: sparse.csr_matrix,
+        cat_set: set,
+    ) -> None:
+        """Fill ``np.nan`` entries in *X_query* using proximity matrix *P*.
+
+        *P* has shape ``(n_query, n_ref)``; reference values come from
+        *X_ref*.  For each feature column:
+
+        - Zero out proximity weights for reference rows where the feature
+          is missing, then row-normalise.
+        - Continuous: weighted average of non-missing reference values.
+        - Categorical: weighted vote among non-missing reference categories.
+        """
+        n_features = X_query.shape[1]
+
+        for m in range(n_features):
+            col_missing_query = missing_query[:, m]
+            if not col_missing_query.any():
+                continue
+
+            # Observed mask for the *reference* data
+            observed_ref = (~missing_ref[:, m]).astype(np.float64)  # (n_ref,)
+
+            # Scale proximity columns by the observed mask: sets weight
+            # to 0 for reference samples that are missing feature m.
+            P_obs = P.multiply(observed_ref[np.newaxis, :])
+            P_obs = sparse.csr_matrix(P_obs)
+
+            # Row-normalise so weights for each query row sum to 1
+            row_sums = np.asarray(P_obs.sum(axis=1)).ravel()
+            row_sums[row_sums == 0] = 1.0
+            diag_inv = sparse.diags(1.0 / row_sums, format="csr")
+            P_norm = diag_inv @ P_obs
+
+            query_rows = np.where(col_missing_query)[0]
+
+            ref_vals = X_ref[:, m].copy()
+            ref_vals[missing_ref[:, m]] = 0.0
+
+            if m in cat_set:
+                # Categorical: weighted vote
+                categories = np.unique(X_ref[:, m][~missing_ref[:, m]])
+                if categories.size == 0:
+                    continue
+                cat_idx = np.searchsorted(categories, ref_vals)
+                cat_idx = np.clip(cat_idx, 0, categories.size - 1)
+                one_hot = sparse.csc_matrix(
+                    (observed_ref, (np.arange(len(ref_vals)), cat_idx)),
+                    shape=(len(ref_vals), categories.size),
+                )
+                votes = P_norm[query_rows] @ one_hot
+                votes_dense = np.asarray(votes.todense() if sparse.issparse(votes) else votes)
+                best = np.argmax(votes_dense, axis=1)
+                X_query[query_rows, m] = categories[best]
+            else:
+                # Continuous: weighted average
+                result = P_norm[query_rows] @ ref_vals
+                if sparse.issparse(result):
+                    result = np.asarray(result.todense()).ravel()
+                X_query[query_rows, m] = result
+
+    def outlier_scores(
+        self,
+        y: Any,
+        scaling: Optional[Literal["normalize", "log"]] = None,
+    ) -> np.ndarray:
+        """
+        Compute class-relative outlier scores from the proximity matrix.
+
+        An outlier in class *j* is a case whose proximities to all other
+        class-*j* cases are small.  Following Breiman's definition:
+
+        1. For each case *n* in class *j*, compute
+           ``avg_prox(n) = sum_k prox(n, k)^2`` over same-class cases.
+        2. Raw outlier measure: ``n_j / avg_prox(n)``.
+        3. Within each class, standardise by subtracting the median and
+           dividing by the median absolute deviation (MAD).
+
+        Parameters
+        ----------
+        y : array-like of shape (n_samples,)
+            Class labels for training samples.
+        scaling : {None, 'normalize', 'log'}, optional
+            Post-processing applied to the standardised scores.
+
+            - ``None``: return the raw MAD-standardised scores.
+            - ``'normalize'``: rescale to [0, 1].
+            - ``'log'``: apply ``log(1 + score)``.
+
+        Returns
+        -------
+        scores : np.ndarray of shape (n_samples,)
+            Outlier scores (higher = more outlier-like).
+        """
+        self._check_proximity_ready()
+        y_arr = np.asarray(y)
+        n_samples = len(y_arr)
+
+        # Get proximities with zero diagonal and no symmetrisation so the
+        # raw self-proximity does not inflate within-class sums.
+        orig_nzd = self.non_zero_diagonal
+        orig_sym = self.symm_mode
+        self.non_zero_diagonal = False
+        self.symm_mode = None
+        try:
+            P = self.get_proximities()
+        finally:
+            self.non_zero_diagonal = orig_nzd
+            self.symm_mode = orig_sym
+
+        if not sparse.issparse(P):
+            P = sparse.csr_matrix(P)
+
+        # Sum of squared proximities to same-class samples
+        avg_prox = np.zeros(n_samples, dtype=np.float64)
+        classes = np.unique(y_arr)
+        for cls in classes:
+            idx = np.where(y_arr == cls)[0]
+            P_sub = P[idx][:, idx]
+            P_sub_sq = P_sub.multiply(P_sub)
+            avg_prox[idx] = np.asarray(P_sub_sq.sum(axis=1)).ravel()
+
+        avg_prox[avg_prox == 0] = 1e-10
+
+        # Raw outlier measure
+        raw_scores = np.zeros(n_samples, dtype=np.float64)
+        for cls in classes:
+            idx = np.where(y_arr == cls)[0]
+            raw_scores[idx] = len(idx) / avg_prox[idx]
+
+        # MAD-standardise within each class
+        scores = np.zeros(n_samples, dtype=np.float64)
+        for cls in classes:
+            idx = np.where(y_arr == cls)[0]
+            class_raw = raw_scores[idx]
+            med = np.median(class_raw)
+            mad = np.median(np.abs(class_raw - med))
+            if mad == 0:
+                scores[idx] = 0.0
+            else:
+                scores[idx] = np.abs(class_raw - med) / mad
+
+        if scaling == "log":
+            scores = np.log1p(scores)
+        elif scaling == "normalize":
+            lo, hi = scores.min(), scores.max()
+            if hi - lo > 0:
+                scores = (scores - lo) / (hi - lo)
+            else:
+                scores = np.zeros_like(scores)
+
+        return scores
+
     def _check_proximity_ready(self) -> None:
         check_is_fitted(cast(Any, self))
         if self.W_mat is None or self.leaf_matrix_ is None or self._leaf_encoding is None:
