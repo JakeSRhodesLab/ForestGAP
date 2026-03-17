@@ -166,6 +166,7 @@ class SparseProximityMixin:
         self._n_total_features: Optional[int] = None
         self._oob_surrogate_estimators_: Optional[List[Any]] = None
         self._oob_surrogate_leaf_matrix_: Optional[np.ndarray] = None
+        self._y_train: Optional[np.ndarray] = None
 
     def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "SparseProximityMixin":
         """
@@ -225,8 +226,11 @@ class SparseProximityMixin:
         """
         check_is_fitted(cast(Any, self))
 
+        self._y_train = np.asarray(y) if y is not None else None
         self._oob_surrogate_estimators_ = None
         self._oob_surrogate_leaf_matrix_ = None
+        self._rotation_original_leaf_encoding_: Optional[_LeafEncoding] = None
+        self._rotation_original_W_mat_: Optional[sparse.csr_matrix] = None
 
         apply_fn = getattr(self, "apply", None)
         if apply_fn is None:
@@ -242,6 +246,15 @@ class SparseProximityMixin:
 
             surrogate_leaves = getattr(self, "_oob_surrogate_leaf_matrix_", None)
             if surrogate_leaves is not None and surrogate_leaves.shape[0] == n_samples:
+                # RotationForest: cache original-tree proximity structures for
+                # prox_extend so that P_ext @ y reproduces predict(X_test).
+                if _is_rotation_forest_instance(self) and self.prox_method == "rfgap":
+                    orig_leaves = np.asarray(apply_fn(X))
+                    orig_encoding = self._build_leaf_encoding(orig_leaves)
+                    self._rotation_original_leaf_encoding_ = orig_encoding
+                    self._rotation_original_W_mat_ = self._build_W_uniform(
+                        orig_leaves, orig_encoding,
+                    )
                 leaves = np.asarray(surrogate_leaves)
 
         if leaves is None:
@@ -298,19 +311,44 @@ class SparseProximityMixin:
 
     def prox_extend(self, X_new: Any) -> MatrixLike:
         """
-        Compute proximities from new samples to fitted/training samples.
+        Compute proximities between new (test) samples and training samples.
+
+        Since test points were not used to build any tree, every test point is
+        treated as out-of-bag for every tree.  For supervised forests with
+        ``prox_method='rfgap'``, the returned matrix can be used as weights:
+        ``P @ y_train`` reproduces the forest's test predictions.
 
         Parameters
         ----------
-        X_new : array-like of shape (n_samples_new, n_features)
+        X_new : array-like of shape (n_test, n_features)
             New observations.
 
         Returns
         -------
         scipy.sparse.csr_matrix or numpy.ndarray
-            `(n_samples_new, n_train)` proximity matrix.
+            `(n_test, n_train)` proximity matrix.
         """
         self._check_proximity_ready()
+
+        # RotationForest rfgap: use original-tree W (c_j=1) so that
+        # P_ext @ y_train reproduces predict(X_test).
+        orig_W = getattr(self, "_rotation_original_W_mat_", None)
+        orig_enc = getattr(self, "_rotation_original_leaf_encoding_", None)
+        if (
+            _is_rotation_forest_instance(self)
+            and self.prox_method == "rfgap"
+            and orig_W is not None
+            and orig_enc is not None
+        ):
+            apply_fn = getattr(self, "apply", None)
+            if apply_fn is None:
+                raise RuntimeError("Estimator must implement apply(X) to use proximity methods.")
+            leaves_new = np.asarray(apply_fn(X_new))
+            Q_new = self._build_Q_matrix_with_encoding(
+                leaves_new, orig_enc, orig_W.shape[1],
+            )
+            P_new = cast(sparse.csr_matrix, Q_new.dot(orig_W.T).tocsr())
+            return P_new.toarray() if self.matrix_type == "dense" else P_new
 
         surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
         if _is_rotation_forest_instance(self) and surrogate_estimators is not None:
@@ -331,6 +369,58 @@ class SparseProximityMixin:
             P_new.data = np.minimum(P_new.data, 1.0)
 
         return P_new.toarray() if self.matrix_type == "dense" else P_new
+
+    def prox_predict(self, X: Any = None) -> np.ndarray:
+        """
+        Predict using rfgap proximity-weighted training labels.
+
+        For classifiers, returns class probability estimates (matching
+        ``predict_proba`` for test data or ``oob_decision_function_`` for
+        training data).  For regressors, returns predicted values (matching
+        ``predict`` for test data or ``oob_prediction_`` for training data).
+        When ``X`` is ``None``, out-of-bag predictions for the training
+        data are returned.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features), optional
+            Test data.  If ``None``, returns OOB predictions for training
+            data.
+
+        Returns
+        -------
+        predictions : np.ndarray
+            Class probabilities of shape (n_samples, n_classes) for
+            classifiers, or predicted values of shape (n_samples,) for
+            regressors.
+        """
+        if self.prox_method != "rfgap":
+            raise ValueError("prox_predict requires prox_method='rfgap'")
+        if self._y_train is None:
+            raise RuntimeError(
+                "No training labels available. Refit with labels to use prox_predict."
+            )
+
+        P = self.get_proximities() if X is None else self.prox_extend(X)
+
+        classes = getattr(self, "classes_", None)
+        if classes is not None:
+            classes = np.asarray(classes)
+            y_idx = np.searchsorted(classes, self._y_train)
+            y_hot = sparse.csc_matrix(
+                (np.ones(len(y_idx), dtype=np.float64), (np.arange(len(y_idx)), y_idx)),
+                shape=(len(y_idx), classes.shape[0]),
+            )
+            prox_prob = np.asarray((P @ y_hot).todense() if sparse.issparse(P) else P @ y_hot)
+            if X is None:
+                rs = prox_prob.sum(axis=1, keepdims=True)
+                rs[rs == 0] = 1.0
+                prox_prob /= rs
+            return prox_prob
+
+        y = self._y_train.astype(np.float64)
+        result = P @ y
+        return np.asarray(result.todense()).ravel() if sparse.issparse(result) else np.asarray(result).ravel()
 
     def _check_proximity_ready(self) -> None:
         check_is_fitted(cast(Any, self))
@@ -477,6 +567,104 @@ class SparseProximityMixin:
             dtype=np.float32,
         )
         self._n_total_features = total_cols
+
+    def _build_W_uniform(
+        self, leaves: np.ndarray, encoding: _LeafEncoding,
+    ) -> sparse.csr_matrix:
+        """Build an rfgap-style W matrix with uniform in-bag counts (c_j=1).
+
+        Used for RotationForest where trees are fitted on all data without
+        bootstrap.  W[j, leaf] = 1 / m_leaf where m_leaf is the number of
+        training samples in that leaf.
+        """
+        n_samples, n_trees = leaves.shape
+        rows, cols, _ = self._map_leaves_to_global_with_encoding(leaves, encoding)
+        if rows.size == 0:
+            return sparse.csr_matrix(
+                (n_samples, encoding.total_features), dtype=np.float32,
+            )
+
+        total_cols = encoding.total_features
+
+        leaf_mass = np.bincount(cols, minlength=total_cols).astype(np.float32)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inv_leaf_mass = 1.0 / leaf_mass
+        inv_leaf_mass[~np.isfinite(inv_leaf_mass)] = 0.0
+
+        weights = inv_leaf_mass[cols]
+
+        keep_nonzero = weights > 0
+        return sparse.csr_matrix(
+            (weights[keep_nonzero], (rows[keep_nonzero], cols[keep_nonzero])),
+            shape=(n_samples, total_cols),
+            dtype=np.float32,
+        )
+
+    def _build_Q_matrix_with_encoding(
+        self,
+        leaves: np.ndarray,
+        encoding: _LeafEncoding,
+        total_features: int,
+    ) -> sparse.csr_matrix:
+        """Build a Q matrix for test data using a given leaf encoding.
+
+        Each test point is treated as OOB for every tree, so Q values are 1/T.
+        """
+        n_samples, n_trees = leaves.shape
+        rows, cols, _ = self._map_leaves_to_global_with_encoding(leaves, encoding)
+        vals = np.full(rows.shape[0], 1.0 / n_trees, dtype=np.float32)
+
+        return sparse.csr_matrix(
+            (vals, (rows, cols)),
+            shape=(n_samples, total_features),
+            dtype=np.float32,
+        )
+
+    def _map_leaves_to_global_with_encoding(
+        self,
+        leaves: np.ndarray,
+        encoding: _LeafEncoding,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Map leaf indices to global column indices using a given encoding."""
+        n_samples, n_trees = leaves.shape
+        all_rows: List[np.ndarray] = []
+        all_cols: List[np.ndarray] = []
+        all_trees: List[np.ndarray] = []
+
+        for t in range(n_trees):
+            known = encoding.values_per_tree[t]
+            test_vals = leaves[:, t]
+
+            pos = np.searchsorted(known, test_vals)
+            in_range = pos < known.shape[0]
+            eq = np.zeros_like(in_range, dtype=bool)
+            idx_in = np.nonzero(in_range)[0]
+            if idx_in.size > 0:
+                eq[idx_in] = known[pos[idx_in]] == test_vals[idx_in]
+            valid = in_range & eq
+            if not np.any(valid):
+                continue
+
+            rows_t = np.nonzero(valid)[0]
+            cols_t = encoding.offsets[t] + pos[valid]
+            trees_t = np.full(rows_t.shape[0], t, dtype=np.int32)
+
+            all_rows.append(rows_t)
+            all_cols.append(cols_t.astype(np.int64))
+            all_trees.append(trees_t)
+
+        if not all_rows:
+            return (
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int64),
+                np.zeros(0, dtype=np.int32),
+            )
+
+        return (
+            np.concatenate(all_rows).astype(np.int64),
+            np.concatenate(all_cols).astype(np.int64),
+            np.concatenate(all_trees),
+        )
 
     def _build_Q_matrix(self, leaves: np.ndarray, is_training: bool) -> sparse.csr_matrix:
         if self._leaf_encoding is None or self._n_total_features is None:
@@ -1039,9 +1227,6 @@ class _RotationForestOOBAdapter:
             return
         y_arr = np.asarray(y)
 
-        # Prefer OOB attributes computed via RotationForest's bootstrap
-        # train-estimate routines, driven by the same per-tree RNG stream used
-        # for RF-GAP OOB extraction.
         try:
             train_proba_fn = getattr(self, "_train_probas_for_estimator", None)
             train_pred_fn = getattr(self, "_train_preds_for_estimator", None)

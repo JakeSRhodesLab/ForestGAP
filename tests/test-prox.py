@@ -169,6 +169,19 @@ class TestSparseProximityMixin(unittest.TestCase):
     def _regression_models_oob_matchable(self):
         return self._regression_models()
 
+    def _classification_models_extend_matchable(self):
+        """Classification models whose extended rfgap proximities reproduce predict.
+
+        HonestForestClassifier is excluded because honest splitting computes
+        predictions from a held-out honest subset.
+        """
+        return [(n, c) for n, c in self._classification_models()
+                if "Honest" not in n]
+
+    def _regression_models_extend_matchable(self):
+        """Regression models whose extended rfgap proximities reproduce predict."""
+        return self._regression_models()
+
     def test_fit_predict_get_proximities_all_models_methods(self):
         Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
         Xr_tr, yr_tr, Xr_te, _ = self._regression_data()
@@ -293,6 +306,105 @@ class TestSparseProximityMixin(unittest.TestCase):
                             _ = model.predict(Xu_te)
                             prox = model.get_proximities()
                             self.assertEqual(prox.shape, (Xu_tr.shape[0], Xu_tr.shape[0]))
+
+    def test_supervised_rfgap_extend_matches_predictions(self):
+        """Extended rfgap proximities used as weights reproduce forest predictions."""
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        Xr_tr, yr_tr, Xr_te, _ = self._regression_data()
+
+        for name, cls in self._classification_models_extend_matchable():
+            with self.subTest(task="classification", model=name):
+                kwargs = {"bootstrap": True}
+                if "bootstrap" not in inspect.signature(cls.__init__).parameters:
+                    kwargs = {}
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=8, **kwargs)
+                self._fit(model, Xc_tr, yc_tr)
+
+                prox_ext = self._to_dense(model.prox_extend(Xc_te))  # (n_test, n_train)
+
+                classes = np.asarray(model.classes_)
+                y_idx = np.searchsorted(classes, yc_tr)
+                y_hot = np.eye(classes.shape[0], dtype=np.float64)[y_idx]
+
+                # prox_ext @ y_one_hot should match predict_proba
+                prox_prob = prox_ext @ y_hot
+
+                forest_prob = np.asarray(model.predict_proba(Xc_te), dtype=np.float64)
+                np.testing.assert_allclose(prox_prob, forest_prob, rtol=1e-4, atol=1e-4)
+
+        for name, cls in self._regression_models_extend_matchable():
+            with self.subTest(task="regression", model=name):
+                kwargs = {"bootstrap": True}
+                if "bootstrap" not in inspect.signature(cls.__init__).parameters:
+                    kwargs = {}
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=9, **kwargs)
+                self._fit(model, Xr_tr, yr_tr)
+
+                prox_ext = self._to_dense(model.prox_extend(Xr_te))  # (n_test, n_train)
+
+                # prox_ext @ y_train should match predict
+                prox_pred = prox_ext @ yr_tr
+
+                forest_pred = np.asarray(model.predict(Xr_te), dtype=np.float64)
+                np.testing.assert_allclose(prox_pred, forest_pred, rtol=1e-4, atol=1e-4)
+
+    def test_prox_predict_test_data_matches_forest_predict(self):
+        """prox_predict(X_test) reproduces the forest's test predictions."""
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        Xr_tr, yr_tr, Xr_te, _ = self._regression_data()
+
+        for name, cls in self._classification_models_extend_matchable():
+            with self.subTest(task="classification", model=name):
+                kwargs = {"bootstrap": True}
+                if "bootstrap" not in inspect.signature(cls.__init__).parameters:
+                    kwargs = {}
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=10, **kwargs)
+                self._fit(model, Xc_tr, yc_tr)
+
+                prox_prob = model.prox_predict(Xc_te)
+                forest_prob = np.asarray(model.predict_proba(Xc_te), dtype=np.float64)
+                np.testing.assert_allclose(prox_prob, forest_prob, rtol=1e-4, atol=1e-4)
+
+        for name, cls in self._regression_models_extend_matchable():
+            with self.subTest(task="regression", model=name):
+                kwargs = {"bootstrap": True}
+                if "bootstrap" not in inspect.signature(cls.__init__).parameters:
+                    kwargs = {}
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=11, **kwargs)
+                self._fit(model, Xr_tr, yr_tr)
+
+                prox_pred = model.prox_predict(Xr_te)
+                forest_pred = np.asarray(model.predict(Xr_te), dtype=np.float64)
+                np.testing.assert_allclose(prox_pred, forest_pred, rtol=1e-4, atol=1e-4)
+
+    def test_prox_predict_training_data_matches_oob(self):
+        """prox_predict() with no args returns OOB predictions for training data."""
+        Xc_tr, yc_tr, _, _ = self._classification_data()
+        Xr_tr, yr_tr, _, _ = self._regression_data()
+
+        for name, cls in self._classification_models_oob_matchable():
+            with self.subTest(task="classification", model=name):
+                kwargs = {"oob_score": True}
+                if "bootstrap" in inspect.signature(cls.__init__).parameters:
+                    kwargs["bootstrap"] = True
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=12, **kwargs)
+                self._fit(model, Xc_tr, yc_tr)
+
+                prox_prob = model.prox_predict()
+                oob_prob = np.asarray(model.oob_decision_function_, dtype=np.float64)
+                np.testing.assert_allclose(prox_prob, oob_prob, rtol=1e-6, atol=1e-6)
+
+        for name, cls in self._regression_models_oob_matchable():
+            with self.subTest(task="regression", model=name):
+                kwargs = {"oob_score": True}
+                if "bootstrap" in inspect.signature(cls.__init__).parameters:
+                    kwargs["bootstrap"] = True
+                model = self._build_model(cls, "rfgap", n_estimators=20, random_state=13, **kwargs)
+                self._fit(model, Xr_tr, yr_tr)
+
+                prox_pred = model.prox_predict()
+                oob_pred = np.asarray(model.oob_prediction_, dtype=np.float64)
+                np.testing.assert_allclose(prox_pred, oob_pred, rtol=1e-6, atol=1e-6)
 
     def test_proximity_matrices_are_finite_and_nonnegative(self):
         Xc_tr, yc_tr, _, _ = self._classification_data()
