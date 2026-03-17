@@ -427,6 +427,7 @@ class SparseProximityMixin:
         X: Any,
         categorical_features: Optional[Sequence[int]] = None,
         X_test: Optional[Any] = None,
+        initialization: str = "median",
     ) -> Any:
         """
         Impute missing values using proximity-weighted replacement.
@@ -454,6 +455,10 @@ class SparseProximityMixin:
             Test data with ``np.nan`` / ``NaN`` marking missing entries.
             If provided, imputed using ``prox_extend`` proximities against
             training points.
+        initialization : str, default ``'median'``
+            Strategy used to rough-fill NaN values before computing test
+            proximities (``prox_extend`` requires NaN-free input).
+            Options: ``'mean'``, ``'median'``, ``'knn'``.
 
         Returns
         -------
@@ -462,6 +467,10 @@ class SparseProximityMixin:
         X_test_imputed : np.ndarray or DataFrame
             Returned only when *X_test* is provided.
         """
+        if initialization not in ("mean", "median", "knn"):
+            raise ValueError(
+                f"initialization must be 'mean', 'median', or 'knn', got {initialization!r}"
+            )
         self._check_proximity_ready()
 
         try:
@@ -501,14 +510,23 @@ class SparseProximityMixin:
             missing_test = np.isnan(X_test_imp)
 
             # prox_extend calls apply() which rejects NaN, so pass a
-            # rough-filled copy (column medians from the already-imputed
-            # training data) for leaf assignment only.
+            # rough-filled copy for leaf assignment only.
             X_test_filled = X_test_imp.copy()
-            col_medians = np.nanmedian(X_imp, axis=0)
-            for col in range(X_test_filled.shape[1]):
-                nans = np.isnan(X_test_filled[:, col])
-                if nans.any():
-                    X_test_filled[nans, col] = col_medians[col]
+            if initialization == "knn":
+                from sklearn.impute import KNNImputer
+                imputer = KNNImputer()
+                # Fit on already-imputed training data, transform test
+                imputer.fit(X_imp)
+                X_test_filled = imputer.transform(X_test_filled)
+            else:
+                if initialization == "mean":
+                    col_stats = np.nanmean(X_imp, axis=0)
+                else:  # median
+                    col_stats = np.nanmedian(X_imp, axis=0)
+                for col in range(X_test_filled.shape[1]):
+                    nans = np.isnan(X_test_filled[:, col])
+                    if nans.any():
+                        X_test_filled[nans, col] = col_stats[col]
 
             P_test = self.prox_extend(X_test_filled)
             if not sparse.issparse(P_test):

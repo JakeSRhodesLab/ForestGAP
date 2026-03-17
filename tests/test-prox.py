@@ -483,6 +483,44 @@ class TestSparseProximityMixin(unittest.TestCase):
         imputed_cats = set(np.unique(X_imp[:, -1]))
         self.assertTrue(imputed_cats.issubset(orig_cats))
 
+    def test_impute_initialization_options(self):
+        """impute works with mean, median, and knn initialization for test data."""
+        rng = np.random.RandomState(42)
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+
+        mask_tr = rng.rand(*Xc_tr.shape) < 0.10
+        mask_te = rng.rand(*Xc_te.shape) < 0.10
+        X_miss_tr = Xc_tr.copy()
+        X_miss_te = Xc_te.copy()
+        X_miss_tr[mask_tr] = np.nan
+        X_miss_te[mask_te] = np.nan
+
+        # Fit on rough-filled data
+        X_init = X_miss_tr.copy()
+        col_medians = np.nanmedian(X_init, axis=0)
+        for m in range(X_init.shape[1]):
+            nans = np.isnan(X_init[:, m])
+            X_init[nans, m] = col_medians[m]
+
+        model = self._build_model(
+            RandomForestClassifier, "rfgap", n_estimators=50,
+            random_state=14, bootstrap=True,
+        )
+        self._fit(model, X_init, yc_tr)
+
+        for init in ("mean", "median", "knn"):
+            with self.subTest(initialization=init):
+                X_imp_tr, X_imp_te = model.impute(
+                    X_miss_tr, X_test=X_miss_te, initialization=init,
+                )
+                self.assertFalse(np.isnan(X_imp_tr).any())
+                self.assertFalse(np.isnan(X_imp_te).any())
+                self.assertTrue(np.isfinite(X_imp_tr).all())
+                self.assertTrue(np.isfinite(X_imp_te).all())
+                # Observed entries unchanged
+                np.testing.assert_array_equal(X_imp_tr[~mask_tr], Xc_tr[~mask_tr])
+                np.testing.assert_array_equal(X_imp_te[~mask_te], Xc_te[~mask_te])
+
     def test_outlier_scores_basic(self):
         """outlier_scores returns finite, non-negative scores for every sample."""
         Xc_tr, yc_tr, _, _ = self._classification_data()
