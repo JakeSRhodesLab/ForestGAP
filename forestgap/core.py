@@ -613,14 +613,15 @@ class SparseProximityMixin:
 
     def outlier_scores(
         self,
-        y: Any,
+        y: Any = None,
         scaling: Optional[Literal["normalize", "log"]] = None,
+        method: Literal["breiman", "ene"] = "breiman",
     ) -> Any:
         """
-        Compute class-relative outlier scores from the proximity matrix.
+        Compute outlier scores from the proximity matrix.
 
-        An outlier in class *j* is a case whose proximities to all other
-        class-*j* cases are small.  Following Breiman's definition:
+        When *y* is provided (classification), scores are computed
+        class-relative following Breiman's definition:
 
         1. For each case *n* in class *j*, compute
            ``avg_prox(n) = sum_k prox(n, k)^2`` over same-class cases.
@@ -628,20 +629,43 @@ class SparseProximityMixin:
         3. Within each class, standardise by subtracting the median and
            dividing by the median absolute deviation (MAD).
 
+        When *y* is ``None`` (unsupervised / label-free), global
+        proximities are used instead:
+
+        1. ``avg_prox(n) = sum_k prox(n, k)^2`` over *all* samples.
+        2. Raw outlier measure: ``n / avg_prox(n)``.
+        3. MAD-standardise globally.
+
         Accepts numpy arrays or pandas Series / DataFrames for *y*.  When
         a pandas object with an index is passed, the result is returned as
         a ``pandas.Series`` with the same index.
 
         Parameters
         ----------
-        y : array-like, Series, or DataFrame of shape (n_samples,)
-            Class labels for training samples.
+        y : array-like, Series, DataFrame, or None
+            Class labels for training samples.  If ``None``, a global
+            (label-free) outlier score is computed using all pairwise
+            proximities.
         scaling : {None, 'normalize', 'log'}, optional
             Post-processing applied to the standardised scores.
 
             - ``None``: return the raw MAD-standardised scores.
             - ``'normalize'``: rescale to [0, 1].
             - ``'log'``: apply ``log(1 + score)``.
+        method : {'breiman', 'ene'}, default 'breiman'
+            Formula used to compute the raw outlier measure.
+
+            - ``'breiman'``: Breiman's sum-of-squared-proximity approach.
+              ``raw(n) = N / sum_k P(n,k)^2``.  Sensitive to the number
+              of proximity neighbours, which can cause central inliers in
+              IsolationForest to receive spuriously high scores.
+            - ``'ene'``: Effective Number of Neighbours (inverse
+              participation ratio).
+              ``ENE(n) = (sum_k P(n,k))^2 / (sum_k P(n,k)^2)``
+              and ``raw(n) = N / ENE(n)``.  This normalises out the
+              confounding effect of neighbour count, making it
+              well-suited for IsolationForest proximities where dense
+              regions accumulate many weak connections.
 
         Returns
         -------
@@ -656,11 +680,8 @@ class SparseProximityMixin:
         except ImportError:
             _has_pandas = False
 
-        y_is_pandas = _has_pandas and isinstance(y, (pd.Series, pd.DataFrame))
+        y_is_pandas = _has_pandas and y is not None and isinstance(y, (pd.Series, pd.DataFrame))
         y_index = y.index if y_is_pandas else None
-
-        y_arr = np.asarray(y)
-        n_samples = len(y_arr)
 
         # Get proximities with zero diagonal and no symmetrisation so the
         # raw self-proximity does not inflate within-class sums.
@@ -677,34 +698,70 @@ class SparseProximityMixin:
         if not sparse.issparse(P):
             P = sparse.csr_matrix(P)
 
-        # Sum of squared proximities to same-class samples
-        avg_prox = np.zeros(n_samples, dtype=np.float64)
-        classes = np.unique(y_arr)
-        for cls in classes:
-            idx = np.where(y_arr == cls)[0]
-            P_sub = P[idx][:, idx]
-            P_sub_sq = P_sub.multiply(P_sub)
-            avg_prox[idx] = np.asarray(P_sub_sq.sum(axis=1)).ravel()
+        n_samples = P.shape[0]
 
-        avg_prox[avg_prox == 0] = 1e-10
+        if y is None:
+            # --- Label-free (unsupervised) path ---
+            P_sq = P.multiply(P)
+            sum_P_sq = np.asarray(P_sq.sum(axis=1)).ravel()
 
-        # Raw outlier measure
-        raw_scores = np.zeros(n_samples, dtype=np.float64)
-        for cls in classes:
-            idx = np.where(y_arr == cls)[0]
-            raw_scores[idx] = len(idx) / avg_prox[idx]
-
-        # MAD-standardise within each class
-        scores = np.zeros(n_samples, dtype=np.float64)
-        for cls in classes:
-            idx = np.where(y_arr == cls)[0]
-            class_raw = raw_scores[idx]
-            med = np.median(class_raw)
-            mad = np.median(np.abs(class_raw - med))
-            if mad == 0:
-                scores[idx] = 0.0
+            if method == "ene":
+                sum_P = np.asarray(P.sum(axis=1)).ravel()
+                sum_P_sq_safe = sum_P_sq.copy()
+                sum_P_sq_safe[sum_P_sq_safe == 0] = 1e-10
+                ene = sum_P ** 2 / sum_P_sq_safe
+                ene[ene == 0] = 1e-10
+                raw_scores = n_samples / ene
             else:
-                scores[idx] = np.abs(class_raw - med) / mad
+                sum_P_sq[sum_P_sq == 0] = 1e-10
+                raw_scores = n_samples / sum_P_sq
+
+            med = np.median(raw_scores)
+            mad = np.median(np.abs(raw_scores - med))
+            if mad == 0:
+                scores = np.zeros(n_samples, dtype=np.float64)
+            else:
+                scores = np.abs(raw_scores - med) / mad
+        else:
+            # --- Class-relative (supervised) path ---
+            y_arr = np.asarray(y)
+
+            raw_scores = np.zeros(n_samples, dtype=np.float64)
+            classes = np.unique(y_arr)
+
+            if method == "ene":
+                for cls in classes:
+                    idx = np.where(y_arr == cls)[0]
+                    P_sub = P[idx][:, idx]
+                    sum_P_sub = np.asarray(P_sub.sum(axis=1)).ravel()
+                    P_sub_sq = P_sub.multiply(P_sub)
+                    sum_P_sub_sq = np.asarray(P_sub_sq.sum(axis=1)).ravel()
+                    sum_P_sub_sq[sum_P_sub_sq == 0] = 1e-10
+                    ene = sum_P_sub ** 2 / sum_P_sub_sq
+                    ene[ene == 0] = 1e-10
+                    raw_scores[idx] = len(idx) / ene
+            else:
+                avg_prox = np.zeros(n_samples, dtype=np.float64)
+                for cls in classes:
+                    idx = np.where(y_arr == cls)[0]
+                    P_sub = P[idx][:, idx]
+                    P_sub_sq = P_sub.multiply(P_sub)
+                    avg_prox[idx] = np.asarray(P_sub_sq.sum(axis=1)).ravel()
+                avg_prox[avg_prox == 0] = 1e-10
+                for cls in classes:
+                    idx = np.where(y_arr == cls)[0]
+                    raw_scores[idx] = len(idx) / avg_prox[idx]
+
+            scores = np.zeros(n_samples, dtype=np.float64)
+            for cls in classes:
+                idx = np.where(y_arr == cls)[0]
+                class_raw = raw_scores[idx]
+                med = np.median(class_raw)
+                mad = np.median(np.abs(class_raw - med))
+                if mad == 0:
+                    scores[idx] = 0.0
+                else:
+                    scores[idx] = np.abs(class_raw - med) / mad
 
         if scaling == "log":
             scores = np.log1p(scores)
