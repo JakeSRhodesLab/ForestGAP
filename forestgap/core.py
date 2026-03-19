@@ -15,6 +15,11 @@ from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted
 
+import matplotlib.pyplot as plt
+from sklearn.manifold import MDS
+import pandas as pd
+
+
 try:
     from sklearn.utils.validation import validate_data
 except ImportError:
@@ -776,6 +781,98 @@ class SparseProximityMixin:
             return pd.Series(scores, index=y_index, name="outlier_score")
         return scores
 
+    def plot_mds(
+        self,
+        X_test: Optional[Any] = None,
+        y: Optional[Any] = None,
+        y_test: Optional[Any] = None,
+    ) -> Any:
+        """
+        Visualize proximity matrix using metric MDS and scatterplot.
+        If X_test is provided, uses test proximities; else training.
+        Colors points by y (categorical or continuous).
+        Returns the matplotlib figure object.
+        """
+
+        # Obtain proximities and keep sparse when possible
+        if X_test is not None:
+            pr = self.prox_extend(X_test)
+            labels = y_test
+        else:
+            pr = self.get_proximities()
+            labels = y
+
+        # Ensure sparse representation until we must densify for MDS
+        if sparse.issparse(pr):
+            pr_sp = pr.tocsr()
+        else:
+            pr_sp = sparse.csr_matrix(np.asarray(pr))
+
+        # For rfgap, recompute proximities with non-zero diagonal & symm_mode
+        if self.prox_method == "rfgap":
+            orig_nzd = self.non_zero_diagonal
+            orig_sym = self.symm_mode
+            self.non_zero_diagonal = True
+            self.symm_mode = self.symm_mode or "arithmetic"
+            try:
+                pr_tmp = self.get_proximities() if X_test is None else self.prox_extend(X_test)
+                pr_sp = pr_tmp.tocsr() if sparse.issparse(pr_tmp) else sparse.csr_matrix(np.asarray(pr_tmp))
+            finally:
+                self.non_zero_diagonal = orig_nzd
+                self.symm_mode = orig_sym
+
+        # Compute sparse distance matrix: dist = sqrt(max(1 - prox, 0))
+        dist_sp = pr_sp.copy().astype(np.float64)
+        # data := 1 - data
+        np.subtract(1.0, dist_sp.data, out=dist_sp.data)
+        # clip negatives to zero then sqrt
+        dist_sp.data[dist_sp.data < 0] = 0.0
+        np.sqrt(dist_sp.data, out=dist_sp.data)
+
+        # MDS requires dense dissimilarity matrix — convert only now
+        dist = dist_sp.toarray()
+
+        # Fit MDS
+        mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42)
+        coords = mds.fit_transform(dist)
+
+        # Infer categorical vs. continuous for coloring
+        if labels is not None:
+            if pd is not None and isinstance(labels, (pd.Series, pd.DataFrame)):
+                arr = labels.values if hasattr(labels, "values") else np.asarray(labels)
+            else:
+                arr = np.asarray(labels)
+            if np.issubdtype(arr.dtype, np.integer) or (np.unique(arr).size <= 10):
+                unique = np.unique(arr)
+                cmap = plt.get_cmap("tab10") if unique.size <= 10 else plt.get_cmap("tab20")
+                colors = [cmap(i % cmap.N) for i in range(unique.size)]
+                color_dict = {v: colors[i] for i, v in enumerate(unique)}
+                color_vals = [color_dict[v] for v in arr]
+                scatter_kwargs = {"c": color_vals, "label": None}
+            else:
+                scatter_kwargs = {"c": arr, "cmap": "viridis", "label": None}
+        else:
+            scatter_kwargs = {"c": "gray", "label": None}
+
+        fig, ax = plt.subplots(figsize=(7, 6))
+        sc = ax.scatter(coords[:, 0], coords[:, 1], s=60, **scatter_kwargs)
+        ax.set_xlabel("MDS 1")
+        ax.set_ylabel("MDS 2")
+        ax.set_title("MDS of Proximities")
+        if labels is not None:
+            if np.issubdtype(arr.dtype, np.integer) or (np.unique(arr).size <= 10):
+                unique = np.unique(arr)
+                from matplotlib.lines import Line2D
+
+                handles = [Line2D([0], [0], marker='o', color='w', markerfacecolor=color_dict[v], markersize=8, label=str(v)) for v in unique]
+                ax.legend(handles=handles, title="Class")
+            else:
+                fig.colorbar(sc, ax=ax, label="y")
+        plt.tight_layout()
+        plt.show()
+        return fig
+
+        
     def _check_proximity_ready(self) -> None:
         check_is_fitted(cast(Any, self))
         if self.W_mat is None or self.leaf_matrix_ is None or self._leaf_encoding is None:
