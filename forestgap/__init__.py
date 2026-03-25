@@ -15,10 +15,20 @@ from forestgap.core import (
     with_sparse_proximity,
     _RotationForestApplyAdapter,
 )
+from forestgap.datasets import (
+    OpenMLBenchmarkSuite,
+    OpenMLDataset,
+    load_openml_dataset,
+    load_openml_suite,
+)
 
 __version__ = "0.1.0"
 __all__ = [
     "SparseProximityMixin",
     "with_sparse_proximity",
     "_RotationForestApplyAdapter",
+    "OpenMLBenchmarkSuite",
+    "OpenMLDataset",
+    "load_openml_dataset",
+    "load_openml_suite",
 ]

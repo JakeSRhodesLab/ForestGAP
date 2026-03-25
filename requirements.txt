@@ -7,3 +7,4 @@ phate
 aeon
 scikit-tree>=0.8.0
 ipykernel
+openml
