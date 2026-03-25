@@ -85,6 +85,12 @@ def _split_frame_target(
 ) -> tuple[Any, Any, List[bool], List[str]]:
     target_columns = [target_name] if isinstance(target_name, str) else list(target_name)
     target_columns = [str(column) for column in target_columns]
+    missing_targets = [column for column in target_columns if column not in frame.columns]
+    if missing_targets:
+        raise ValueError(
+            "Requested target column(s) not found in dataset frame: "
+            f"{missing_targets}. Available columns: {list(frame.columns)}"
+        )
     feature_columns = [column for column in frame.columns if column not in target_columns]
 
     X = frame.loc[:, feature_columns]
@@ -105,6 +111,24 @@ def _split_frame_target(
             y = np.ravel(y)
 
     return X, y, X_categorical_indicator, feature_columns
+
+
+def _load_dataset_via_frame_split(
+    dataset: Any,
+    resolved_target: Union[str, Sequence[str]],
+    as_frame: bool,
+) -> tuple[Any, Any, List[bool], List[str]]:
+    frame, _, categorical_indicator, attribute_names = dataset.get_data(
+        target=None,
+        dataset_format="dataframe",
+    )
+    return _split_frame_target(
+        frame=frame,
+        categorical_indicator=categorical_indicator,
+        attribute_names=attribute_names,
+        target_name=resolved_target,
+        as_frame=as_frame,
+    )
 
 
 def _resolve_dataset_id_by_name(openml: Any, name: str, version: Optional[int]) -> int:
@@ -180,23 +204,26 @@ def load_openml_dataset(
         target_name if target_name is not None else getattr(dataset, "default_target_attribute", None)
     )
     if isinstance(resolved_target, list):
-        frame, _, categorical_indicator, attribute_names = dataset.get_data(
-            target=None,
-            dataset_format="dataframe",
-        )
-        X, y, categorical_indicator, attribute_names = _split_frame_target(
-            frame=frame,
-            categorical_indicator=categorical_indicator,
-            attribute_names=attribute_names,
-            target_name=resolved_target,
+        X, y, categorical_indicator, attribute_names = _load_dataset_via_frame_split(
+            dataset=dataset,
+            resolved_target=resolved_target,
             as_frame=as_frame,
         )
     else:
         dataset_format = "dataframe" if as_frame else "array"
-        X, y, categorical_indicator, attribute_names = dataset.get_data(
-            target=resolved_target,
-            dataset_format=dataset_format,
-        )
+        try:
+            X, y, categorical_indicator, attribute_names = dataset.get_data(
+                target=resolved_target,
+                dataset_format=dataset_format,
+            )
+        except IndexError:
+            if resolved_target is None:
+                raise
+            X, y, categorical_indicator, attribute_names = _load_dataset_via_frame_split(
+                dataset=dataset,
+                resolved_target=resolved_target,
+                as_frame=as_frame,
+            )
 
     metadata = {
         "dataset_id": getattr(dataset, "dataset_id", resolved_dataset_id),

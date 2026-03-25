@@ -117,6 +117,53 @@ class TestOpenMLDatasetLoading(unittest.TestCase):
         self.assertEqual(loaded.feature_names, ["A1", "A2"])
         self.assertEqual(loaded.categorical_indicator, [False, False])
 
+    def test_load_openml_dataset_falls_back_to_frame_split_on_openml_indexerror(self):
+        fake_dataset = SimpleNamespace(
+            dataset_id=42585,
+            name="iris",
+            version=1,
+            default_target_attribute="class",
+            description="iris",
+            url="https://www.openml.org/d/42585",
+            row_id_attribute=None,
+            ignore_attribute=None,
+            citation=None,
+            creator=None,
+            collection_date=None,
+            language=None,
+            licence=None,
+        )
+        frame = pd.DataFrame(
+            {
+                "A1": [5.1, 4.9],
+                "A2": [3.5, 3.0],
+                "class": ["setosa", "setosa"],
+            }
+        )
+
+        def fake_get_data(target, dataset_format):
+            if target == "class":
+                raise IndexError("list index out of range")
+            return frame, None, [False, False, True], ["A1", "A2", "class"]
+
+        fake_dataset.get_data = fake_get_data
+        fake_openml = SimpleNamespace(
+            datasets=SimpleNamespace(
+                list_datasets=lambda **kwargs: {
+                    42585: {"name": "iris", "version": 1},
+                },
+                get_dataset=lambda **kwargs: fake_dataset,
+            ),
+        )
+
+        with patch("forestgap.datasets._require_openml", return_value=fake_openml):
+            loaded = load_openml_dataset(name="iris")
+
+        self.assertEqual(loaded.target_name, "class")
+        self.assertEqual(list(loaded.X.columns), ["A1", "A2"])
+        self.assertEqual(list(loaded.y.astype(str)), ["setosa", "setosa"])
+        self.assertEqual(loaded.feature_names, ["A1", "A2"])
+
     def test_load_openml_suite_loads_each_task_dataset(self):
         fake_suite = SimpleNamespace(
             name="Toy Suite",
