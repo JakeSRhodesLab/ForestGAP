@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -37,6 +37,364 @@ class OpenMLBenchmarkSuite:
     datasets: List[OpenMLDataset]
     description: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SyntheticDataset:
+    """Normalized representation of a simulated dataset."""
+
+    name: str
+    X: np.ndarray
+    y: np.ndarray
+    feature_names: List[str]
+    description: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def _feature_names(n_features: int) -> List[str]:
+    return [f"x{i + 1}" for i in range(n_features)]
+
+
+def _rng(random_state: Optional[int]) -> np.random.RandomState:
+    return np.random.RandomState(random_state)
+
+
+def _append_noise_features(
+    rng: np.random.RandomState,
+    signal: np.ndarray,
+    n_features: int,
+    noise_scale: float = 1.0,
+) -> np.ndarray:
+    if n_features < signal.shape[1]:
+        raise ValueError(
+            f"n_features={n_features} must be at least the signal dimension {signal.shape[1]}."
+        )
+    if n_features == signal.shape[1]:
+        return signal
+    noise = rng.normal(scale=noise_scale, size=(signal.shape[0], n_features - signal.shape[1]))
+    return np.column_stack([signal, noise])
+
+
+def _rotation_matrix(angle_degrees: float) -> np.ndarray:
+    theta = np.deg2rad(angle_degrees)
+    return np.array(
+        [
+            [np.cos(theta), -np.sin(theta)],
+            [np.sin(theta), np.cos(theta)],
+        ]
+    )
+
+
+def _finalize_synthetic_dataset(
+    *,
+    name: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    description: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> SyntheticDataset:
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int64)
+    return SyntheticDataset(
+        name=name,
+        X=X,
+        y=y,
+        feature_names=_feature_names(X.shape[1]),
+        description=description,
+        metadata=metadata or {},
+    )
+
+
+def _random_projection(
+    rng: np.random.RandomState,
+    n_features: int,
+    n_active: Optional[int] = None,
+) -> np.ndarray:
+    if n_active is None or n_active >= n_features:
+        weights = rng.normal(size=n_features)
+    else:
+        weights = np.zeros(n_features, dtype=np.float64)
+        active = rng.choice(n_features, size=n_active, replace=False)
+        weights[active] = rng.normal(size=n_active)
+    norm = np.linalg.norm(weights)
+    if norm == 0:
+        weights[0] = 1.0
+        norm = 1.0
+    return weights / norm
+
+
+def make_rotated_linear_boundary(
+    n_samples: int = 400,
+    n_features: int = 2,
+    angle_degrees: float = 35.0,
+    noise_std: float = 0.25,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    latent = rng.normal(size=(n_samples, 2))
+    y = (latent[:, 0] + latent[:, 1] + rng.normal(scale=noise_std, size=n_samples) > 0).astype(int)
+    observed = latent @ _rotation_matrix(angle_degrees).T
+    X = _append_noise_features(rng, observed, n_features)
+    return _finalize_synthetic_dataset(
+        name="rotated_linear_boundary",
+        X=X,
+        y=y,
+        description="Binary classification with a diagonal linear boundary in rotated coordinates.",
+        metadata={
+            "angle_degrees": angle_degrees,
+            "noise_std": noise_std,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_rotated_xor(
+    n_samples: int = 400,
+    n_features: int = 2,
+    angle_degrees: float = 35.0,
+    feature_noise_std: float = 0.1,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    latent = rng.normal(size=(n_samples, 2))
+    y = np.logical_xor(latent[:, 0] > 0, latent[:, 1] > 0).astype(int)
+    observed = latent @ _rotation_matrix(angle_degrees).T
+    observed += rng.normal(scale=feature_noise_std, size=observed.shape)
+    X = _append_noise_features(rng, observed, n_features)
+    return _finalize_synthetic_dataset(
+        name="rotated_xor",
+        X=X,
+        y=y,
+        description="XOR classification after rotating the 2D feature space.",
+        metadata={
+            "angle_degrees": angle_degrees,
+            "feature_noise_std": feature_noise_std,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_oblique_gaussian_clusters(
+    n_samples: int = 400,
+    n_features: int = 2,
+    correlation: float = 0.85,
+    class_sep: float = 2.5,
+    angle_degrees: float = 25.0,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    n0 = n_samples // 2
+    n1 = n_samples - n0
+    cov = np.array([[1.0, correlation], [correlation, 1.0]])
+    rotation = _rotation_matrix(angle_degrees)
+    cov = rotation @ cov @ rotation.T
+    mean0 = rotation @ np.array([-class_sep / 2.0, 0.0])
+    mean1 = rotation @ np.array([class_sep / 2.0, 0.0])
+    X0 = rng.multivariate_normal(mean=mean0, cov=cov, size=n0)
+    X1 = rng.multivariate_normal(mean=mean1, cov=cov, size=n1)
+    signal = np.vstack([X0, X1])
+    y = np.concatenate([np.zeros(n0, dtype=int), np.ones(n1, dtype=int)])
+    X = _append_noise_features(rng, signal, n_features, noise_scale=0.75)
+    return _finalize_synthetic_dataset(
+        name="oblique_gaussian_clusters",
+        X=X,
+        y=y,
+        description="Correlated Gaussian class clusters with oblique covariance structure.",
+        metadata={
+            "correlation": correlation,
+            "class_sep": class_sep,
+            "angle_degrees": angle_degrees,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_rotated_subspace_signal(
+    n_samples: int = 400,
+    n_features: int = 10,
+    signal_noise_std: float = 0.25,
+    feature_noise_std: float = 0.5,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    if n_features < 2:
+        raise ValueError("n_features must be at least 2 for the rotated subspace simulation.")
+    rng = _rng(random_state)
+    latent = rng.normal(size=(n_samples, 2))
+    y = (latent[:, 0] + 0.5 * latent[:, 1] + rng.normal(scale=signal_noise_std, size=n_samples) > 0).astype(int)
+    mixing = rng.normal(size=(n_features, 2))
+    q, _ = np.linalg.qr(mixing)
+    X = latent @ q[:, :2].T + rng.normal(scale=feature_noise_std, size=(n_samples, n_features))
+    return _finalize_synthetic_dataset(
+        name="rotated_subspace_signal",
+        X=X,
+        y=y,
+        description="Signal lives in a rotated 2D latent subspace embedded in higher dimensions.",
+        metadata={
+            "signal_noise_std": signal_noise_std,
+            "feature_noise_std": feature_noise_std,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_additive_interaction_correlated(
+    n_samples: int = 400,
+    n_features: int = 6,
+    correlation: float = 0.7,
+    noise_std: float = 0.2,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    if n_features < 3:
+        raise ValueError("n_features must be at least 3 for the additive interaction simulation.")
+    rng = _rng(random_state)
+    cov = np.full((n_features, n_features), correlation, dtype=np.float64)
+    np.fill_diagonal(cov, 1.0)
+    X = rng.multivariate_normal(mean=np.zeros(n_features), cov=cov, size=n_samples)
+    signal = X[:, 0] * X[:, 1] + 0.3 * X[:, 2] + rng.normal(scale=noise_std, size=n_samples)
+    y = (signal > 0).astype(int)
+    return _finalize_synthetic_dataset(
+        name="additive_interaction_correlated",
+        X=X,
+        y=y,
+        description="Interaction-driven signal with correlated predictors.",
+        metadata={
+            "correlation": correlation,
+            "noise_std": noise_std,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_diagonal_band(
+    n_samples: int = 400,
+    n_features: int = 2,
+    band_width: float = 0.45,
+    noise_std: float = 0.05,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    signal = rng.uniform(-2.0, 2.0, size=(n_samples, 2))
+    y = (np.abs(signal[:, 0] - signal[:, 1] + rng.normal(scale=noise_std, size=n_samples)) < band_width).astype(int)
+    X = _append_noise_features(rng, signal, n_features, noise_scale=0.75)
+    return _finalize_synthetic_dataset(
+        name="diagonal_band",
+        X=X,
+        y=y,
+        description="Thin band classification aligned with x1 - x2 rather than the coordinate axes.",
+        metadata={
+            "band_width": band_width,
+            "noise_std": noise_std,
+            "n_samples": n_samples,
+            "n_features": n_features,
+        },
+    )
+
+
+def make_sparse_oblique_hyperplane(
+    n_samples: int = 400,
+    n_features: int = 12,
+    n_informative: int = 4,
+    margin_noise_std: float = 0.2,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    if n_informative > n_features:
+        raise ValueError("n_informative must be less than or equal to n_features.")
+    rng = _rng(random_state)
+    X = rng.normal(size=(n_samples, n_features))
+    weights = _random_projection(rng, n_features, n_active=n_informative)
+    margins = X @ weights + rng.normal(scale=margin_noise_std, size=n_samples)
+    y = (margins > 0).astype(int)
+    return _finalize_synthetic_dataset(
+        name="sparse_oblique_hyperplane",
+        X=X,
+        y=y,
+        description="High-dimensional sparse linear boundary defined by a projection across a few active features.",
+        metadata={
+            "n_samples": n_samples,
+            "n_features": n_features,
+            "n_informative": n_informative,
+            "margin_noise_std": margin_noise_std,
+        },
+    )
+
+
+def make_oblique_slab(
+    n_samples: int = 400,
+    n_features: int = 8,
+    slab_half_width: float = 0.4,
+    margin_noise_std: float = 0.05,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    X = rng.normal(size=(n_samples, n_features))
+    weights = _random_projection(rng, n_features, n_active=min(4, n_features))
+    signed_distance = X @ weights + rng.normal(scale=margin_noise_std, size=n_samples)
+    y = (np.abs(signed_distance) < slab_half_width).astype(int)
+    return _finalize_synthetic_dataset(
+        name="oblique_slab",
+        X=X,
+        y=y,
+        description="Thin positive slab around an oblique hyperplane, requiring multiple axis-aligned boxes to approximate.",
+        metadata={
+            "n_samples": n_samples,
+            "n_features": n_features,
+            "slab_half_width": slab_half_width,
+            "margin_noise_std": margin_noise_std,
+        },
+    )
+
+
+def make_dual_projection_xor(
+    n_samples: int = 400,
+    n_features: int = 8,
+    projection_noise_std: float = 0.1,
+    random_state: Optional[int] = None,
+) -> SyntheticDataset:
+    rng = _rng(random_state)
+    X = rng.normal(size=(n_samples, n_features))
+    w1 = _random_projection(rng, n_features, n_active=min(4, n_features))
+    w2 = _random_projection(rng, n_features, n_active=min(4, n_features))
+    proj1 = X @ w1 + rng.normal(scale=projection_noise_std, size=n_samples)
+    proj2 = X @ w2 + rng.normal(scale=projection_noise_std, size=n_samples)
+    y = np.logical_xor(proj1 > 0, proj2 > 0).astype(int)
+    return _finalize_synthetic_dataset(
+        name="dual_projection_xor",
+        X=X,
+        y=y,
+        description="XOR classification defined on two different oblique projections in higher dimensions.",
+        metadata={
+            "n_samples": n_samples,
+            "n_features": n_features,
+            "projection_noise_std": projection_noise_std,
+        },
+    )
+
+
+SIMULATION_DATASET_GENERATORS: Dict[str, Callable[..., SyntheticDataset]] = {
+    "rotated_linear_boundary": make_rotated_linear_boundary,
+    "rotated_xor": make_rotated_xor,
+    "oblique_gaussian_clusters": make_oblique_gaussian_clusters,
+    "rotated_subspace_signal": make_rotated_subspace_signal,
+    "additive_interaction_correlated": make_additive_interaction_correlated,
+    "diagonal_band": make_diagonal_band,
+    "sparse_oblique_hyperplane": make_sparse_oblique_hyperplane,
+    "oblique_slab": make_oblique_slab,
+    "dual_projection_xor": make_dual_projection_xor,
+}
+
+
+def load_simulated_dataset(name: str, **kwargs: Any) -> SyntheticDataset:
+    if name not in SIMULATION_DATASET_GENERATORS:
+        raise ValueError(
+            f"Unknown simulated dataset {name!r}. "
+            f"Available datasets: {sorted(SIMULATION_DATASET_GENERATORS)}"
+        )
+    return SIMULATION_DATASET_GENERATORS[name](**kwargs)
 
 
 def _require_openml() -> Any:
@@ -325,6 +683,18 @@ def load_openml_suite(
 __all__ = [
     "OpenMLBenchmarkSuite",
     "OpenMLDataset",
+    "SyntheticDataset",
+    "SIMULATION_DATASET_GENERATORS",
     "load_openml_dataset",
     "load_openml_suite",
+    "load_simulated_dataset",
+    "make_rotated_linear_boundary",
+    "make_rotated_xor",
+    "make_oblique_gaussian_clusters",
+    "make_rotated_subspace_signal",
+    "make_additive_interaction_correlated",
+    "make_diagonal_band",
+    "make_sparse_oblique_hyperplane",
+    "make_oblique_slab",
+    "make_dual_projection_xor",
 ]
