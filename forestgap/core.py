@@ -20,6 +20,47 @@ from sklearn.manifold import MDS
 import pandas as pd
 
 
+def patch_treeple_regressor_tags() -> bool:
+    """Patch treeple regressor sklearn tags across sklearn versions.
+
+    treeple 0.10.3 tries to set ``tags.regressor_tags.multi_label = True`` in
+    its bundled sklearn forest regressor implementation. Some scikit-learn
+    versions do not define ``multi_label`` on ``RegressorTags``, which raises
+    ``AttributeError`` during fit.
+
+    Returns
+    -------
+    bool
+        True when the patch is installed (or already present), False when
+        treeple is unavailable.
+    """
+
+    try:
+        from treeple._lib.sklearn.ensemble._forest import ForestRegressor
+    except Exception:
+        return False
+
+    if getattr(ForestRegressor, "_forestgap_tags_patch", False):
+        return True
+
+    def _patched_sklearn_tags(self):
+        tags = super(ForestRegressor, self).__sklearn_tags__()
+        regressor_tags = getattr(tags, "regressor_tags", None)
+        if regressor_tags is not None:
+            try:
+                regressor_tags.multi_label = True
+            except AttributeError:
+                pass
+        return tags
+
+    ForestRegressor.__sklearn_tags__ = _patched_sklearn_tags
+    ForestRegressor._forestgap_tags_patch = True
+    return True
+
+
+patch_treeple_regressor_tags()
+
+
 try:
     from sklearn.utils.validation import validate_data
 except ImportError:
@@ -1345,7 +1386,7 @@ class SparseProximityMixin:
                     oob_mask[idx, t] = 0
                 return oob_mask, in_bag_counts
             except AttributeError:
-                # Some sktree forests (e.g. UnsupervisedRandomForest) expose
+                # Some treeple forests (e.g. UnsupervisedRandomForest) expose
                 # _get_estimators_indices but lack _n_samples; fall through to
                 # the _generate_sample_indices fallback.
                 oob_mask[:] = 0
@@ -1506,6 +1547,18 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
                 if bootstrap_val is None and bootstrap_param is not None and bootstrap_param.default is not inspect._empty:
                     bootstrap_val = bootstrap_param.default
 
+                max_samples_param = base_sig.parameters.get("max_samples")
+                max_samples_val = kwargs.get("max_samples", None)
+                if (
+                    max_samples_val is None
+                    and max_samples_param is not None
+                    and max_samples_param.default is not inspect._empty
+                ):
+                    max_samples_val = max_samples_param.default
+
+                if bootstrap_val is False and max_samples_val is not None:
+                    kwargs["max_samples"] = None
+
                 if requested_oob_score and bootstrap_val is False:
                     kwargs["oob_score"] = False
                     effective_oob_score = False
@@ -1519,7 +1572,7 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
                 kwargs["oob_score"] = False
                 effective_oob_score = False
 
-            # sktree ForestCluster (UnsupervisedRandomForest) has a buggy
+            # treeple ForestCluster (UnsupervisedRandomForest) has a buggy
             # _set_oob_score_and_attributes; always disable the base model's
             # oob_score and let the mixin handle OOB computation itself.
             _is_forest_cluster = any(

@@ -33,7 +33,7 @@ except Exception:
     _HAS_AEON = False
 
 try:
-    from sktree import (
+    from treeple import (
         ObliqueRandomForestClassifier,
         ObliqueRandomForestRegressor,
         PatchObliqueRandomForestClassifier,
@@ -44,9 +44,9 @@ try:
         UnsupervisedRandomForest,
         ExtendedIsolationForest,
     )
-    _HAS_SKTREE = True
+    _HAS_TREEPLE = True
 except Exception:
-    _HAS_SKTREE = False
+    _HAS_TREEPLE = False
 
 
 class TestSparseProximityMixin(unittest.TestCase):
@@ -121,7 +121,7 @@ class TestSparseProximityMixin(unittest.TestCase):
         ]
         if _HAS_AEON:
             models.append(("RotationForestClassifier", RotationForestClassifier))
-        if _HAS_SKTREE:
+        if _HAS_TREEPLE:
             models.extend([
                 ("ObliqueRandomForestClassifier", ObliqueRandomForestClassifier),
                 ("PatchObliqueRandomForestClassifier", PatchObliqueRandomForestClassifier),
@@ -137,7 +137,7 @@ class TestSparseProximityMixin(unittest.TestCase):
         ]
         if _HAS_AEON:
             models.append(("RotationForestRegressor", RotationForestRegressor))
-        if _HAS_SKTREE:
+        if _HAS_TREEPLE:
             models.extend([
                 ("ObliqueRandomForestRegressor", ObliqueRandomForestRegressor),
                 ("PatchObliqueRandomForestRegressor", PatchObliqueRandomForestRegressor),
@@ -149,7 +149,7 @@ class TestSparseProximityMixin(unittest.TestCase):
         models = [
             ("IsolationForest", IsolationForest),
         ]
-        if _HAS_SKTREE:
+        if _HAS_TREEPLE:
             models.extend([
                 ("UnsupervisedRandomForest", UnsupervisedRandomForest),
                 ("ExtendedIsolationForest", ExtendedIsolationForest),
