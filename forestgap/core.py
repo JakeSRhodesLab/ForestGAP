@@ -213,6 +213,10 @@ class SparseProximityMixin:
         self._oob_surrogate_estimators_: Optional[List[Any]] = None
         self._oob_surrogate_leaf_matrix_: Optional[np.ndarray] = None
         self._y_train: Optional[np.ndarray] = None
+        self._X_train: Optional[np.ndarray] = None
+        self._X_train_index_: Optional[pd.Index] = None
+        self._X_train_columns_: Optional[pd.Index] = None
+        self._X_train_was_dataframe_: bool = False
 
     def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "SparseProximityMixin":
         """
@@ -273,6 +277,7 @@ class SparseProximityMixin:
         check_is_fitted(cast(Any, self))
 
         self._y_train = np.asarray(y) if y is not None else None
+        self._store_training_features(X)
         self._oob_surrogate_estimators_ = None
         self._oob_surrogate_leaf_matrix_ = None
         self._rotation_original_leaf_encoding_: Optional[_LeafEncoding] = None
@@ -822,6 +827,209 @@ class SparseProximityMixin:
             return pd.Series(scores, index=y_index, name="outlier_score")
         return scores
 
+    def local_feature_importance(
+        self,
+        X: Optional[Any] = None,
+        labels: Optional[Any] = None,
+        *,
+        perturbation: Literal["auto", "flip", "permute"] = "auto",
+        n_repeats: int = 1,
+        random_state: Optional[Any] = None,
+        return_closeness: bool = False,
+    ) -> Any:
+        """
+        Compute Whitmore et al. (2018) local feature contributions.
+
+        The paper perturbs one feature at a time, recomputes the sample's
+        proximity profile against the fixed training set, and compares the
+        perturbed and unperturbed profiles with an in-group / out-group sign
+        vector. Positive values mean the original feature value supported the
+        focal class; negative values mean it pushed the sample away from that
+        class.
+
+        Parameters
+        ----------
+        X : array-like or DataFrame of shape (n_samples, n_features), optional
+            Query samples to explain. If omitted, the fitted training samples
+            are explained.
+        labels : array-like, Series, DataFrame, or None, optional
+            Focal class for each query sample. When omitted, the estimator's
+            predicted class is used, matching the paper's "decided class"
+            interpretation. Passing the true label is useful for analyzing
+            misclassifications.
+        perturbation : {'auto', 'flip', 'permute'}, default 'auto'
+            Feature perturbation strategy.
+
+            - ``'flip'``: swap each binary value to the other observed level.
+            - ``'permute'``: replace each feature value with a draw from the
+              fitted training column.
+            - ``'auto'``: use ``'flip'`` for binary columns and
+              ``'permute'`` otherwise.
+        n_repeats : int, default 1
+            Number of perturbation draws per feature. Repeats are averaged.
+            Ignored for deterministic binary flips.
+        random_state : int, RandomState, or None, optional
+            Controls reproducible feature permutations.
+        return_closeness : bool, default False
+            When True, also return the paper's "closeness" summaries as
+            average squared perturbed proximities to the focal class and its
+            complement.
+
+        Returns
+        -------
+        importance : np.ndarray or pandas.DataFrame of shape (n_samples, n_features)
+            Local feature contributions for each sample and feature.
+        closeness : dict[str, np.ndarray | pandas.DataFrame], optional
+            Returned only when ``return_closeness=True`` with keys
+            ``'in_group'`` and ``'out_group'``.
+        """
+        self._check_proximity_ready()
+
+        if self._y_train is None or not hasattr(self, "classes_"):
+            raise ValueError(
+                "local_feature_importance is only defined for classifiers with "
+                "training class labels."
+            )
+        if perturbation not in ("auto", "flip", "permute"):
+            raise ValueError(
+                "perturbation must be one of {'auto', 'flip', 'permute'}"
+            )
+        if int(n_repeats) < 1:
+            raise ValueError("n_repeats must be at least 1")
+
+        X_query, X_is_df, X_index, X_columns = self._prepare_local_feature_matrix(X)
+        X_query_obj = self._materialize_local_feature_matrix(
+            X_query, X_is_df, X_index, X_columns,
+        )
+
+        if self._X_train is None:
+            raise RuntimeError(
+                "Training features were not cached in a dense matrix, so local "
+                "feature importance is unavailable for this estimator fit."
+            )
+
+        train_labels = np.asarray(self._y_train)
+        query_labels = self._prepare_local_feature_labels(
+            labels, X_query, X_query_obj,
+        )
+
+        groups: List[Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]] = []
+        for cls in np.unique(query_labels):
+            row_idx = np.flatnonzero(query_labels == cls)
+            in_mask = train_labels == cls
+            if not np.any(in_mask):
+                raise ValueError(
+                    f"Focal class {cls!r} was not observed in the fitted training labels."
+                )
+            out_mask = ~in_mask
+            groups.append(
+                (
+                    row_idx,
+                    in_mask,
+                    out_mask,
+                    int(in_mask.sum()),
+                    int(out_mask.sum()),
+                )
+            )
+
+        P_base = self._ensure_csr_matrix(self.prox_extend(X_query_obj))
+
+        n_samples, n_features = X_query.shape
+        importance = np.zeros((n_samples, n_features), dtype=np.float64)
+
+        closeness_in = np.zeros_like(importance) if return_closeness else None
+        closeness_out = np.zeros_like(importance) if return_closeness else None
+
+        rng = check_random_state(random_state)
+        X_ref = self._X_train
+
+        for feature_idx in range(n_features):
+            query_col = X_query[:, feature_idx]
+            ref_col = X_ref[:, feature_idx]
+            mode = self._resolve_local_perturbation_mode(
+                query_col, ref_col, perturbation,
+            )
+            repeats = 1 if mode == "flip" else int(n_repeats)
+
+            for _ in range(repeats):
+                if mode == "flip":
+                    perturbed_col = self._flip_binary_feature(query_col, ref_col)
+                else:
+                    perturbed_col = self._sample_permuted_feature(
+                        query_col, ref_col, rng,
+                    )
+
+                X_perturbed = np.array(X_query, copy=True)
+                X_perturbed[:, feature_idx] = perturbed_col
+                X_perturbed_obj = self._materialize_local_feature_matrix(
+                    X_perturbed, X_is_df, X_index, X_columns,
+                )
+
+                P_perturbed = self._ensure_csr_matrix(
+                    self.prox_extend(X_perturbed_obj),
+                )
+                delta_sq = (P_perturbed - P_base).multiply(P_perturbed - P_base).tocsr()
+                perturbed_sq = (
+                    P_perturbed.multiply(P_perturbed).tocsr()
+                    if return_closeness
+                    else None
+                )
+
+                for row_idx, in_mask, out_mask, n_in, n_out in groups:
+                    in_shift = np.asarray(
+                        delta_sq[row_idx][:, in_mask].sum(axis=1),
+                        dtype=np.float64,
+                    ).ravel()
+                    out_shift = np.asarray(
+                        delta_sq[row_idx][:, out_mask].sum(axis=1),
+                        dtype=np.float64,
+                    ).ravel()
+
+                    # Positive values indicate the original feature value
+                    # supported the focal class more than its complement.
+                    importance[row_idx, feature_idx] += out_shift - in_shift
+
+                    if perturbed_sq is not None and closeness_in is not None and closeness_out is not None:
+                        closeness_in[row_idx, feature_idx] += (
+                            np.asarray(
+                                perturbed_sq[row_idx][:, in_mask].sum(axis=1),
+                                dtype=np.float64,
+                            ).ravel()
+                            / max(n_in, 1)
+                        )
+                        if n_out > 0:
+                            closeness_out[row_idx, feature_idx] += (
+                                np.asarray(
+                                    perturbed_sq[row_idx][:, out_mask].sum(axis=1),
+                                    dtype=np.float64,
+                                ).ravel()
+                                / n_out
+                            )
+
+            importance[:, feature_idx] /= repeats
+            if closeness_in is not None and closeness_out is not None:
+                closeness_in[:, feature_idx] /= repeats
+                closeness_out[:, feature_idx] /= repeats
+
+        wrapped_importance = self._wrap_local_feature_output(
+            importance, X_is_df, X_index, X_columns,
+        )
+        if not return_closeness or closeness_in is None or closeness_out is None:
+            return wrapped_importance
+
+        return wrapped_importance, {
+            "in_group": self._wrap_local_feature_output(
+                closeness_in, X_is_df, X_index, X_columns,
+            ),
+            "out_group": self._wrap_local_feature_output(
+                closeness_out, X_is_df, X_index, X_columns,
+            ),
+        }
+
+    def local_variable_importance(self, *args: Any, **kwargs: Any) -> Any:
+        """Alias for :meth:`local_feature_importance`."""
+        return self.local_feature_importance(*args, **kwargs)
+
     def plot_mds(
         self,
         X_test: Optional[Any] = None,
@@ -918,6 +1126,192 @@ class SparseProximityMixin:
         check_is_fitted(cast(Any, self))
         if self.W_mat is None or self.leaf_matrix_ is None or self._leaf_encoding is None:
             raise RuntimeError("Proximity structures are not initialized. Call fit(X, y) first.")
+
+    def _store_training_features(self, X: Any) -> None:
+        if sparse.issparse(X):
+            self._X_train = None
+            self._X_train_index_ = None
+            self._X_train_columns_ = None
+            self._X_train_was_dataframe_ = False
+            return
+
+        if isinstance(X, pd.DataFrame):
+            self._X_train = X.to_numpy(copy=True)
+            self._X_train_index_ = X.index.copy()
+            self._X_train_columns_ = X.columns.copy()
+            self._X_train_was_dataframe_ = True
+            return
+
+        X_arr = np.array(X, copy=True)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+
+        self._X_train = X_arr
+        self._X_train_index_ = None
+        self._X_train_columns_ = None
+        self._X_train_was_dataframe_ = False
+
+    def _prepare_local_feature_matrix(
+        self,
+        X: Optional[Any],
+    ) -> Tuple[np.ndarray, bool, Optional[pd.Index], Optional[pd.Index]]:
+        if X is None:
+            if self._X_train is None:
+                raise RuntimeError(
+                    "local_feature_importance requires cached dense training features "
+                    "when X is omitted."
+                )
+            return (
+                np.array(self._X_train, copy=True),
+                self._X_train_was_dataframe_,
+                self._X_train_index_,
+                self._X_train_columns_,
+            )
+
+        if sparse.issparse(X):
+            raise TypeError(
+                "local_feature_importance currently requires dense feature matrices."
+            )
+
+        if isinstance(X, pd.DataFrame):
+            return X.to_numpy(copy=True), True, X.index.copy(), X.columns.copy()
+
+        X_arr = np.array(X, copy=True)
+        if X_arr.ndim == 1:
+            X_arr = X_arr.reshape(1, -1)
+        return X_arr, False, None, None
+
+    @staticmethod
+    def _materialize_local_feature_matrix(
+        X: np.ndarray,
+        X_is_df: bool,
+        X_index: Optional[pd.Index],
+        X_columns: Optional[pd.Index],
+    ) -> Any:
+        if X_is_df:
+            return pd.DataFrame(X, index=X_index, columns=X_columns)
+        return X
+
+    def _prepare_local_feature_labels(
+        self,
+        labels: Optional[Any],
+        X_query: np.ndarray,
+        X_query_obj: Any,
+    ) -> np.ndarray:
+        if labels is None:
+            labels_arr = np.asarray(self.predict(X_query_obj))
+        else:
+            labels_arr = np.asarray(labels)
+
+        if labels_arr.ndim == 2:
+            if labels_arr.shape[1] != 1:
+                raise ValueError("labels must be one-dimensional.")
+            labels_arr = labels_arr.ravel()
+        elif labels_arr.ndim != 1:
+            raise ValueError("labels must be one-dimensional.")
+
+        if labels_arr.shape[0] != X_query.shape[0]:
+            raise ValueError(
+                "labels must have one entry per query sample; got "
+                f"{labels_arr.shape[0]} labels for {X_query.shape[0]} samples."
+            )
+        return labels_arr
+
+    @staticmethod
+    def _ensure_csr_matrix(P: MatrixLike) -> sparse.csr_matrix:
+        if sparse.issparse(P):
+            return P.tocsr()
+        return sparse.csr_matrix(np.asarray(P))
+
+    @staticmethod
+    def _wrap_local_feature_output(
+        values: np.ndarray,
+        X_is_df: bool,
+        X_index: Optional[pd.Index],
+        X_columns: Optional[pd.Index],
+    ) -> Any:
+        if X_is_df:
+            return pd.DataFrame(values, index=X_index, columns=X_columns)
+        return values
+
+    @staticmethod
+    def _resolve_local_perturbation_mode(
+        query_col: np.ndarray,
+        ref_col: np.ndarray,
+        perturbation: Literal["auto", "flip", "permute"],
+    ) -> Literal["flip", "permute"]:
+        if perturbation != "auto":
+            return perturbation
+
+        combined = np.concatenate([np.asarray(ref_col).ravel(), np.asarray(query_col).ravel()])
+        unique_nonmissing = pd.unique(combined[~pd.isna(combined)])
+        return "flip" if unique_nonmissing.size == 2 else "permute"
+
+    @staticmethod
+    def _flip_binary_feature(query_col: np.ndarray, ref_col: np.ndarray) -> np.ndarray:
+        combined = np.concatenate([np.asarray(ref_col).ravel(), np.asarray(query_col).ravel()])
+        unique_nonmissing = pd.unique(combined[~pd.isna(combined)])
+        if unique_nonmissing.size != 2:
+            raise ValueError(
+                "Binary flip perturbation requires exactly two observed feature values."
+            )
+
+        lo, hi = unique_nonmissing[0], unique_nonmissing[1]
+        flipped = np.array(query_col, copy=True)
+        for idx, value in enumerate(query_col):
+            if pd.isna(value):
+                flipped[idx] = lo
+            elif SparseProximityMixin._scalar_values_equal(value, lo):
+                flipped[idx] = hi
+            elif SparseProximityMixin._scalar_values_equal(value, hi):
+                flipped[idx] = lo
+            else:
+                flipped[idx] = lo
+        return flipped
+
+    @staticmethod
+    def _sample_permuted_feature(
+        query_col: np.ndarray,
+        ref_col: np.ndarray,
+        rng: Any,
+    ) -> np.ndarray:
+        ref_arr = np.asarray(ref_col).ravel()
+        if ref_arr.size == 0:
+            return np.array(query_col, copy=True)
+
+        sampled = np.array(
+            ref_arr[rng.randint(0, ref_arr.shape[0], size=query_col.shape[0])],
+            copy=True,
+        )
+        unique_nonmissing = pd.unique(ref_arr[~pd.isna(ref_arr)])
+        if unique_nonmissing.size <= 1:
+            return sampled
+
+        for idx, value in enumerate(query_col):
+            if not SparseProximityMixin._scalar_values_equal(sampled[idx], value):
+                continue
+
+            alternatives = [
+                candidate
+                for candidate in unique_nonmissing
+                if not SparseProximityMixin._scalar_values_equal(candidate, value)
+            ]
+            if alternatives:
+                sampled[idx] = alternatives[rng.randint(0, len(alternatives))]
+        return sampled
+
+    @staticmethod
+    def _scalar_values_equal(lhs: Any, rhs: Any) -> bool:
+        lhs_missing = pd.isna(lhs)
+        rhs_missing = pd.isna(rhs)
+        if bool(lhs_missing) and bool(rhs_missing):
+            return True
+        if bool(lhs_missing) or bool(rhs_missing):
+            return False
+        try:
+            return bool(lhs == rhs)
+        except Exception:
+            return False
 
     def _build_leaf_encoding(self, leaves: np.ndarray) -> _LeafEncoding:
         n_trees = leaves.shape[1]
