@@ -114,6 +114,13 @@ class TestSparseProximityMixin(unittest.TestCase):
         )
         return X[:90], X[90:]
 
+    @staticmethod
+    def _binary_signal_data():
+        rng = np.random.RandomState(321)
+        X = rng.randint(0, 2, size=(160, 3)).astype(float)
+        y = X[:, 0].astype(int)
+        return X[:120], y[:120], X[120:], y[120:]
+
     def _classification_models(self):
         models = [
             ("RandomForestClassifier", RandomForestClassifier),
@@ -813,6 +820,103 @@ class TestSparseProximityMixin(unittest.TestCase):
 
         oob_prob = np.asarray(model.oob_decision_function_, dtype=np.float64)
         np.testing.assert_allclose(prox_prob, oob_prob, rtol=1e-6, atol=1e-6)
+
+    def test_local_feature_importance_identifies_binary_signal(self):
+        X_tr, y_tr, X_te, y_te = self._binary_signal_data()
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=80,
+            random_state=19,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, X_tr, y_tr)
+
+        importance = np.asarray(
+            model.local_feature_importance(
+                X_te[:12], labels=y_te[:12], perturbation="flip",
+            ),
+            dtype=np.float64,
+        )
+
+        self.assertEqual(importance.shape, (12, X_te.shape[1]))
+        self.assertGreater(
+            np.abs(importance[:, 0]).mean(),
+            np.abs(importance[:, 1]).mean(),
+        )
+        self.assertGreater(
+            np.abs(importance[:, 0]).mean(),
+            np.abs(importance[:, 2]).mean(),
+        )
+
+    def test_local_feature_importance_respects_focal_class_choice(self):
+        X_tr, y_tr, X_te, y_te = self._binary_signal_data()
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=80,
+            random_state=20,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, X_tr, y_tr)
+
+        correct = np.asarray(
+            model.local_feature_importance(
+                X_te[:12], labels=y_te[:12], perturbation="flip",
+            ),
+            dtype=np.float64,
+        )
+        alternate = np.asarray(
+            model.local_variable_importance(
+                X_te[:12], labels=1 - y_te[:12], perturbation="flip",
+            ),
+            dtype=np.float64,
+        )
+
+        np.testing.assert_allclose(alternate, -correct, atol=1e-12)
+
+    def test_local_feature_importance_dataframe_and_closeness(self):
+        """local_feature_importance preserves DataFrame structure and optional closeness output."""
+        import pandas as pd
+
+        X_tr, y_tr, X_te, y_te = self._binary_signal_data()
+        columns = ["signal", "noise_1", "noise_2"]
+        index = pd.RangeIndex(700, 712)
+
+        df_tr = pd.DataFrame(X_tr, columns=columns)
+        df_te = pd.DataFrame(X_te[:12], columns=columns, index=index)
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=80,
+            random_state=21,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, df_tr, y_tr)
+
+        importance, closeness = model.local_feature_importance(
+            df_te,
+            labels=y_te[:12],
+            perturbation="flip",
+            return_closeness=True,
+        )
+
+        self.assertIsInstance(importance, pd.DataFrame)
+        pd.testing.assert_index_equal(importance.index, index)
+        self.assertListEqual(list(importance.columns), columns)
+        self.assertSetEqual(set(closeness.keys()), {"in_group", "out_group"})
+
+        for value in closeness.values():
+            self.assertIsInstance(value, pd.DataFrame)
+            pd.testing.assert_index_equal(value.index, index)
+            self.assertListEqual(list(value.columns), columns)
+            self.assertTrue(np.isfinite(value.to_numpy()).all())
 
 
 if __name__ == "__main__":
