@@ -918,6 +918,50 @@ class TestSparseProximityMixin(unittest.TestCase):
             self.assertListEqual(list(value.columns), columns)
             self.assertTrue(np.isfinite(value.to_numpy()).all())
 
+    def test_local_feature_importance_quantile_mode_is_deterministic(self):
+        """quantile perturbation uses a deterministic quantile grid, not RNG draws."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        columns = [f"feature_{i}" for i in range(Xc_tr.shape[1])]
+
+        df_tr = pd.DataFrame(Xc_tr, columns=columns)
+        df_te = pd.DataFrame(Xc_te[:8], columns=columns)
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=60,
+            random_state=22,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        quant_a = model.local_feature_importance(
+            df_te,
+            perturbation="quantile",
+            n_repeats=5,
+            random_state=0,
+        )
+        quant_b = model.local_feature_importance(
+            df_te,
+            perturbation="quantile",
+            n_repeats=5,
+            random_state=999,
+        )
+        quant_median = model.local_feature_importance(
+            df_te,
+            perturbation="quantile",
+            n_repeats=1,
+        )
+
+        self.assertIsInstance(quant_a, pd.DataFrame)
+        self.assertEqual(quant_a.shape, (8, Xc_tr.shape[1]))
+        self.assertTrue(np.isfinite(quant_a.to_numpy()).all())
+        self.assertTrue(np.isfinite(quant_median.to_numpy()).all())
+        pd.testing.assert_frame_equal(quant_a, quant_b)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -832,8 +832,8 @@ class SparseProximityMixin:
         X: Optional[Any] = None,
         labels: Optional[Any] = None,
         *,
-        perturbation: Literal["auto", "flip", "permute"] = "auto",
-        n_repeats: int = 1,
+        perturbation: Literal["auto", "flip", "permute", "quantile"] = "auto",
+        n_repeats: int = 30,
         random_state: Optional[Any] = None,
         return_closeness: bool = False,
     ) -> Any:
@@ -857,17 +857,21 @@ class SparseProximityMixin:
             predicted class is used, matching the paper's "decided class"
             interpretation. Passing the true label is useful for analyzing
             misclassifications.
-        perturbation : {'auto', 'flip', 'permute'}, default 'auto'
+        perturbation : {'auto', 'flip', 'permute', 'quantile'}, default 'auto'
             Feature perturbation strategy.
 
             - ``'flip'``: swap each binary value to the other observed level.
             - ``'permute'``: replace each feature value with a draw from the
               fitted training column.
+            - ``'quantile'``: replace the feature with a succession of evenly
+              spaced quantiles of the fitted training column.
             - ``'auto'``: use ``'flip'`` for binary columns and
               ``'permute'`` otherwise.
-        n_repeats : int, default 1
+        n_repeats : int, default 30
             Number of perturbation draws per feature. Repeats are averaged.
-            Ignored for deterministic binary flips.
+            Ignored for deterministic binary flips. For
+            ``perturbation='quantile'``, this is the number of evenly spaced
+            quantiles used for perturbation.
         random_state : int, RandomState, or None, optional
             Controls reproducible feature permutations.
         return_closeness : bool, default False
@@ -890,9 +894,9 @@ class SparseProximityMixin:
                 "local_feature_importance is only defined for classifiers with "
                 "training class labels."
             )
-        if perturbation not in ("auto", "flip", "permute"):
+        if perturbation not in ("auto", "flip", "permute", "quantile"):
             raise ValueError(
-                "perturbation must be one of {'auto', 'flip', 'permute'}"
+                "perturbation must be one of {'auto', 'flip', 'permute', 'quantile'}"
             )
         if int(n_repeats) < 1:
             raise ValueError("n_repeats must be at least 1")
@@ -949,15 +953,20 @@ class SparseProximityMixin:
             mode = self._resolve_local_perturbation_mode(
                 query_col, ref_col, perturbation,
             )
-            repeats = 1 if mode == "flip" else int(n_repeats)
+            if mode == "flip":
+                perturbations = [self._flip_binary_feature(query_col, ref_col)]
+            elif mode == "permute":
+                perturbations = [
+                    self._sample_permuted_feature(query_col, ref_col, rng)
+                    for _ in range(int(n_repeats))
+                ]
+            else:
+                perturbations = self._quantile_feature_perturbations(
+                    query_col, ref_col, int(n_repeats),
+                )
+            repeats = len(perturbations)
 
-            for _ in range(repeats):
-                if mode == "flip":
-                    perturbed_col = self._flip_binary_feature(query_col, ref_col)
-                else:
-                    perturbed_col = self._sample_permuted_feature(
-                        query_col, ref_col, rng,
-                    )
+            for perturbed_col in perturbations:
 
                 X_perturbed = np.array(X_query, copy=True)
                 X_perturbed[:, feature_idx] = perturbed_col
@@ -1238,8 +1247,8 @@ class SparseProximityMixin:
     def _resolve_local_perturbation_mode(
         query_col: np.ndarray,
         ref_col: np.ndarray,
-        perturbation: Literal["auto", "flip", "permute"],
-    ) -> Literal["flip", "permute"]:
+        perturbation: Literal["auto", "flip", "permute", "quantile"],
+    ) -> Literal["flip", "permute", "quantile"]:
         if perturbation != "auto":
             return perturbation
 
@@ -1299,6 +1308,40 @@ class SparseProximityMixin:
             if alternatives:
                 sampled[idx] = alternatives[rng.randint(0, len(alternatives))]
         return sampled
+
+    @staticmethod
+    def _quantile_feature_perturbations(
+        query_col: np.ndarray,
+        ref_col: np.ndarray,
+        n_quantiles: int,
+    ) -> List[np.ndarray]:
+        if n_quantiles < 1:
+            raise ValueError("n_repeats must be at least 1 for quantile perturbation.")
+
+        try:
+            ref_numeric = pd.to_numeric(pd.Series(np.asarray(ref_col).ravel()), errors="raise")
+        except Exception as exc:
+            raise TypeError(
+                "Quantile perturbation requires numeric training feature columns."
+            ) from exc
+
+        ref_values = ref_numeric.to_numpy(dtype=np.float64, copy=False)
+        ref_values = ref_values[~np.isnan(ref_values)]
+        if ref_values.size == 0:
+            return [np.array(query_col, copy=True) for _ in range(n_quantiles)]
+
+        if n_quantiles == 1:
+            quantile_levels = np.array([0.5], dtype=np.float64)
+        else:
+            quantile_levels = np.linspace(0.0, 1.0, n_quantiles, dtype=np.float64)
+
+        perturbations: List[np.ndarray] = []
+        for level in quantile_levels:
+            quantile_value = float(np.quantile(ref_values, level))
+            perturbations.append(
+                np.full(query_col.shape[0], quantile_value, dtype=np.float64)
+            )
+        return perturbations
 
     @staticmethod
     def _scalar_values_equal(lhs: Any, rhs: Any) -> bool:
