@@ -121,6 +121,21 @@ class TestSparseProximityMixin(unittest.TestCase):
         y = X[:, 0].astype(int)
         return X[:120], y[:120], X[120:], y[120:]
 
+    @staticmethod
+    def _prototype_data():
+        import pandas as pd
+
+        X = pd.DataFrame(
+            {
+                "x1": [0] * 8 + [5] * 8,
+                "x2": [0] * 4 + [4] * 4 + [0] * 4 + [4] * 4,
+                "texture_code": [0] * 4 + [1] * 4 + [0] * 4 + [1] * 4,
+            },
+            index=pd.Index([f"case_{idx}" for idx in range(16)], name="sample"),
+        )
+        y = np.array([0] * 8 + [1] * 8, dtype=int)
+        return X, y
+
     def _classification_models(self):
         models = [
             ("RandomForestClassifier", RandomForestClassifier),
@@ -1101,6 +1116,120 @@ class TestSparseProximityMixin(unittest.TestCase):
             rtol=1e-10,
             atol=1e-10,
         )
+
+    def test_get_prototypes_returns_disjoint_classwise_summaries(self):
+        import pandas as pd
+
+        X_tr, y_tr = self._prototype_data()
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=80,
+            random_state=31,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, X_tr, y_tr)
+
+        prototypes = model.get_prototypes(
+            k=4,
+            n_prototypes=2,
+            categorical_features=["texture_code"],
+        )
+
+        self.assertSetEqual(set(prototypes.keys()), {0, 1})
+        for cls, records in prototypes.items():
+            self.assertEqual(len(records), 2)
+
+            first_neighbors = set(records[0]["neighbor_positions"].tolist())
+            second_neighbors = set(records[1]["neighbor_positions"].tolist())
+            self.assertTrue(first_neighbors.isdisjoint(second_neighbors))
+
+            x2_medians = sorted(
+                float(record["continuous_summary"].loc["x2", "median"])
+                for record in records
+            )
+            self.assertEqual(x2_medians, [0.0, 4.0])
+
+            texture_modes = sorted(
+                int(record["categorical_summary"].loc["texture_code", "mode"])
+                for record in records
+            )
+            self.assertEqual(texture_modes, [0, 1])
+
+            for record in records:
+                self.assertIsInstance(record["prototype"], pd.Series)
+                self.assertIsInstance(record["neighbor_index"], pd.Index)
+                self.assertEqual(record["neighbor_index"].shape[0], 4)
+                self.assertEqual(record["continuous_summary"].index.name, "feature")
+                self.assertEqual(record["categorical_summary"].index.name, "feature")
+                self.assertListEqual(
+                    list(record["continuous_summary"].columns),
+                    ["q25", "median", "q75"],
+                )
+                self.assertListEqual(
+                    list(record["categorical_summary"].columns),
+                    ["mode", "mode_count", "mode_frequency"],
+                )
+                self.assertListEqual(
+                    list(record["categorical_frequencies"].columns),
+                    ["count", "frequency"],
+                )
+                self.assertEqual(record["categorical_frequencies"].index.names, ["feature", "category"])
+                self.assertGreater(record["same_class_neighbor_count"], 0)
+                self.assertLessEqual(record["same_class_neighbor_count"], 4)
+                self.assertTrue(np.isfinite(record["neighbor_proximities"]).all())
+                self.assertEqual(record["prototype"].index.name, "feature")
+                self.assertEqual(record["prototype"]["x1"], float(cls * 5))
+
+    def test_get_prototypes_standardizes_continuous_summaries(self):
+        X_tr, y_tr = self._prototype_data()
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=80,
+            random_state=32,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, X_tr, y_tr)
+
+        prototypes = model.get_prototypes(
+            k=4,
+            n_prototypes=2,
+            categorical_features=["texture_code"],
+            standardize_continuous=True,
+        )
+
+        x2_medians = sorted(
+            float(record["continuous_summary"].loc["x2", "median"])
+            for record in prototypes[0]
+        )
+        np.testing.assert_allclose(x2_medians, [0.0, 1.0], atol=1e-12)
+
+        x1_medians = sorted(
+            float(record["continuous_summary"].loc["x1", "median"])
+            for record in prototypes[0] + prototypes[1]
+        )
+        np.testing.assert_allclose(x1_medians, [0.0, 0.0, 1.0, 1.0], atol=1e-12)
+
+    def test_get_prototypes_rejects_regressors(self):
+        Xr_tr, yr_tr, _, _ = self._regression_data()
+
+        model = self._build_model(
+            RandomForestRegressor,
+            "original",
+            n_estimators=40,
+            random_state=33,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, Xr_tr, yr_tr)
+
+        with self.assertRaisesRegex(ValueError, "only defined for classifiers"):
+            model.get_prototypes()
 
 
 if __name__ == "__main__":

@@ -827,6 +827,206 @@ class SparseProximityMixin:
             return pd.Series(scores, index=y_index, name="outlier_score")
         return scores
 
+    def get_prototypes(
+        self,
+        *,
+        k: int = 10,
+        n_prototypes: int = 1,
+        categorical_features: Optional[Sequence[Any]] = None,
+        standardize_continuous: bool = False,
+    ) -> dict[Any, List[dict[str, Any]]]:
+        """
+        Compute classwise proximity prototypes following Breiman's description.
+
+        For each class, the method searches over remaining cases of that class
+        and selects the case whose ``k`` nearest available proximity neighbours
+        contain the largest number of same-class points. The selected
+        neighbourhood is then summarised feature-by-feature: continuous
+        variables receive their 25th percentile, median, and 75th percentile;
+        categorical variables receive their modal value plus the full category
+        frequency table. Additional prototypes for the same class are obtained
+        by removing the previously selected neighbourhood from consideration and
+        repeating the search.
+
+        Parameters
+        ----------
+        k : int, default 10
+            Size of the proximity neighbourhood used to score candidate
+            prototype centres and to summarise each selected prototype.
+        n_prototypes : int, default 1
+            Maximum number of prototypes to return per class.
+        categorical_features : sequence of column names or positions, optional
+            Features that should be treated as categorical even if they are
+            numerically encoded. When omitted, non-numeric columns are inferred
+            as categorical automatically.
+        standardize_continuous : bool, default False
+            When True, continuous prototype summaries are standardised by the
+            fitted training column's 5th and 95th percentiles, matching
+            Breiman's output convention.
+
+        Returns
+        -------
+        prototypes : dict[class_label, list[dict[str, Any]]]
+            Classwise prototype records. Each record contains:
+
+            - ``prototype_number``: 1-based prototype index within the class.
+            - ``center_position`` / ``center_index``: selected case.
+            - ``neighbor_positions`` / ``neighbor_index``: selected
+              neighbourhood.
+            - ``same_class_neighbor_count`` and
+              ``same_class_neighbor_fraction``.
+            - ``prototype``: per-feature prototype values (median for
+              continuous, mode for categorical).
+            - ``continuous_summary``: DataFrame with ``q25``, ``median``,
+              and ``q75`` rows for continuous variables.
+            - ``categorical_summary``: DataFrame with modal category
+              information.
+            - ``categorical_frequencies``: DataFrame of all category counts
+              and frequencies for categorical variables.
+        """
+        self._check_proximity_ready()
+
+        if self._y_train is None or not hasattr(self, "classes_"):
+            raise ValueError(
+                "get_prototypes is only defined for classifiers with training "
+                "class labels."
+            )
+        if self._X_train is None:
+            raise RuntimeError(
+                "Training features were not cached in a dense matrix, so "
+                "prototypes are unavailable for this estimator fit."
+            )
+        if int(k) < 1:
+            raise ValueError("k must be at least 1.")
+        if int(n_prototypes) < 1:
+            raise ValueError("n_prototypes must be at least 1.")
+
+        X_train, _, X_index, X_columns = self._prepare_local_feature_matrix(None)
+        train_labels = np.asarray(self._y_train)
+        n_samples, n_features = X_train.shape
+        feature_names = self._prototype_feature_names(n_features, X_columns)
+        categorical_idx = self._resolve_prototype_categorical_indices(
+            X_train, X_columns, categorical_features,
+        )
+        categorical_set = set(categorical_idx)
+        continuous_idx = [
+            feature_idx
+            for feature_idx in range(n_features)
+            if feature_idx not in categorical_set
+        ]
+
+        P = self._ensure_csr_matrix(self.get_proximities())
+        results: dict[Any, List[dict[str, Any]]] = {}
+
+        for cls in np.unique(train_labels):
+            available_mask = np.ones(n_samples, dtype=bool)
+            class_records: List[dict[str, Any]] = []
+
+            for prototype_number in range(1, int(n_prototypes) + 1):
+                class_candidates = np.flatnonzero((train_labels == cls) & available_mask)
+                if class_candidates.size == 0:
+                    break
+
+                best_center: Optional[int] = None
+                best_neighbors: Optional[np.ndarray] = None
+                best_neighbor_values: Optional[np.ndarray] = None
+                best_key: Optional[Tuple[int, float, float, int]] = None
+
+                for center_position in class_candidates:
+                    neighbor_positions, neighbor_values = self._prototype_neighbor_set(
+                        P, int(center_position), available_mask, int(k),
+                    )
+                    if neighbor_positions.size == 0:
+                        continue
+
+                    same_class_mask = train_labels[neighbor_positions] == cls
+                    same_class_count = int(same_class_mask.sum())
+                    same_class_proximity = float(neighbor_values[same_class_mask].sum())
+                    total_proximity = float(neighbor_values.sum())
+                    key = (
+                        same_class_count,
+                        same_class_proximity,
+                        total_proximity,
+                        -int(center_position),
+                    )
+                    if best_key is None or key > best_key:
+                        best_center = int(center_position)
+                        best_neighbors = neighbor_positions
+                        best_neighbor_values = neighbor_values
+                        best_key = key
+
+                if (
+                    best_center is None
+                    or best_neighbors is None
+                    or best_neighbor_values is None
+                ):
+                    break
+
+                continuous_summary, continuous_medians = self._summarize_prototype_continuous_features(
+                    X_train,
+                    best_neighbors,
+                    continuous_idx,
+                    feature_names,
+                    standardize_continuous,
+                )
+                (
+                    categorical_summary,
+                    categorical_frequencies,
+                    categorical_modes,
+                ) = self._summarize_prototype_categorical_features(
+                    X_train,
+                    best_neighbors,
+                    categorical_idx,
+                    feature_names,
+                )
+
+                prototype_values: List[Any] = []
+                for feature_idx, feature_name in enumerate(feature_names):
+                    if feature_idx in categorical_set:
+                        prototype_values.append(categorical_modes.get(feature_name, np.nan))
+                    else:
+                        prototype_values.append(continuous_medians.get(feature_name, np.nan))
+
+                neighbor_index = (
+                    np.array(best_neighbors, copy=True)
+                    if X_index is None
+                    else X_index.take(best_neighbors)
+                )
+                same_class_neighbor_count = int((train_labels[best_neighbors] == cls).sum())
+                class_records.append(
+                    {
+                        "prototype_number": prototype_number,
+                        "class_label": cls,
+                        "center_position": best_center,
+                        "center_index": (
+                            int(best_center)
+                            if X_index is None
+                            else X_index[best_center]
+                        ),
+                        "neighbor_positions": np.array(best_neighbors, copy=True),
+                        "neighbor_index": neighbor_index,
+                        "neighbor_proximities": np.array(best_neighbor_values, copy=True),
+                        "same_class_neighbor_count": same_class_neighbor_count,
+                        "same_class_neighbor_fraction": (
+                            same_class_neighbor_count / max(best_neighbors.size, 1)
+                        ),
+                        "prototype": pd.Series(
+                            prototype_values,
+                            index=pd.Index(feature_names, name="feature"),
+                            name="prototype",
+                        ),
+                        "continuous_summary": continuous_summary,
+                        "categorical_summary": categorical_summary,
+                        "categorical_frequencies": categorical_frequencies,
+                    }
+                )
+
+                available_mask[best_neighbors] = False
+
+            results[cls] = class_records
+
+        return results
+
     def local_feature_importance(
         self,
         X: Optional[Any] = None,
@@ -1343,6 +1543,241 @@ class SparseProximityMixin:
         if X_is_df:
             return pd.DataFrame(values, index=X_index, columns=X_columns)
         return values
+
+    @staticmethod
+    def _prototype_feature_names(
+        n_features: int,
+        X_columns: Optional[pd.Index],
+    ) -> List[Any]:
+        if X_columns is not None:
+            return list(X_columns)
+        return [f"feature_{idx}" for idx in range(n_features)]
+
+    @staticmethod
+    def _resolve_prototype_categorical_indices(
+        X_train: np.ndarray,
+        X_columns: Optional[pd.Index],
+        categorical_features: Optional[Sequence[Any]],
+    ) -> List[int]:
+        inferred = {
+            feature_idx
+            for feature_idx in range(X_train.shape[1])
+            if not SparseProximityMixin._is_numeric_local_feature(X_train[:, feature_idx])
+        }
+        if categorical_features is None:
+            return sorted(inferred)
+
+        resolved = set(inferred)
+        for feature in categorical_features:
+            if isinstance(feature, (int, np.integer)):
+                feature_idx = int(feature)
+                if feature_idx < 0 or feature_idx >= X_train.shape[1]:
+                    raise ValueError(
+                        f"Categorical feature index {feature_idx} is out of bounds for "
+                        f"{X_train.shape[1]} features."
+                    )
+                resolved.add(feature_idx)
+                continue
+
+            if X_columns is None:
+                raise ValueError(
+                    "String categorical feature names require fitting with a DataFrame "
+                    "or passing integer column positions."
+                )
+            matches = np.flatnonzero(X_columns == feature)
+            if matches.size == 0:
+                raise ValueError(
+                    f"Categorical feature {feature!r} was not found in the fitted columns."
+                )
+            resolved.add(int(matches[0]))
+
+        return sorted(resolved)
+
+    @staticmethod
+    def _prototype_neighbor_set(
+        P: sparse.csr_matrix,
+        row_idx: int,
+        available_mask: np.ndarray,
+        k: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if k < 1 or row_idx < 0 or row_idx >= P.shape[0] or not available_mask[row_idx]:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float64),
+            )
+
+        row = P.getrow(row_idx)
+        available_count = int(available_mask.sum())
+        k_effective = min(int(k), available_count)
+
+        selected_positions = [int(row_idx)]
+        self_mask = row.indices == row_idx
+        if np.any(self_mask):
+            self_value = float(row.data[self_mask][0])
+        else:
+            row_max = float(row.data.max()) if row.nnz > 0 else 0.0
+            self_value = float(np.nextafter(max(row_max, 0.0), np.inf))
+        selected_values = [self_value]
+
+        mask = available_mask[row.indices]
+        candidate_positions = row.indices[mask]
+        candidate_values = row.data[mask]
+
+        nonself_mask = candidate_positions != row_idx
+        candidate_positions = candidate_positions[nonself_mask]
+        candidate_values = candidate_values[nonself_mask]
+
+        if candidate_positions.size > 0:
+            order = np.lexsort((candidate_positions, -candidate_values))
+            candidate_positions = candidate_positions[order]
+            candidate_values = candidate_values[order]
+
+        remaining = k_effective - 1
+        take = min(remaining, candidate_positions.size)
+        if take > 0:
+            selected_positions.extend(candidate_positions[:take].tolist())
+            selected_values.extend(candidate_values[:take].astype(np.float64, copy=False).tolist())
+
+        if len(selected_positions) < k_effective:
+            used = np.zeros_like(available_mask, dtype=bool)
+            used[np.asarray(selected_positions, dtype=np.int64)] = True
+            zero_fill = np.flatnonzero(available_mask & ~used)
+            needed = k_effective - len(selected_positions)
+            if needed > 0 and zero_fill.size > 0:
+                fill = zero_fill[:needed]
+                selected_positions.extend(fill.tolist())
+                selected_values.extend([0.0] * fill.size)
+
+        return (
+            np.asarray(selected_positions, dtype=np.int64),
+            np.asarray(selected_values, dtype=np.float64),
+        )
+
+    @staticmethod
+    def _summarize_prototype_continuous_features(
+        X_train: np.ndarray,
+        neighbor_positions: np.ndarray,
+        continuous_idx: Sequence[int],
+        feature_names: Sequence[Any],
+        standardize_continuous: bool,
+    ) -> Tuple[pd.DataFrame, dict[Any, float]]:
+        rows: List[dict[str, Any]] = []
+        medians: dict[Any, float] = {}
+
+        for feature_idx in continuous_idx:
+            feature_name = feature_names[feature_idx]
+            feature_values = pd.to_numeric(
+                pd.Series(X_train[neighbor_positions, feature_idx]),
+                errors="coerce",
+            ).to_numpy(dtype=np.float64, copy=False)
+            feature_values = feature_values[~np.isnan(feature_values)]
+
+            if feature_values.size == 0:
+                q25 = median = q75 = np.nan
+            else:
+                q25, median, q75 = np.quantile(feature_values, [0.25, 0.5, 0.75])
+
+            if standardize_continuous:
+                ref_values = pd.to_numeric(
+                    pd.Series(X_train[:, feature_idx]),
+                    errors="coerce",
+                ).to_numpy(dtype=np.float64, copy=False)
+                ref_values = ref_values[~np.isnan(ref_values)]
+                if ref_values.size > 0:
+                    ref_q05, ref_q95 = np.quantile(ref_values, [0.05, 0.95])
+                    scale = ref_q95 - ref_q05
+                    q25 = q25 - ref_q05
+                    median = median - ref_q05
+                    q75 = q75 - ref_q05
+                    if scale > 0:
+                        q25 /= scale
+                        median /= scale
+                        q75 /= scale
+
+            rows.append(
+                {
+                    "feature": feature_name,
+                    "q25": float(q25) if np.isfinite(q25) else np.nan,
+                    "median": float(median) if np.isfinite(median) else np.nan,
+                    "q75": float(q75) if np.isfinite(q75) else np.nan,
+                }
+            )
+            medians[feature_name] = float(median) if np.isfinite(median) else np.nan
+
+        if rows:
+            summary = pd.DataFrame(rows).set_index("feature")
+        else:
+            summary = pd.DataFrame(columns=["q25", "median", "q75"])
+            summary.index = pd.Index([], name="feature")
+        return summary, medians
+
+    @staticmethod
+    def _summarize_prototype_categorical_features(
+        X_train: np.ndarray,
+        neighbor_positions: np.ndarray,
+        categorical_idx: Sequence[int],
+        feature_names: Sequence[Any],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, dict[Any, Any]]:
+        summary_rows: List[dict[str, Any]] = []
+        frequency_rows: List[dict[str, Any]] = []
+        modes: dict[Any, Any] = {}
+        neighborhood_size = max(int(neighbor_positions.size), 1)
+
+        for feature_idx in categorical_idx:
+            feature_name = feature_names[feature_idx]
+            counts = pd.Series(X_train[neighbor_positions, feature_idx]).value_counts(dropna=False)
+            if counts.empty:
+                mode_value = np.nan
+                mode_count = 0
+            else:
+                mode_count = int(counts.max())
+                mode_candidates = [
+                    value for value, count in counts.items()
+                    if int(count) == mode_count
+                ]
+                mode_value = min(
+                    mode_candidates,
+                    key=SparseProximityMixin._prototype_category_sort_key,
+                )
+
+            modes[feature_name] = mode_value
+            summary_rows.append(
+                {
+                    "feature": feature_name,
+                    "mode": mode_value,
+                    "mode_count": mode_count,
+                    "mode_frequency": mode_count / neighborhood_size,
+                }
+            )
+            for category, count in counts.items():
+                frequency_rows.append(
+                    {
+                        "feature": feature_name,
+                        "category": category,
+                        "count": int(count),
+                        "frequency": int(count) / neighborhood_size,
+                    }
+                )
+
+        if summary_rows:
+            summary = pd.DataFrame(summary_rows).set_index("feature")
+        else:
+            summary = pd.DataFrame(columns=["mode", "mode_count", "mode_frequency"])
+            summary.index = pd.Index([], name="feature")
+
+        if frequency_rows:
+            frequencies = pd.DataFrame(frequency_rows).set_index(["feature", "category"])
+        else:
+            frequencies = pd.DataFrame(columns=["count", "frequency"])
+            frequencies.index = pd.MultiIndex.from_arrays(
+                [[], []], names=["feature", "category"],
+            )
+
+        return summary, frequencies, modes
+
+    @staticmethod
+    def _prototype_category_sort_key(value: Any) -> Tuple[str, str]:
+        return (type(value).__name__, repr(value))
 
     @staticmethod
     def _resolve_local_perturbation_mode(
