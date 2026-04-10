@@ -962,6 +962,54 @@ class TestSparseProximityMixin(unittest.TestCase):
         self.assertTrue(np.isfinite(quant_median.to_numpy()).all())
         pd.testing.assert_frame_equal(quant_a, quant_b)
 
+    def test_local_feature_importance_auto_uses_quantiles_for_numeric_columns(self):
+        """auto perturbation should route non-binary numeric columns to quantile perturbations."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        columns = [f"feature_{i}" for i in range(Xc_tr.shape[1])]
+
+        df_tr = pd.DataFrame(Xc_tr, columns=columns)
+        df_te = pd.DataFrame(Xc_te[:8], columns=columns)
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=60,
+            random_state=24,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        auto_importance = model.local_feature_importance(
+            df_te,
+            perturbation="auto",
+            n_repeats=5,
+            random_state=999,
+        )
+        quant_importance = model.local_feature_importance(
+            df_te,
+            perturbation="quantile",
+            n_repeats=5,
+            random_state=0,
+        )
+
+        self.assertIsInstance(auto_importance, pd.DataFrame)
+        pd.testing.assert_frame_equal(auto_importance, quant_importance)
+
+    def test_local_perturbation_mode_auto_uses_permute_for_non_numeric_columns(self):
+        """auto perturbation should not send non-numeric categorical columns through quantiles."""
+        query_col = np.array(["red", "blue", "green"], dtype=object)
+        ref_col = np.array(["red", "green", "blue", "green"], dtype=object)
+
+        mode = with_sparse_proximity(RandomForestClassifier)._resolve_local_perturbation_mode(
+            query_col,
+            ref_col,
+            "auto",
+        )
+        self.assertEqual(mode, "permute")
+
     def test_local_feature_importance_directionality_tracks_quantile_direction(self):
         """Directional summaries split quantile perturbations into upward and downward moves."""
         import pandas as pd

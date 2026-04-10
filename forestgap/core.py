@@ -872,8 +872,9 @@ class SparseProximityMixin:
               fitted training column.
             - ``'quantile'``: replace the feature with a succession of evenly
               spaced quantiles of the fitted training column.
-            - ``'auto'``: use ``'flip'`` for binary columns and
-              ``'permute'`` otherwise.
+            - ``'auto'``: use ``'flip'`` for binary columns, ``'quantile'``
+              for non-binary numeric columns, and ``'permute'`` for
+              non-numeric columns.
         n_repeats : int, default 30
             Number of perturbation draws per feature. Repeats are averaged.
             Ignored for deterministic binary flips. For
@@ -1354,7 +1355,19 @@ class SparseProximityMixin:
 
         combined = np.concatenate([np.asarray(ref_col).ravel(), np.asarray(query_col).ravel()])
         unique_nonmissing = pd.unique(combined[~pd.isna(combined)])
-        return "flip" if unique_nonmissing.size == 2 else "permute"
+        if unique_nonmissing.size == 2:
+            return "flip"
+        return "quantile" if SparseProximityMixin._is_numeric_local_feature(combined) else "permute"
+
+    @staticmethod
+    def _is_numeric_local_feature(values: np.ndarray) -> bool:
+        try:
+            numeric = pd.to_numeric(pd.Series(np.asarray(values).ravel()), errors="raise")
+        except Exception:
+            return False
+
+        numeric_values = numeric.to_numpy(dtype=np.float64, copy=False)
+        return np.any(~np.isnan(numeric_values))
 
     @staticmethod
     def _flip_binary_feature(query_col: np.ndarray, ref_col: np.ndarray) -> np.ndarray:
