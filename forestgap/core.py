@@ -836,6 +836,7 @@ class SparseProximityMixin:
         n_repeats: int = 30,
         random_state: Optional[Any] = None,
         return_closeness: bool = False,
+        return_directionality: bool = False,
     ) -> Any:
         """
         Compute Whitmore et al. (2018) local feature contributions.
@@ -846,6 +847,12 @@ class SparseProximityMixin:
         vector. Positive values mean the original feature value supported the
         focal class; negative values mean it pushed the sample away from that
         class.
+
+        When ``return_directionality=True``, the same per-perturbation score is
+        also split by whether the replacement value is numerically above or
+        below the observed feature value. This tracks directional sensitivity
+        in perturbation space for ordered numeric features without changing the
+        default Whitmore et al. summary.
 
         Parameters
         ----------
@@ -878,6 +885,13 @@ class SparseProximityMixin:
             When True, also return the paper's "closeness" summaries as
             average squared perturbed proximities to the focal class and its
             complement.
+        return_directionality : bool, default False
+            When True, also return directional local summaries for numeric
+            perturbations. Perturbations replacing a feature with a value above
+            the observed value contribute to ``'upward'``; those below the
+            observed value contribute to ``'downward'``. Non-numeric or
+            unchanged perturbations are excluded from these directional
+            summaries.
 
         Returns
         -------
@@ -886,6 +900,12 @@ class SparseProximityMixin:
         closeness : dict[str, np.ndarray | pandas.DataFrame], optional
             Returned only when ``return_closeness=True`` with keys
             ``'in_group'`` and ``'out_group'``.
+        directionality : dict[str, np.ndarray | pandas.DataFrame], optional
+            Returned only when ``return_directionality=True`` with keys
+            ``'upward'``, ``'downward'``, ``'upward_count'``, and
+            ``'downward_count'``. The directional arrays are averages over
+            perturbations in that direction for each sample-feature pair, and
+            are ``NaN`` when no perturbations occurred in that direction.
         """
         self._check_proximity_ready()
 
@@ -943,6 +963,18 @@ class SparseProximityMixin:
 
         closeness_in = np.zeros_like(importance) if return_closeness else None
         closeness_out = np.zeros_like(importance) if return_closeness else None
+        directional_up_sum = np.zeros_like(importance) if return_directionality else None
+        directional_down_sum = np.zeros_like(importance) if return_directionality else None
+        directional_up_count = (
+            np.zeros((n_samples, n_features), dtype=np.int64)
+            if return_directionality
+            else None
+        )
+        directional_down_count = (
+            np.zeros((n_samples, n_features), dtype=np.int64)
+            if return_directionality
+            else None
+        )
 
         rng = check_random_state(random_state)
         X_ref = self._X_train
@@ -967,6 +999,13 @@ class SparseProximityMixin:
             repeats = len(perturbations)
 
             for perturbed_col in perturbations:
+                if return_directionality:
+                    upward_mask, downward_mask = self._directional_masks(
+                        query_col, perturbed_col,
+                    )
+                else:
+                    upward_mask = None
+                    downward_mask = None
 
                 X_perturbed = np.array(X_query, copy=True)
                 X_perturbed[:, feature_idx] = perturbed_col
@@ -993,10 +1032,31 @@ class SparseProximityMixin:
                         delta_sq[row_idx][:, out_mask].sum(axis=1),
                         dtype=np.float64,
                     ).ravel()
+                    contribution = out_shift - in_shift
 
                     # Positive values indicate the original feature value
                     # supported the focal class more than its complement.
-                    importance[row_idx, feature_idx] += out_shift - in_shift
+                    importance[row_idx, feature_idx] += contribution
+
+                    if (
+                        upward_mask is not None
+                        and downward_mask is not None
+                        and directional_up_sum is not None
+                        and directional_down_sum is not None
+                        and directional_up_count is not None
+                        and directional_down_count is not None
+                    ):
+                        group_upward = upward_mask[row_idx]
+                        if np.any(group_upward):
+                            selected_rows = row_idx[group_upward]
+                            directional_up_sum[selected_rows, feature_idx] += contribution[group_upward]
+                            directional_up_count[selected_rows, feature_idx] += 1
+
+                        group_downward = downward_mask[row_idx]
+                        if np.any(group_downward):
+                            selected_rows = row_idx[group_downward]
+                            directional_down_sum[selected_rows, feature_idx] += contribution[group_downward]
+                            directional_down_count[selected_rows, feature_idx] += 1
 
                     if perturbed_sq is not None and closeness_in is not None and closeness_out is not None:
                         closeness_in[row_idx, feature_idx] += (
@@ -1023,10 +1083,47 @@ class SparseProximityMixin:
         wrapped_importance = self._wrap_local_feature_output(
             importance, X_is_df, X_index, X_columns,
         )
+        wrapped_directionality = None
+        if (
+            return_directionality
+            and directional_up_sum is not None
+            and directional_down_sum is not None
+            and directional_up_count is not None
+            and directional_down_count is not None
+        ):
+            upward = np.full_like(importance, np.nan)
+            downward = np.full_like(importance, np.nan)
+
+            valid_upward = directional_up_count > 0
+            valid_downward = directional_down_count > 0
+            upward[valid_upward] = (
+                directional_up_sum[valid_upward] / directional_up_count[valid_upward]
+            )
+            downward[valid_downward] = (
+                directional_down_sum[valid_downward] / directional_down_count[valid_downward]
+            )
+
+            wrapped_directionality = {
+                "upward": self._wrap_local_feature_output(
+                    upward, X_is_df, X_index, X_columns,
+                ),
+                "downward": self._wrap_local_feature_output(
+                    downward, X_is_df, X_index, X_columns,
+                ),
+                "upward_count": self._wrap_local_feature_output(
+                    directional_up_count, X_is_df, X_index, X_columns,
+                ),
+                "downward_count": self._wrap_local_feature_output(
+                    directional_down_count, X_is_df, X_index, X_columns,
+                ),
+            }
+
         if not return_closeness or closeness_in is None or closeness_out is None:
+            if wrapped_directionality is not None:
+                return wrapped_importance, wrapped_directionality
             return wrapped_importance
 
-        return wrapped_importance, {
+        wrapped_closeness = {
             "in_group": self._wrap_local_feature_output(
                 closeness_in, X_is_df, X_index, X_columns,
             ),
@@ -1034,6 +1131,9 @@ class SparseProximityMixin:
                 closeness_out, X_is_df, X_index, X_columns,
             ),
         }
+        if wrapped_directionality is not None:
+            return wrapped_importance, wrapped_closeness, wrapped_directionality
+        return wrapped_importance, wrapped_closeness
 
     def local_variable_importance(self, *args: Any, **kwargs: Any) -> Any:
         """Alias for :meth:`local_feature_importance`."""
@@ -1342,6 +1442,28 @@ class SparseProximityMixin:
                 np.full(query_col.shape[0], quantile_value, dtype=np.float64)
             )
         return perturbations
+
+    @staticmethod
+    def _directional_masks(
+        query_col: np.ndarray,
+        perturbed_col: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        query_numeric = pd.to_numeric(
+            pd.Series(np.asarray(query_col).ravel()), errors="coerce",
+        )
+        perturbed_numeric = pd.to_numeric(
+            pd.Series(np.asarray(perturbed_col).ravel()), errors="coerce",
+        )
+
+        query_values = query_numeric.to_numpy(dtype=np.float64, copy=False)
+        perturbed_values = perturbed_numeric.to_numpy(dtype=np.float64, copy=False)
+        valid = ~(np.isnan(query_values) | np.isnan(perturbed_values))
+
+        upward = np.zeros(query_values.shape[0], dtype=bool)
+        downward = np.zeros(query_values.shape[0], dtype=bool)
+        upward[valid] = perturbed_values[valid] > query_values[valid]
+        downward[valid] = perturbed_values[valid] < query_values[valid]
+        return upward, downward
 
     @staticmethod
     def _scalar_values_equal(lhs: Any, rhs: Any) -> bool:

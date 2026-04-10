@@ -962,6 +962,98 @@ class TestSparseProximityMixin(unittest.TestCase):
         self.assertTrue(np.isfinite(quant_median.to_numpy()).all())
         pd.testing.assert_frame_equal(quant_a, quant_b)
 
+    def test_local_feature_importance_directionality_tracks_quantile_direction(self):
+        """Directional summaries split quantile perturbations into upward and downward moves."""
+        import pandas as pd
+
+        Xc_tr, yc_tr, Xc_te, _ = self._classification_data()
+        columns = [f"feature_{i}" for i in range(Xc_tr.shape[1])]
+        index = pd.RangeIndex(900, 908)
+
+        df_tr = pd.DataFrame(Xc_tr, columns=columns)
+        df_te = pd.DataFrame(Xc_te[:8], columns=columns, index=index)
+
+        model = self._build_model(
+            RandomForestClassifier,
+            "original",
+            n_estimators=60,
+            random_state=23,
+            bootstrap=False,
+            max_features=None,
+        )
+        self._fit(model, df_tr, yc_tr)
+
+        importance, closeness, directionality = model.local_feature_importance(
+            df_te,
+            perturbation="quantile",
+            n_repeats=5,
+            return_closeness=True,
+            return_directionality=True,
+        )
+
+        self.assertIsInstance(importance, pd.DataFrame)
+        self.assertSetEqual(set(closeness.keys()), {"in_group", "out_group"})
+        self.assertSetEqual(
+            set(directionality.keys()),
+            {"upward", "downward", "upward_count", "downward_count"},
+        )
+
+        upward = directionality["upward"]
+        downward = directionality["downward"]
+        upward_count = directionality["upward_count"]
+        downward_count = directionality["downward_count"]
+
+        for value in (
+            upward,
+            downward,
+            upward_count,
+            downward_count,
+            closeness["in_group"],
+            closeness["out_group"],
+        ):
+            self.assertIsInstance(value, pd.DataFrame)
+            pd.testing.assert_index_equal(value.index, index)
+            self.assertListEqual(list(value.columns), columns)
+
+        quantile_levels = np.linspace(0.0, 1.0, 5, dtype=np.float64)
+        expected_upward = np.zeros((df_te.shape[0], df_te.shape[1]), dtype=np.int64)
+        expected_downward = np.zeros_like(expected_upward)
+
+        for feature_idx, column in enumerate(columns):
+            ref_values = df_tr[column].to_numpy(dtype=np.float64, copy=False)
+            quantile_values = np.quantile(ref_values, quantile_levels)
+            observed = df_te[column].to_numpy(dtype=np.float64, copy=False)
+            expected_upward[:, feature_idx] = (
+                quantile_values[np.newaxis, :] > observed[:, np.newaxis]
+            ).sum(axis=1)
+            expected_downward[:, feature_idx] = (
+                quantile_values[np.newaxis, :] < observed[:, np.newaxis]
+            ).sum(axis=1)
+
+        expected_upward_df = pd.DataFrame(expected_upward, index=index, columns=columns)
+        expected_downward_df = pd.DataFrame(expected_downward, index=index, columns=columns)
+
+        pd.testing.assert_frame_equal(upward_count, expected_upward_df)
+        pd.testing.assert_frame_equal(downward_count, expected_downward_df)
+
+        upward_values = upward.to_numpy(dtype=np.float64)
+        downward_values = downward.to_numpy(dtype=np.float64)
+        self.assertTrue(np.isnan(upward_values[expected_upward == 0]).all())
+        self.assertTrue(np.isnan(downward_values[expected_downward == 0]).all())
+        self.assertTrue(np.isfinite(upward_values[expected_upward > 0]).all())
+        self.assertTrue(np.isfinite(downward_values[expected_downward > 0]).all())
+
+        reconstructed = (
+            np.nan_to_num(upward_values, nan=0.0) * expected_upward
+            + np.nan_to_num(downward_values, nan=0.0) * expected_downward
+        ) / 5.0
+        np.testing.assert_allclose(
+            reconstructed,
+            importance.to_numpy(dtype=np.float64),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
