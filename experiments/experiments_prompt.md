@@ -1,0 +1,10 @@
+codex --model gpt-5.4 --config model_reasoning_effort='"high"' --yolo
+
+Please review the codebase in ObliqueProximitiesCode/forestgap. Review the proximity-based applications in ObliqueProximitiesCode/notes/proximity_applications_summary.md. For any code runs, please use the conda environment generalforest. The
+  ObliqueProximitiesCode/forestgap/core.py file contains the main code base for running the proximity-based applications. The ObliqueProximitiesCode/forestgap/datasets.py file contains code for loading in OpenML Benchmarks. Use the OpenML-CC18
+  benchmark for classification, and the OpenML-CTR23 benchmark for regression tasks. Now, devise experiments based on both of these benchmarks (separate for regression and classification) to test the applications spelled out in
+  ObliqueProximitiesCode/notes/proximity_applications_summary.md. Most of these task involve supervision, including imputation, outlier detection, prototypes, and local feature importance. In the ObliqueProximitiesCode/experiments directory, create
+  scripts to test each application found. Each experiment should be reproducible and run with multiple random states. Raw results should be stored in ObliqueProximitiesCode/results/raw. Compiled results (e.g., figures, tables, plots) should be
+  stored in respective directories of ObliqueProximitiesCode/results. Use as many threads as possible. Continue refining experiments until all run on all benchmark datasets. If any applications in ObliqueProximitiesCode/forestgap/core.py need to be
+  updated, please do so. Only work on the current branch (create_experiments). Any critical results or continued questions should be recorded in respectively ObliqueProximitiesCode/results/results_summary.md and ObliqueProximitiesCode/results/
+  questions.md. Reiterate through your processes as often as necessary.
