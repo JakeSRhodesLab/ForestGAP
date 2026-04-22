@@ -614,10 +614,35 @@ def load_openml_dataset(
 
 
 def _resolve_suite_id_by_name(openml: Any, suite_name: str) -> int:
-    suites = openml.study.list_suites(output_format="dict")
-    for suite_id, suite_info in suites.items():
-        if suite_info.get("name") == suite_name:
-            return int(suite_id)
+    query = str(suite_name).strip().casefold()
+    suites = openml.study.list_suites(output_format="dataframe")
+    candidates: list[tuple[int, str, str]] = []
+
+    if hasattr(suites, "iterrows"):
+        for _, suite_info in suites.iterrows():
+            suite_id = int(suite_info.get("id"))
+            name = str(suite_info.get("name", "") or "")
+            alias = str(suite_info.get("alias", "") or "")
+            candidates.append((suite_id, name, alias))
+    else:
+        for suite_id, suite_info in suites.items():
+            name = str(suite_info.get("name", "") or "")
+            alias = str(suite_info.get("alias", "") or "")
+            candidates.append((int(suite_id), name, alias))
+
+    for suite_id, name, alias in candidates:
+        if query in {name.strip().casefold(), alias.strip().casefold()}:
+            return suite_id
+
+    prefix_matches = [
+        suite_id
+        for suite_id, name, alias in candidates
+        if name.strip().casefold().startswith(query)
+        or alias.strip().casefold().startswith(query)
+    ]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+
     raise ValueError(f"Could not find an OpenML benchmark suite named {suite_name!r}.")
 
 

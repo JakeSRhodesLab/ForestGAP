@@ -58,7 +58,59 @@ def patch_treeple_regressor_tags() -> bool:
     return True
 
 
+def patch_treeple_sample_weight_signature() -> bool:
+    """Patch treeple's vendored sklearn tree helper for sklearn>=1.7.
+
+    treeple 0.10.3 still calls ``_check_sample_weight(sample_weight, X, DOUBLE)``
+    positionally, while sklearn 1.7 makes ``dtype`` keyword-only. Patch the
+    treeple-local reference so existing call sites keep working.
+
+    Returns
+    -------
+    bool
+        True when the patch is installed (or already present), False when
+        treeple is unavailable.
+    """
+
+    try:
+        from sklearn.utils.validation import _check_sample_weight as sklearn_check_sample_weight
+        import treeple._lib.sklearn.tree._classes as treeple_tree_classes
+    except Exception:
+        return False
+
+    if getattr(treeple_tree_classes, "_forestgap_sample_weight_patch", False):
+        return True
+
+    def _patched_check_sample_weight(
+        sample_weight: Any,
+        X: Any,
+        dtype: Any = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if args:
+            if dtype is None:
+                dtype = args[0]
+            else:
+                raise TypeError("dtype provided both positionally and by keyword.")
+            if len(args) > 1:
+                raise TypeError(
+                    "_check_sample_weight accepts at most one positional argument after X."
+                )
+        return sklearn_check_sample_weight(
+            sample_weight,
+            X,
+            dtype=dtype,
+            **kwargs,
+        )
+
+    treeple_tree_classes._check_sample_weight = _patched_check_sample_weight
+    treeple_tree_classes._forestgap_sample_weight_patch = True
+    return True
+
+
 patch_treeple_regressor_tags()
+patch_treeple_sample_weight_signature()
 
 
 try:

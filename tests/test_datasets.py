@@ -217,6 +217,44 @@ class TestOpenMLDatasetLoading(unittest.TestCase):
         self.assertEqual([dataset.dataset_id for dataset in suite.datasets], [101, 102])
         self.assertEqual(mocked_loader.call_count, 2)
 
+    def test_load_openml_suite_matches_alias_and_prefix(self):
+        fake_suite = SimpleNamespace(
+            name="OpenML-CTR23 - A curated tabular regression benchmarking suite",
+            description="benchmark",
+            tasks=[],
+            alias="8f0ea660163b436bbd4abd49665c7b1d",
+            main_entity_type="task",
+        )
+        fake_suites = pd.DataFrame(
+            [
+                {
+                    "id": 99,
+                    "name": "OpenML-CC18 Curated Classification benchmark",
+                    "alias": "OpenML-CC18",
+                },
+                {
+                    "id": 353,
+                    "name": "OpenML-CTR23 - A curated tabular regression benchmarking suite",
+                    "alias": "8f0ea660163b436bbd4abd49665c7b1d",
+                },
+            ]
+        )
+        fake_openml = SimpleNamespace(
+            study=SimpleNamespace(
+                get_suite=lambda suite_id: fake_suite,
+                list_suites=lambda output_format="dataframe": fake_suites,
+            ),
+            tasks=SimpleNamespace(get_task=lambda task_id: None),
+        )
+
+        with patch("forestgap.datasets._require_openml", return_value=fake_openml):
+            with patch("forestgap.datasets.load_openml_dataset", return_value=None):
+                cc18 = load_openml_suite(suite_name="OpenML-CC18")
+                ctr23 = load_openml_suite(suite_name="OpenML-CTR23")
+
+        self.assertEqual(cc18.suite_id, 99)
+        self.assertEqual(ctr23.suite_id, 353)
+
 
 if __name__ == "__main__":
     unittest.main()
