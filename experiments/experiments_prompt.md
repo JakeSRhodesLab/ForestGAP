@@ -533,3 +533,141 @@ Deliverables:
 - updated raw/compiled result schema
 - smoke-test evidence
 - concise documentation of the revised validation methodology
+
+
+
+
+## Proximity Prediction
+
+codex --model gpt-5.4 --config model_reasoning_effort='"high"' --yolo
+
+Please update the prediction identity benchmark in ObliqueProximitiesCode/experiments/run_prediction_identity.py and any shared helpers in ObliqueProximitiesCode/experiments/common.py as needed. For any code runs, use the conda environment generalforest. Only work on the current branch.
+
+First review:
+- ObliqueProximitiesCode/experiments/run_prediction_identity.py
+- ObliqueProximitiesCode/experiments/common.py
+- ObliqueProximitiesCode/forestgap/core.py, especially `prox_predict`
+- ObliqueProximitiesCode/notes/proximity_applications_summary.md, especially the prediction-identity discussion
+- ObliqueProximitiesCode/notebooks/rotation_forest_proximities.ipynb for import/model examples
+
+Goal:
+Strengthen the prediction identity experiment so it validates the RF-GAP claim that proximity weights reproduce the forest prediction, especially for OOB training predictions. The primary evidence should be a direct comparison between:
+- proximity-weighted OOB predictions from `prox_predict()`
+- the forest’s native OOB predictions from `oob_decision_function_` or `oob_prediction_`
+
+This should be benchmarked across all supervised forest models and across both benchmark suites:
+- classification: OpenML-CC18
+- regression: OpenML-CTR23
+
+Model scope:
+Use all supervised forest families supported by the current environment and matching the notebook import patterns, including when available:
+- RandomForest
+- ExtraTrees
+- RotationForest
+- HonestForest
+- ObliqueRandomForest
+- PatchObliqueRandomForest
+- ExtraObliqueRandomForest
+
+If any of these are not yet in the experiment registry but are available in the environment, extend the registry cleanly.
+If a model truly is unavailable or unsupported for a task kind, log an explicit unsupported row rather than skipping it.
+
+Important methodology requirements:
+1. Prediction identity here is specifically about RF-GAP-weighted prediction, so use `prox_method="rfgap"` as the main setting.
+2. The primary benchmark comparison must be:
+   - classification: `prox_predict()` vs `oob_decision_function_`
+   - regression: `prox_predict()` vs `oob_prediction_`
+3. Also keep the test-data identity check as a secondary validation:
+   - classification: `prox_predict(X_test)` vs `predict_proba(X_test)`
+   - regression: `prox_predict(X_test)` vs `predict(X_test)`
+4. Reuse the same fitted model for OOB and test comparisons.
+5. Fit models with the right supervised configuration:
+   - `fit(X_train, y_train)`
+   - use notebook-consistent import and wrapper patterns from `rotation_forest_proximities.ipynb`
+   - preserve model-specific handling for bootstrap / oob support where needed
+
+Metrics:
+For classification, report at least:
+- `test_mean_abs_diff`
+- `test_max_abs_diff`
+- `oob_mean_abs_diff`
+- `oob_max_abs_diff`
+- `test_argmax_agreement`
+- `oob_argmax_agreement`
+- model predictive performance on the held-out set, e.g. `test_accuracy`
+
+For regression, report at least:
+- `test_mean_abs_diff`
+- `test_max_abs_diff`
+- `oob_mean_abs_diff`
+- `oob_max_abs_diff`
+- `test_rmse_diff` or equivalent identity error summary if helpful
+- model predictive performance on the held-out set, e.g. `test_r2`
+
+If there are rows where OOB predictions are undefined or partially missing for a model family, handle that explicitly and document it.
+
+Result schema:
+Update raw output rows to include at least:
+- experiment
+- status
+- task_kind
+- suite_name
+- dataset_id
+- dataset_name
+- task_id
+- random_state
+- model_name
+- prox_method
+- train_size
+- test_size
+- n_features
+- n_categorical_features
+- test_mean_abs_diff
+- test_max_abs_diff
+- oob_mean_abs_diff
+- oob_max_abs_diff
+- test_argmax_agreement when classification
+- oob_argmax_agreement when classification
+- performance metric (`test_accuracy` or `test_r2`)
+- fit_runtime_seconds
+- prox_test_runtime_seconds
+- forest_test_runtime_seconds
+- prox_oob_runtime_seconds
+- total_runtime_seconds
+
+Compiled outputs:
+Create summaries and plots that emphasize OOB identity first.
+At minimum produce:
+- summary.csv grouped by `model_name`
+- model_comparison.csv
+- plots for:
+  - OOB max absolute difference by model
+  - test max absolute difference by model
+- separate outputs for classification and regression
+
+If helpful, also create a more detailed summary grouped by:
+- model_name
+- task_kind
+
+Implementation guidance:
+- Keep shared logic in `experiments/common.py` when appropriate rather than bloating the experiment script.
+- Use the supervised model import / registry style already reflected in `rotation_forest_proximities.ipynb`.
+- Do not include unsupervised models in this benchmark.
+- Preserve reproducibility via random states and the existing results directory conventions.
+- Keep unsupported/error rows explicit.
+
+Validation:
+- Smoke-test the updated experiment on at least one classification dataset and one regression dataset.
+- Confirm that all supervised model families available in the environment are attempted.
+- Confirm that OOB identity is being computed and saved for every supported fitted model.
+
+Documentation:
+- Record the final experiment design and any model-specific caveats in ObliqueProximitiesCode/results/results_summary.md
+- Record unresolved issues or blockers in ObliqueProximitiesCode/results/questions.md
+
+Deliverables:
+- updated run_prediction_identity.py
+- any required registry/helper updates in common.py
+- updated raw/compiled result schema
+- smoke-test evidence
+- concise documentation of the OOB vs proximity-weighted prediction identity benchmark
