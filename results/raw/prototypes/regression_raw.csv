@@ -1,0 +1,19 @@
+experiment,status,task_kind,model_name,random_state,task_id,dataset_id,dataset_name,reason,suite_name,prox_method,prototype_source,k,n_prototypes
+prototypes,unsupported,regression,RandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,RandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,RandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3
+prototypes,unsupported,regression,RotationForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,RotationForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,RotationForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3
+prototypes,unsupported,regression,HonestForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,HonestForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,HonestForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3
+prototypes,unsupported,regression,ObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,ObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,ObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3
+prototypes,unsupported,regression,PatchObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,PatchObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,PatchObliqueRandomForest,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3
+prototypes,unsupported,regression,ExtraTrees,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,original,learned,15,3
+prototypes,unsupported,regression,ExtraTrees,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,oob,learned,15,3
+prototypes,unsupported,regression,ExtraTrees,0,361234,44956,task_361234,get_prototypes is only implemented for classifiers in forestgap.core,OpenML-CTR23,rfgap,learned,15,3

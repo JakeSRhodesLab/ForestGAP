@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -27,19 +29,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import openml
 import pandas as pd
+from scipy.stats import spearmanr
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     ExtraTreesRegressor,
+    IsolationForest,
     RandomForestClassifier,
     RandomForestRegressor,
 )
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    mean_squared_error,
     r2_score,
     roc_auc_score,
 )
+from sklearn.linear_model import Lasso, LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from forestgap import load_openml_dataset, with_sparse_proximity
 
@@ -52,7 +61,10 @@ ModelKey = Literal[
     "HonestForest",
     "ObliqueRandomForest",
     "PatchObliqueRandomForest",
+    "ExtraObliqueRandomForest",
 ]
+OutlierModelFamily = Literal["supervised_forest", "unsupervised_model"]
+OutlierLabelMode = Literal["supervised", "unsupervised", "not_applicable"]
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
@@ -65,8 +77,25 @@ REQUESTED_MODEL_ORDER: tuple[ModelKey, ...] = (
     "HonestForest",
     "ObliqueRandomForest",
     "PatchObliqueRandomForest",
+    "ExtraObliqueRandomForest",
     "ExtraTrees",
 )
+REQUESTED_OUTLIER_MODEL_ORDER: tuple[str, ...] = (
+    *REQUESTED_MODEL_ORDER,
+    "IsolationForest",
+    "ExtendedIsolationForest",
+    "UnsupervisedRandomForest",
+    "UnsupervisedObliqueRandomForest",
+)
+OUTLIER_PROX_METHODS: tuple[str, ...] = ("original", "oob", "rfgap")
+OUTLIER_SCORE_METHODS: tuple[str, ...] = ("breiman", "ene")
+DEFAULT_MISSINGNESS_MECHANISMS: tuple[str, ...] = ("MCAR", "MAR", "MNAR")
+DEFAULT_MISSING_RATES: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75)
+DOWNSTREAM_MODEL_ORDER: dict[TaskKind, tuple[str, ...]] = {
+    "classification": ("LogisticRegression", "KNeighborsClassifier"),
+    "regression": ("Lasso", "KNeighborsRegressor"),
+}
+LOW_SUPPORT_CATEGORY_MIN_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -74,6 +103,19 @@ class ModelSpec:
     key: ModelKey
     estimator_cls: type[Any]
     task_kind: TaskKind
+
+
+@dataclass(frozen=True)
+class OutlierModelSpec:
+    key: str
+    estimator_cls: type[Any]
+    task_kind: TaskKind
+    model_family: OutlierModelFamily
+    fit_mode: Literal["fit_x", "fit_xy"]
+    supports_label_aware_scores: bool
+    supports_native_scores: bool
+    native_score_method: Optional[str] = None
+    native_scores_share_fit_across_prox_methods: bool = False
 
 
 def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
@@ -100,64 +142,160 @@ def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
         ),
     }
 
-    try:
-        from aeon.classification.sklearn import RotationForestClassifier
-        from aeon.regression.sklearn import RotationForestRegressor
+    def register_optional(
+        task_kind: TaskKind,
+        key: ModelKey,
+        module_name: str,
+        class_name: str,
+    ) -> None:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            estimator_cls = getattr(module, class_name)
+        except Exception:
+            return
+        registry[(task_kind, key)] = ModelSpec(
+            key=key,
+            estimator_cls=estimator_cls,
+            task_kind=task_kind,
+        )
 
-        registry[("classification", "RotationForest")] = ModelSpec(
-            key="RotationForest",
-            estimator_cls=RotationForestClassifier,
-            task_kind="classification",
+    register_optional(
+        "classification",
+        "RotationForest",
+        "aeon.classification.sklearn",
+        "RotationForestClassifier",
+    )
+    register_optional(
+        "regression",
+        "RotationForest",
+        "aeon.regression.sklearn",
+        "RotationForestRegressor",
+    )
+    register_optional(
+        "classification",
+        "HonestForest",
+        "treeple",
+        "HonestForestClassifier",
+    )
+    register_optional(
+        "classification",
+        "ObliqueRandomForest",
+        "treeple",
+        "ObliqueRandomForestClassifier",
+    )
+    register_optional(
+        "regression",
+        "ObliqueRandomForest",
+        "treeple",
+        "ObliqueRandomForestRegressor",
+    )
+    register_optional(
+        "classification",
+        "PatchObliqueRandomForest",
+        "treeple",
+        "PatchObliqueRandomForestClassifier",
+    )
+    register_optional(
+        "regression",
+        "PatchObliqueRandomForest",
+        "treeple",
+        "PatchObliqueRandomForestRegressor",
+    )
+    register_optional(
+        "classification",
+        "ExtraObliqueRandomForest",
+        "treeple",
+        "ExtraObliqueRandomForestClassifier",
+    )
+    register_optional(
+        "regression",
+        "ExtraObliqueRandomForest",
+        "treeple",
+        "ExtraObliqueRandomForestRegressor",
+    )
+
+    return registry
+
+
+MODEL_REGISTRY = _build_model_registry()
+
+
+def _build_outlier_model_registry() -> dict[tuple[TaskKind, str], OutlierModelSpec]:
+    registry: dict[tuple[TaskKind, str], OutlierModelSpec] = {}
+
+    for task_kind in ("classification", "regression"):
+        typed_task_kind = task_kind  # keep a concrete literal-like value for readability
+        for model_name in REQUESTED_MODEL_ORDER:
+            spec = MODEL_REGISTRY.get((typed_task_kind, model_name))
+            if spec is None:
+                continue
+            registry[(typed_task_kind, model_name)] = OutlierModelSpec(
+                key=model_name,
+                estimator_cls=spec.estimator_cls,
+                task_kind=typed_task_kind,
+                model_family="supervised_forest",
+                fit_mode="fit_xy",
+                supports_label_aware_scores=(typed_task_kind == "classification"),
+                supports_native_scores=False,
+            )
+
+        registry[(typed_task_kind, "IsolationForest")] = OutlierModelSpec(
+            key="IsolationForest",
+            estimator_cls=IsolationForest,
+            task_kind=typed_task_kind,
+            model_family="unsupervised_model",
+            fit_mode="fit_x",
+            supports_label_aware_scores=False,
+            supports_native_scores=True,
+            native_score_method="score_samples",
+            native_scores_share_fit_across_prox_methods=True,
         )
-        registry[("regression", "RotationForest")] = ModelSpec(
-            key="RotationForest",
-            estimator_cls=RotationForestRegressor,
-            task_kind="regression",
-        )
-    except Exception:
-        pass
 
     try:
         from treeple import (
-            HonestForestClassifier,
-            ObliqueRandomForestClassifier,
-            ObliqueRandomForestRegressor,
-            PatchObliqueRandomForestClassifier,
-            PatchObliqueRandomForestRegressor,
+            ExtendedIsolationForest,
+            UnsupervisedObliqueRandomForest,
+            UnsupervisedRandomForest,
         )
 
-        registry[("classification", "HonestForest")] = ModelSpec(
-            key="HonestForest",
-            estimator_cls=HonestForestClassifier,
-            task_kind="classification",
-        )
-        registry[("classification", "ObliqueRandomForest")] = ModelSpec(
-            key="ObliqueRandomForest",
-            estimator_cls=ObliqueRandomForestClassifier,
-            task_kind="classification",
-        )
-        registry[("regression", "ObliqueRandomForest")] = ModelSpec(
-            key="ObliqueRandomForest",
-            estimator_cls=ObliqueRandomForestRegressor,
-            task_kind="regression",
-        )
-        registry[("classification", "PatchObliqueRandomForest")] = ModelSpec(
-            key="PatchObliqueRandomForest",
-            estimator_cls=PatchObliqueRandomForestClassifier,
-            task_kind="classification",
-        )
-        registry[("regression", "PatchObliqueRandomForest")] = ModelSpec(
-            key="PatchObliqueRandomForest",
-            estimator_cls=PatchObliqueRandomForestRegressor,
-            task_kind="regression",
-        )
+        for task_kind in ("classification", "regression"):
+            typed_task_kind = task_kind
+            registry[(typed_task_kind, "ExtendedIsolationForest")] = OutlierModelSpec(
+                key="ExtendedIsolationForest",
+                estimator_cls=ExtendedIsolationForest,
+                task_kind=typed_task_kind,
+                model_family="unsupervised_model",
+                fit_mode="fit_x",
+                supports_label_aware_scores=False,
+                supports_native_scores=True,
+                native_score_method="score_samples",
+                native_scores_share_fit_across_prox_methods=True,
+            )
+            registry[(typed_task_kind, "UnsupervisedRandomForest")] = OutlierModelSpec(
+                key="UnsupervisedRandomForest",
+                estimator_cls=UnsupervisedRandomForest,
+                task_kind=typed_task_kind,
+                model_family="unsupervised_model",
+                fit_mode="fit_x",
+                supports_label_aware_scores=False,
+                supports_native_scores=False,
+            )
+            registry[(typed_task_kind, "UnsupervisedObliqueRandomForest")] = OutlierModelSpec(
+                key="UnsupervisedObliqueRandomForest",
+                estimator_cls=UnsupervisedObliqueRandomForest,
+                task_kind=typed_task_kind,
+                model_family="unsupervised_model",
+                fit_mode="fit_x",
+                supports_label_aware_scores=False,
+                supports_native_scores=False,
+            )
     except Exception:
         pass
 
     return registry
 
 
-MODEL_REGISTRY = _build_model_registry()
+OUTLIER_MODEL_REGISTRY = _build_outlier_model_registry()
 
 
 @dataclass
@@ -179,8 +317,45 @@ class PreparedDataset:
     test_size: int
 
 
+@dataclass(frozen=True)
+class MissingMaskResult:
+    mechanism: str
+    missing_rate: float
+    train_mask: np.ndarray
+    test_mask: np.ndarray
+    metadata: dict[str, Any]
+
+
 def parse_random_states(text: str) -> list[int]:
     return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def parse_csv_strings(text: str) -> list[str]:
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def parse_csv_floats(text: str) -> list[float]:
+    return [float(part) for part in parse_csv_strings(text)]
+
+
+def parse_missingness_mechanisms(text: str) -> list[str]:
+    mechanisms = [mechanism.upper() for mechanism in parse_csv_strings(text)]
+    invalid = sorted(set(mechanisms) - set(DEFAULT_MISSINGNESS_MECHANISMS))
+    if invalid:
+        raise ValueError(
+            "Unknown missingness mechanisms: "
+            + ", ".join(invalid)
+            + f". Expected a subset of {DEFAULT_MISSINGNESS_MECHANISMS!r}."
+        )
+    return mechanisms
+
+
+def parse_missing_rates(text: str) -> list[float]:
+    rates = parse_csv_floats(text)
+    for rate in rates:
+        if rate < 0.0 or rate > 1.0:
+            raise ValueError(f"Missing rates must lie in [0, 1], received {rate}.")
+    return rates
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -244,6 +419,10 @@ def requested_model_names() -> tuple[ModelKey, ...]:
     return REQUESTED_MODEL_ORDER
 
 
+def requested_outlier_model_names() -> tuple[str, ...]:
+    return REQUESTED_OUTLIER_MODEL_ORDER
+
+
 def available_model_names(task_kind: TaskKind) -> list[ModelKey]:
     return [
         model_key
@@ -252,15 +431,53 @@ def available_model_names(task_kind: TaskKind) -> list[ModelKey]:
     ]
 
 
+def available_outlier_model_names(task_kind: TaskKind) -> list[str]:
+    return [
+        model_name
+        for model_name in REQUESTED_OUTLIER_MODEL_ORDER
+        if (task_kind, model_name) in OUTLIER_MODEL_REGISTRY
+    ]
+
+
+def downstream_model_names(task_kind: TaskKind) -> tuple[str, ...]:
+    return DOWNSTREAM_MODEL_ORDER[task_kind]
+
+
 def model_spec(task_kind: TaskKind, model_name: ModelKey) -> Optional[ModelSpec]:
     return MODEL_REGISTRY.get((task_kind, model_name))
+
+
+def outlier_model_spec(task_kind: TaskKind, model_name: str) -> Optional[OutlierModelSpec]:
+    return OUTLIER_MODEL_REGISTRY.get((task_kind, model_name))
+
+
+def estimator_supports_parameter(
+    task_kind: TaskKind,
+    model_name: ModelKey,
+    parameter_name: str,
+) -> bool:
+    spec = model_spec(task_kind, model_name)
+    if spec is None:
+        return False
+    return parameter_name in inspect.signature(spec.estimator_cls.__init__).parameters
+
+
+def outlier_label_modes(task_kind: TaskKind, model_name: str) -> tuple[OutlierLabelMode, ...]:
+    spec = outlier_model_spec(task_kind, model_name)
+    if spec is None:
+        return tuple()
+    if spec.model_family == "unsupervised_model":
+        return ("unsupervised",)
+    if task_kind == "classification" and spec.supports_label_aware_scores:
+        return ("supervised", "unsupervised")
+    return ("unsupervised",)
 
 
 def unsupported_model_row(
     *,
     experiment_name: str,
     task_kind: TaskKind,
-    model_name: ModelKey,
+    model_name: str,
     dataset_name: str,
     dataset_id: int,
     task_id: int,
@@ -299,15 +516,66 @@ def save_plot_dataframe(
     path: Path,
     rotation: int = 35,
 ) -> None:
+    if df.empty:
+        return
     ensure_dir(path.parent)
-    fig, ax = plt.subplots(figsize=(10, 5))
+    width = max(10.0, min(24.0, 0.4 * max(len(df), 1)))
+    fig, ax = plt.subplots(figsize=(width, 5.5))
     df.plot(kind="bar", x=x, y=y, ax=ax, legend=False, color="#2c7fb8")
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xlabel("")
     ax.tick_params(axis="x", rotation=rotation)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, message=r".*layout.*")
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_lineplot_dataframe(
+    df: pd.DataFrame,
+    *,
+    x: str,
+    y: str,
+    group_col: str,
+    facet_col: Optional[str],
+    title: str,
+    ylabel: str,
+    path: Path,
+) -> None:
+    if df.empty:
+        return
+    ensure_dir(path.parent)
+    facet_values = [None] if facet_col is None else sorted(df[facet_col].dropna().unique())
+    fig, axes = plt.subplots(
+        1,
+        len(facet_values),
+        figsize=(6 * len(facet_values), 5),
+        squeeze=False,
+        sharey=True,
+    )
+    for axis, facet_value in zip(axes[0], facet_values):
+        facet_df = df if facet_col is None else df[df[facet_col] == facet_value]
+        for group_value, group_df in facet_df.groupby(group_col, dropna=False):
+            ordered = group_df.sort_values(x)
+            axis.plot(
+                ordered[x].to_numpy(dtype=np.float64),
+                ordered[y].to_numpy(dtype=np.float64),
+                marker="o",
+                linewidth=1.5,
+                label=str(group_value),
+            )
+        if facet_col is not None:
+            axis.set_title(f"{facet_col}={facet_value}")
+        axis.set_xlabel(x.replace("_", " ").title())
+        axis.set_ylabel(ylabel)
+        axis.grid(alpha=0.25, linestyle=":")
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    if labels:
+        fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.02), ncol=2)
+    fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(path, dpi=180)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -599,6 +867,72 @@ def build_proximity_model(
     return prox_cls(**kwargs)
 
 
+def build_outlier_model(
+    task_kind: TaskKind,
+    *,
+    model_name: str,
+    prox_method: str,
+    random_state: int,
+    n_estimators: int,
+    isolation_bootstrap: bool,
+    extra_kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[Any, OutlierModelSpec, dict[str, Any]]:
+    spec = outlier_model_spec(task_kind, model_name)
+    if spec is None:
+        raise ValueError(f"Outlier model {model_name!r} is not available for task_kind={task_kind!r}.")
+
+    base_cls = spec.estimator_cls
+    prox_cls = with_sparse_proximity(base_cls)
+    signature = inspect.signature(base_cls.__init__)
+    kwargs: dict[str, Any] = {
+        "n_estimators": n_estimators,
+        "random_state": random_state,
+        "prox_method": prox_method,
+        "matrix_type": "sparse",
+        "n_jobs": int(os.environ.get("FORESTGAP_N_JOBS", "-1")),
+    }
+
+    if spec.model_family == "supervised_forest":
+        if "bootstrap" in signature.parameters:
+            kwargs["bootstrap"] = True
+        if "oob_score" in signature.parameters:
+            kwargs["oob_score"] = prox_method == "rfgap"
+    elif model_name in {"IsolationForest", "ExtendedIsolationForest"}:
+        if "bootstrap" in signature.parameters:
+            kwargs["bootstrap"] = bool(isolation_bootstrap)
+    else:
+        if "bootstrap" in signature.parameters:
+            kwargs["bootstrap"] = prox_method in ("oob", "rfgap")
+        if "oob_score" in signature.parameters:
+            kwargs["oob_score"] = False
+
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
+
+    fit_metadata = {
+        "fit_mode": spec.fit_mode,
+        "fit_bootstrap": bool(kwargs.get("bootstrap", False)),
+        "native_score_shared_across_prox_methods": (
+            spec.supports_native_scores and spec.native_scores_share_fit_across_prox_methods
+        ),
+    }
+    return prox_cls(**kwargs), spec, fit_metadata
+
+
+def fit_outlier_model(model: Any, spec: OutlierModelSpec, X: np.ndarray, y: np.ndarray) -> Any:
+    if spec.fit_mode == "fit_xy":
+        model.fit(X, y)
+    else:
+        model.fit(X)
+    return model
+
+
+def native_outlier_scores(model: Any, X: np.ndarray) -> np.ndarray:
+    if not hasattr(model, "score_samples"):
+        raise AttributeError(f"{type(model).__name__} does not expose score_samples().")
+    return -np.asarray(model.score_samples(X), dtype=np.float64)
+
+
 def classification_probability_metrics(
     prox_prob: np.ndarray,
     forest_prob: np.ndarray,
@@ -625,6 +959,251 @@ def regression_prediction_metrics(
     }
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(values, -30.0, 30.0)))
+
+
+def _logit(value: float) -> float:
+    clipped = float(np.clip(value, 1e-6, 1.0 - 1e-6))
+    return math.log(clipped / (1.0 - clipped))
+
+
+def _calibrate_logistic_intercept(scores: np.ndarray, target_rate: float) -> float:
+    if target_rate <= 0.0:
+        return -30.0
+    if target_rate >= 1.0:
+        return 30.0
+    clean_scores = np.asarray(scores, dtype=np.float64)
+    if clean_scores.size == 0 or np.allclose(clean_scores, clean_scores[0]):
+        return _logit(target_rate) - float(clean_scores[0] if clean_scores.size else 0.0)
+    low = -30.0
+    high = 30.0
+    for _ in range(80):
+        mid = 0.5 * (low + high)
+        mean_prob = float(np.mean(_sigmoid(clean_scores + mid)))
+        if mean_prob > target_rate:
+            high = mid
+        else:
+            low = mid
+    return 0.5 * (low + high)
+
+
+def _weighted_sample_mask(
+    candidate_indices: np.ndarray,
+    n_select: int,
+    weights: np.ndarray,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    mask = np.zeros(candidate_indices.shape[0], dtype=bool)
+    if n_select <= 0 or candidate_indices.size == 0:
+        return mask
+    if n_select >= candidate_indices.size:
+        mask[:] = True
+        return mask
+    clean_weights = np.asarray(weights, dtype=np.float64)
+    clean_weights = np.where(np.isfinite(clean_weights) & (clean_weights > 0.0), clean_weights, 0.0)
+    if float(clean_weights.sum()) <= 0.0:
+        clean_weights = np.ones(candidate_indices.size, dtype=np.float64)
+    probabilities = clean_weights / clean_weights.sum()
+    selected_local = rng.choice(candidate_indices.size, size=n_select, replace=False, p=probabilities)
+    mask[selected_local] = True
+    return mask
+
+
+def _standardize_with_train(train_column: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, bool]:
+    observed = train_column[~np.isnan(train_column)]
+    if observed.size == 0:
+        return np.zeros(values.shape[0], dtype=np.float64), False
+    scale = float(np.nanstd(observed))
+    if not np.isfinite(scale) or scale == 0.0:
+        return np.zeros(values.shape[0], dtype=np.float64), False
+    centered = np.asarray(values, dtype=np.float64) - float(np.nanmean(observed))
+    standardized = centered / scale
+    standardized[np.isnan(standardized)] = 0.0
+    return standardized, True
+
+
+def _quantile_rank_scores(train_observed: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, bool]:
+    clean_train = np.sort(np.asarray(train_observed, dtype=np.float64))
+    if clean_train.size == 0 or np.unique(clean_train).size < 2:
+        return np.zeros(values.shape[0], dtype=np.float64), False
+    ranks = np.searchsorted(clean_train, np.asarray(values, dtype=np.float64), side="right") + 1
+    probs = np.clip(ranks / (clean_train.size + 1.0), 1e-4, 1.0 - 1e-4)
+    scores = np.log(probs / (1.0 - probs))
+    scores[np.isnan(scores)] = 0.0
+    return scores, True
+
+
+def _feature_label(feature_names: Optional[Sequence[str]], col_idx: int) -> str:
+    if feature_names is None or col_idx >= len(feature_names):
+        return f"x{col_idx + 1}"
+    return str(feature_names[col_idx])
+
+
+def _mar_conditioning_candidates(
+    X_train: np.ndarray,
+    target_idx: int,
+) -> list[dict[str, Any]]:
+    target_column = X_train[:, target_idx]
+    target_observed = target_column[~np.isnan(target_column)]
+    target_has_variation = target_observed.size >= 8 and np.unique(target_observed).size >= 2
+    candidates: list[dict[str, Any]] = []
+    for col_idx in range(X_train.shape[1]):
+        if col_idx == target_idx:
+            continue
+        column = X_train[:, col_idx]
+        observed = column[~np.isnan(column)]
+        if observed.size < 8:
+            continue
+        scale = float(np.nanstd(observed))
+        if not np.isfinite(scale) or scale == 0.0:
+            continue
+        overlap = (~np.isnan(target_column)) & (~np.isnan(column))
+        overlap_count = int(overlap.sum())
+        if overlap_count < 8:
+            continue
+        correlation = float("nan")
+        if target_has_variation:
+            corr = np.corrcoef(target_column[overlap], column[overlap])[0, 1]
+            if np.isfinite(corr):
+                correlation = float(corr)
+        candidates.append(
+            {
+                "col_idx": col_idx,
+                "abs_correlation": abs(correlation) if np.isfinite(correlation) else -1.0,
+                "correlation": correlation,
+                "overlap_count": overlap_count,
+            }
+        )
+    return sorted(
+        candidates,
+        key=lambda item: (item["abs_correlation"], item["overlap_count"]),
+        reverse=True,
+    )
+
+
+def _mar_sampling_weights(
+    X_train: np.ndarray,
+    X_split: np.ndarray,
+    *,
+    target_idx: int,
+    target_rate: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    candidates = _mar_conditioning_candidates(X_train, target_idx)
+    if not candidates:
+        return np.ones(X_split.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_no_usable_conditioning_column",
+            "conditioning_feature_indices": [],
+        }
+    selected = candidates[: min(2, len(candidates))]
+    train_score = np.zeros(X_train.shape[0], dtype=np.float64)
+    split_score = np.zeros(X_split.shape[0], dtype=np.float64)
+    selected_indices: list[int] = []
+    for candidate in selected:
+        train_standardized, train_usable = _standardize_with_train(
+            X_train[:, candidate["col_idx"]],
+            X_train[:, candidate["col_idx"]],
+        )
+        split_standardized, split_usable = _standardize_with_train(
+            X_train[:, candidate["col_idx"]],
+            X_split[:, candidate["col_idx"]],
+        )
+        if not train_usable or not split_usable:
+            continue
+        sign = -1.0 if np.isfinite(candidate["correlation"]) and candidate["correlation"] < 0 else 1.0
+        train_score += sign * train_standardized
+        split_score += sign * split_standardized
+        selected_indices.append(int(candidate["col_idx"]))
+    if not selected_indices:
+        return np.ones(X_split.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_no_usable_conditioning_column",
+            "conditioning_feature_indices": [],
+        }
+    train_score /= float(len(selected_indices))
+    split_score /= float(len(selected_indices))
+    observed_target = ~np.isnan(X_train[:, target_idx])
+    intercept = _calibrate_logistic_intercept(train_score[observed_target], target_rate)
+    probabilities = _sigmoid(split_score + intercept)
+    return probabilities, {
+        "strategy": "mar_logistic",
+        "conditioning_feature_indices": selected_indices,
+    }
+
+
+def _mnar_numeric_sampling_weights(
+    train_column: np.ndarray,
+    split_column: np.ndarray,
+    *,
+    target_rate: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    observed_train = train_column[~np.isnan(train_column)]
+    train_score, usable = _quantile_rank_scores(observed_train, train_column)
+    if not usable:
+        return np.ones(split_column.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_constant_numeric_feature",
+        }
+    split_score, _ = _quantile_rank_scores(observed_train, split_column)
+    intercept = _calibrate_logistic_intercept(train_score[~np.isnan(train_column)], target_rate)
+    return _sigmoid(split_score + intercept), {"strategy": "mnar_numeric_quantile"}
+
+
+def _mnar_categorical_sampling_weights(
+    train_column: np.ndarray,
+    split_column: np.ndarray,
+    *,
+    target_rate: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    observed_train = train_column[~np.isnan(train_column)]
+    if observed_train.size == 0:
+        return np.ones(split_column.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_all_missing_training_feature",
+        }
+    values, counts = np.unique(observed_train, return_counts=True)
+    if values.size < 2:
+        return np.ones(split_column.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_constant_categorical_feature",
+        }
+    min_support = min(
+        LOW_SUPPORT_CATEGORY_MIN_COUNT,
+        max(2, int(math.ceil(0.05 * observed_train.size))),
+    )
+    supported = counts >= min_support
+    if int(np.sum(supported)) < 2:
+        return np.ones(split_column.shape[0], dtype=np.float64), {
+            "strategy": "mcar_uniform",
+            "fallback_reason": "mcar_low_support_categorical_levels",
+        }
+    rarity = -np.log(counts.astype(np.float64))
+    supported_center = float(np.mean(rarity[supported]))
+    supported_scale = float(np.std(rarity[supported]))
+    if not np.isfinite(supported_scale) or supported_scale == 0.0:
+        supported_scale = 1.0
+    score_map: dict[float, float] = {}
+    pooled_any = False
+    for value, raw_score, is_supported in zip(values, rarity, supported):
+        if bool(is_supported):
+            score_map[float(value)] = float((raw_score - supported_center) / supported_scale)
+        else:
+            score_map[float(value)] = 0.0
+            pooled_any = True
+    train_score = np.array(
+        [score_map.get(float(value), 0.0) if not np.isnan(value) else 0.0 for value in train_column]
+    )
+    split_score = np.array(
+        [score_map.get(float(value), 0.0) if not np.isnan(value) else 0.0 for value in split_column]
+    )
+    intercept = _calibrate_logistic_intercept(train_score[~np.isnan(train_column)], target_rate)
+    metadata: dict[str, Any] = {"strategy": "mnar_categorical_level"}
+    if pooled_any:
+        metadata["rare_level_pooling"] = True
+    return _sigmoid(split_score + intercept), metadata
+
+
 def imputation_metrics(
     X_true: np.ndarray,
     X_imputed: np.ndarray,
@@ -648,11 +1227,13 @@ def imputation_metrics(
         else:
             numeric_scores.extend(np.square(truth - pred).tolist())
 
-    numeric_rmse = float(np.sqrt(np.mean(numeric_scores))) if numeric_scores else float("nan")
+    numeric_mse = float(np.mean(numeric_scores)) if numeric_scores else float("nan")
+    numeric_rmse = float(np.sqrt(numeric_mse)) if numeric_scores else float("nan")
     categorical_accuracy = (
         float(categorical_match / categorical_total) if categorical_total else float("nan")
     )
     return {
+        "numeric_mse": numeric_mse,
         "numeric_rmse": numeric_rmse,
         "categorical_accuracy": categorical_accuracy,
         "n_numeric_masked": int(len(numeric_scores)),
@@ -664,32 +1245,223 @@ def induced_missing_masks(
     X_train: np.ndarray,
     X_test: np.ndarray,
     *,
+    categorical_indices: Sequence[int],
+    missingness_mechanism: str,
     missing_rate: float,
     random_state: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> MissingMaskResult:
+    """Generate deterministic train/test masks for MCAR, MAR, or MNAR.
+
+    The mechanism parameters are fit from the training split only. Each feature is
+    then masked with an exact per-split count of ``floor(rate * n_observed)`` so the
+    realized masking rate is reproducible and shared across all compared methods.
+    """
+    mechanism = str(missingness_mechanism).upper()
+    if mechanism not in DEFAULT_MISSINGNESS_MECHANISMS:
+        raise ValueError(
+            f"Unknown missingness mechanism {missingness_mechanism!r}; "
+            f"expected one of {DEFAULT_MISSINGNESS_MECHANISMS!r}."
+        )
     rng = np.random.RandomState(random_state)
     train_mask = np.zeros_like(X_train, dtype=bool)
     test_mask = np.zeros_like(X_test, dtype=bool)
-
+    cat_set = set(int(idx) for idx in categorical_indices)
+    feature_records: list[dict[str, Any]] = []
     for col_idx in range(X_train.shape[1]):
         train_candidates = np.flatnonzero(~np.isnan(X_train[:, col_idx]))
         test_candidates = np.flatnonzero(~np.isnan(X_test[:, col_idx]))
         n_train_missing = min(train_candidates.size, int(np.floor(missing_rate * train_candidates.size)))
         n_test_missing = min(test_candidates.size, int(np.floor(missing_rate * test_candidates.size)))
-        if n_train_missing > 0:
-            train_selected = rng.choice(train_candidates, size=n_train_missing, replace=False)
-            train_mask[train_selected, col_idx] = True
-        if n_test_missing > 0:
-            test_selected = rng.choice(test_candidates, size=n_test_missing, replace=False)
-            test_mask[test_selected, col_idx] = True
+        record: dict[str, Any] = {
+            "feature_index": int(col_idx),
+            "feature_type": "categorical" if col_idx in cat_set else "numeric",
+        }
+        if train_candidates.size == 0 and test_candidates.size == 0:
+            record["strategy"] = "no_observed_candidates"
+            feature_records.append(record)
+            continue
+        if mechanism == "MCAR":
+            train_weights = np.ones(X_train.shape[0], dtype=np.float64)
+            test_weights = np.ones(X_test.shape[0], dtype=np.float64)
+            record["strategy"] = "mcar_uniform"
+        elif mechanism == "MAR":
+            train_weights, train_metadata = _mar_sampling_weights(
+                X_train,
+                X_train,
+                target_idx=col_idx,
+                target_rate=missing_rate,
+            )
+            test_weights, _ = _mar_sampling_weights(
+                X_train,
+                X_test,
+                target_idx=col_idx,
+                target_rate=missing_rate,
+            )
+            record.update(train_metadata)
+        else:
+            if col_idx in cat_set:
+                train_weights, train_metadata = _mnar_categorical_sampling_weights(
+                    X_train[:, col_idx],
+                    X_train[:, col_idx],
+                    target_rate=missing_rate,
+                )
+                test_weights, _ = _mnar_categorical_sampling_weights(
+                    X_train[:, col_idx],
+                    X_test[:, col_idx],
+                    target_rate=missing_rate,
+                )
+            else:
+                train_weights, train_metadata = _mnar_numeric_sampling_weights(
+                    X_train[:, col_idx],
+                    X_train[:, col_idx],
+                    target_rate=missing_rate,
+                )
+                test_weights, _ = _mnar_numeric_sampling_weights(
+                    X_train[:, col_idx],
+                    X_test[:, col_idx],
+                    target_rate=missing_rate,
+                )
+            record.update(train_metadata)
 
-    return train_mask, test_mask
+        if n_train_missing > 0:
+            selected_local = _weighted_sample_mask(
+                train_candidates,
+                n_train_missing,
+                train_weights[train_candidates],
+                rng,
+            )
+            train_mask[train_candidates[selected_local], col_idx] = True
+        if n_test_missing > 0:
+            selected_local = _weighted_sample_mask(
+                test_candidates,
+                n_test_missing,
+                test_weights[test_candidates],
+                rng,
+            )
+            test_mask[test_candidates[selected_local], col_idx] = True
+        feature_records.append(record)
+
+    strategy_counts: dict[str, int] = {}
+    fallback_counts: dict[str, int] = {}
+    fallback_examples: list[dict[str, Any]] = []
+    for record in feature_records:
+        strategy = str(record.get("strategy", "unknown"))
+        strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+        fallback_reason = record.get("fallback_reason")
+        if fallback_reason:
+            fallback_key = str(fallback_reason)
+            fallback_counts[fallback_key] = fallback_counts.get(fallback_key, 0) + 1
+            if len(fallback_examples) < 5:
+                fallback_examples.append(
+                    {
+                        "feature_index": int(record["feature_index"]),
+                        "feature_type": record.get("feature_type"),
+                        "fallback_reason": fallback_key,
+                    }
+                )
+
+    return MissingMaskResult(
+        mechanism=mechanism,
+        missing_rate=float(missing_rate),
+        train_mask=train_mask,
+        test_mask=test_mask,
+        metadata={
+            "mechanism": mechanism,
+            "missing_rate": float(missing_rate),
+            "strategy_counts": strategy_counts,
+            "fallback_count": int(sum(fallback_counts.values())),
+            "fallback_counts": fallback_counts,
+            "fallback_examples": fallback_examples,
+        },
+    )
 
 
 def apply_missing_mask(X: np.ndarray, mask: np.ndarray) -> np.ndarray:
     out = np.array(X, copy=True)
     out[mask] = np.nan
     return out
+
+
+def build_downstream_pipeline(
+    task_kind: TaskKind,
+    *,
+    downstream_model: str,
+    random_state: int,
+) -> Pipeline:
+    if task_kind == "classification":
+        if downstream_model == "LogisticRegression":
+            estimator: Any = LogisticRegression(
+                max_iter=2000,
+                solver="lbfgs",
+                random_state=random_state,
+            )
+        elif downstream_model == "KNeighborsClassifier":
+            estimator = KNeighborsClassifier(n_neighbors=5)
+        else:
+            raise ValueError(f"Unknown downstream_model={downstream_model!r} for classification.")
+    else:
+        if downstream_model == "Lasso":
+            estimator = Lasso(alpha=0.01, max_iter=5000)
+        elif downstream_model == "KNeighborsRegressor":
+            estimator = KNeighborsRegressor(n_neighbors=5)
+        else:
+            raise ValueError(f"Unknown downstream_model={downstream_model!r} for regression.")
+    return Pipeline(
+        [
+            ("scale", StandardScaler()),
+            ("model", estimator),
+        ]
+    )
+
+
+def _classification_roc_auc(y_true: np.ndarray, probabilities: np.ndarray) -> float:
+    classes = np.unique(y_true)
+    if classes.size < 2:
+        return float("nan")
+    if probabilities.ndim == 1 or probabilities.shape[1] == 1:
+        return float("nan")
+    try:
+        if probabilities.shape[1] == 2:
+            return float(roc_auc_score(y_true, probabilities[:, 1]))
+        return float(roc_auc_score(y_true, probabilities, multi_class="ovr", average="weighted"))
+    except Exception:
+        return float("nan")
+
+
+def evaluate_downstream_model(
+    task_kind: TaskKind,
+    *,
+    downstream_model: str,
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    categorical_indices: Sequence[int],
+    random_state: int,
+) -> dict[str, float]:
+    """Evaluate a simple downstream model on a completed train/test feature pair."""
+    fit_train, fit_test = rough_fill_train_test(X_train, X_test, categorical_indices)
+    pipeline = build_downstream_pipeline(
+        task_kind,
+        downstream_model=downstream_model,
+        random_state=random_state,
+    )
+    pipeline.fit(fit_train, y_train)
+    predictions = pipeline.predict(fit_test)
+    if task_kind == "classification":
+        probabilities = pipeline.predict_proba(fit_test)
+        return {
+            "test_accuracy": float(accuracy_score(y_test, predictions)),
+            "test_roc_auc": _classification_roc_auc(np.asarray(y_test), np.asarray(probabilities)),
+            "test_mse": float("nan"),
+            "test_r2": float("nan"),
+        }
+    return {
+        "test_accuracy": float("nan"),
+        "test_roc_auc": float("nan"),
+        "test_mse": float(mean_squared_error(y_test, predictions)),
+        "test_r2": float(r2_score(y_test, predictions)),
+    }
 
 
 def iterative_imputation(
@@ -777,16 +1549,49 @@ def corrupt_dataset(
     return X_corrupt, labels
 
 
-def outlier_metrics(scores: np.ndarray, labels: np.ndarray, top_fraction: float) -> dict[str, float]:
+def outlier_metrics(scores: np.ndarray, labels: np.ndarray, top_k: int) -> dict[str, float]:
     scores = np.asarray(scores, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.int64)
     metrics: dict[str, float] = {}
     metrics["roc_auc"] = float(roc_auc_score(labels, scores))
     metrics["average_precision"] = float(average_precision_score(labels, scores))
-    n_top = max(1, int(np.ceil(top_fraction * labels.size)))
+    n_top = max(1, min(int(top_k), labels.size))
     ranked = np.argsort(scores)[::-1][:n_top]
-    metrics["topk_precision"] = float(labels[ranked].mean())
+    y_pred = np.zeros_like(labels)
+    y_pred[ranked] = 1
+    true_positives = int(labels[ranked].sum())
+    positives = int(labels.sum())
+    precision = float(true_positives / n_top)
+    recall = float(true_positives / positives) if positives > 0 else float("nan")
+    if precision + recall > 0:
+        f1 = float(2.0 * precision * recall / (precision + recall))
+    else:
+        f1 = 0.0
+    metrics["precision_at_k"] = precision
+    metrics["recall_at_k"] = recall
+    metrics["f1_at_k"] = f1
     return metrics
+
+
+def topk_overlap_at_k(reference_scores: np.ndarray, candidate_scores: np.ndarray, top_k: int) -> float:
+    n_top = max(1, min(int(top_k), len(reference_scores)))
+    ref_top = set(np.argsort(np.asarray(reference_scores, dtype=np.float64))[::-1][:n_top].tolist())
+    cand_top = set(np.argsort(np.asarray(candidate_scores, dtype=np.float64))[::-1][:n_top].tolist())
+    return float(len(ref_top & cand_top) / n_top)
+
+
+def native_proximity_agreement_metrics(
+    native_scores: np.ndarray,
+    proximity_scores: np.ndarray,
+    top_k: int,
+) -> dict[str, float]:
+    native = np.asarray(native_scores, dtype=np.float64)
+    prox = np.asarray(proximity_scores, dtype=np.float64)
+    spearman = spearmanr(native, prox).statistic
+    return {
+        "spearman_rank_corr": float(spearman) if spearman is not None else float("nan"),
+        "topk_overlap_at_k": topk_overlap_at_k(native, prox, top_k),
+    }
 
 
 def record_exception(
@@ -798,8 +1603,9 @@ def record_exception(
     dataset_id: int,
     task_id: int,
     error: Exception,
+    extra_fields: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    return {
+    row = {
         "experiment": experiment_name,
         "task_kind": task_kind,
         "random_state": random_state,
@@ -811,6 +1617,9 @@ def record_exception(
         "error_message": str(error),
         "traceback": traceback.format_exc(limit=8),
     }
+    if extra_fields:
+        row.update(extra_fields)
+    return row
 
 
 def aggregate_success_rows(df: pd.DataFrame, group_cols: Sequence[str], metric_cols: Sequence[str]) -> pd.DataFrame:

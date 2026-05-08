@@ -1,0 +1,1 @@
+suite_name,prototype_source,model_name,prox_method,k,n_prototypes,mean_within_class_neighbor_overlap_jaccard,mean_within_class_center_proximity,unique_covered_neighbor_fraction,stability_center_proximity_std

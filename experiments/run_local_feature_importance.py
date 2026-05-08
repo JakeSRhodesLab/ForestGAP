@@ -1,10 +1,37 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import site
 import sys
 import time
 from typing import Any
+
+
+def _remove_user_site_from_sys_path() -> None:
+    # Prevent ABI-incompatible user-site wheels from shadowing the conda env.
+    candidate_paths: set[str] = set()
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str):
+            candidate_paths.add(user_site)
+        else:
+            candidate_paths.update(str(path) for path in user_site)
+    except Exception:
+        pass
+    candidate_paths.add(str(Path.home() / ".local" / "lib"))
+
+    normalized_candidates = tuple(os.path.normpath(path) for path in candidate_paths)
+    sys.path = [
+        path
+        for path in sys.path
+        if path
+        and not any(os.path.normpath(path).startswith(candidate) for candidate in normalized_candidates)
+    ]
+
+
+_remove_user_site_from_sys_path()
 
 import numpy as np
 import pandas as pd
@@ -24,6 +51,7 @@ from experiments.common import (
     prepare_dataset,
     raw_output_path,
     record_exception,
+    requested_tasks,
     requested_model_names,
     rough_fill_train_test,
     save_dataframe,
@@ -53,7 +81,7 @@ def _probability_drop(
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
-    for task_kind in ("classification", "regression"):
+    for task_kind in requested_tasks(args.task):
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
@@ -218,6 +246,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def compile_outputs(df: pd.DataFrame) -> None:
+    if df.empty or "task_kind" not in df.columns:
+        return
+
     for task_kind in sorted(df["task_kind"].dropna().unique()):
         task_df = df[df["task_kind"] == task_kind].copy()
         save_dataframe(task_df, raw_output_path(EXPERIMENT_NAME, task_kind))

@@ -671,3 +671,242 @@ Deliverables:
 - updated raw/compiled result schema
 - smoke-test evidence
 - concise documentation of the OOB vs proximity-weighted prediction identity benchmark
+
+
+## Prototypes
+
+codex --model gpt-5.4 --config model_reasoning_effort='"high"' --yolo
+
+Please update the prototype benchmark in ObliqueProximitiesCode/experiments/run_prototypes.py and any shared helpers in ObliqueProximitiesCode/experiments/common.py as needed. For any code runs, use the conda environment generalforest. Only work on the current branch.
+
+First review:
+- ObliqueProximitiesCode/experiments/run_prototypes.py
+- ObliqueProximitiesCode/experiments/common.py
+- ObliqueProximitiesCode/forestgap/core.py, especially `get_prototypes`
+- ObliqueProximitiesCode/notebooks/prototypes_demo.ipynb
+- ObliqueProximitiesCode/tests/test_prox.py, especially the prototype tests
+- ObliqueProximitiesCode/notes/proximity_applications_summary.md
+
+Current limitations to address:
+- the benchmark is currently classification-only because `get_prototypes()` is classifier-only in `forestgap.core`
+- it only uses `prox_method="original"`
+- it evaluates prototypes mostly with:
+  - `same_class_neighbor_fraction`
+  - `coverage_fraction`
+  - a prototype-induced classifier accuracy
+- it does not yet establish what makes a prototype genuinely “good” beyond those lightweight summaries
+- it does not compare against simple prototype baselines such as random same-class centers
+
+Goal:
+Strengthen the proximity-based prototype benchmark so it evaluates whether selected prototypes are actually representative, pure, non-redundant, stable, and useful. If the current `forestgap.core` prototype API remains classification-only, keep regression as explicit unsupported rows unless you intentionally and safely extend the core implementation.
+
+Methodology requirements:
+1. Preserve the current prototype extraction path through `model.get_prototypes(...)`.
+2. Expand comparisons across proximity constructions where supported:
+   - `original`
+   - `oob`
+   - `rfgap`
+3. Compare all supported supervised classifier forest families already available in the experiments framework.
+4. Keep results reproducible across random states.
+5. Reuse the same train/test split and preprocessing across compared models and proximity modes.
+
+Define a stronger notion of “good prototype”
+A good prototype should ideally satisfy several properties:
+- purity:
+  its selected neighbourhood is mostly same-class
+- representativeness:
+  the prototype center is a strong or typical representative of its class, not just an arbitrary point
+- coverage:
+  the prototype set covers a substantial fraction of the class manifold / training population
+- non-redundancy:
+  multiple prototypes for the same class should not collapse onto the same local neighbourhood
+- predictive utility:
+  the prototype set should retain useful classification signal on held-out data
+- stability:
+  the selected prototype centres or neighbourhoods should not vary wildly across random seeds
+
+Use a two-track evaluation design.
+
+Track A: synthetic validation
+Create at least one or two controlled synthetic classification scenarios where the desired prototype behavior is known:
+- a class with multiple clearly separated subclusters, so multiple prototypes should recover different submodes of the same class
+- optionally a setting with class imbalance or overlapping regions to test whether prototypes still prefer representative same-class regions
+
+For synthetic validation, evaluate at least:
+- mode coverage:
+  whether the selected prototypes recover distinct known subclusters within each class
+- center-to-true-mode matching:
+  whether prototype centers lie near true subcluster centers or are assigned correctly to distinct modes
+- neighbourhood purity
+- redundancy / overlap of prototype neighbourhoods within class
+- held-out prototype classifier performance
+- comparison against random same-class center baselines
+
+Track B: OpenML benchmark validation
+Keep the OpenML-CC18 classification benchmark as the main real-data evaluation track.
+
+For OpenML, evaluate at least the following prototype-quality criteria.
+
+1. Purity
+Keep and expand:
+- `same_class_neighbor_fraction`
+- `same_class_neighbor_count`
+Report these per prototype and aggregated per model / proximity mode.
+
+2. Coverage
+Keep and expand:
+- training coverage fraction overall
+- class-balanced coverage fraction:
+  fraction of each class covered by at least one prototype neighbourhood
+- optionally test-set coverage:
+  fraction of test points whose nearest prototype centre belongs to the correct class
+
+3. Non-redundancy
+Add metrics such as:
+- mean overlap between prototype neighbourhoods within the same class
+- pairwise proximity between selected prototype centers within the same class
+- unique-covered-neighbour fraction after all prototypes are selected
+Lower overlap / redundancy is better, up to the point where purity and coverage remain good.
+
+4. Predictive utility
+Retain and strengthen the prototype-induced classifier idea.
+Evaluate at least:
+- held-out classification accuracy using prototypes only
+- optionally compare multiple aggregation rules:
+  - sum of proximities to class prototype centers
+  - max proximity to a class prototype center
+  - sum or max over prototype neighbourhood members if useful
+- compare prototype-only accuracy to the full forest accuracy and report the accuracy gap
+This makes the prototype set a compressed summary; a good prototype set should lose relatively little signal.
+
+5. Representativeness / confidence
+Use the ideas already explored in `prototypes_demo.ipynb`.
+
+Because prototype centers are training observations, raw in-sample `predict_proba` can be overly optimistic. Add prototype-center confidence diagnostics using OOB probabilities when available.
+
+For each prototype center, compute at least:
+- focal-class in-sample `predict_proba`
+- focal-class OOB probability where available
+- percentile of the prototype center within its same-class peer distribution
+- percentile of the prototype center versus non-prototype same-class OOB probabilities
+
+Metrics inspired by the notebook are welcome, e.g.:
+- `predict_percentile_within_class`
+- `predict_percentile_vs_nonprototype_oob`
+- `oob_percentile_vs_nonprototype_oob`
+
+If a model family does not provide clean OOB probabilities for this application, document the fallback explicitly.
+
+6. Stability
+Add prototype stability across seeds, for example:
+- overlap of selected prototype neighbourhoods across random states
+- matching rate of prototype centers across seeds
+- stability of aggregated prototype summaries
+Do not require exact index equality if multiple equally good centers exist; neighbourhood overlap or class-submode consistency is acceptable.
+
+Baselines
+A stronger benchmark should compare the learned prototypes against at least one simple baseline.
+
+Required baseline:
+- random same-class centers:
+  for each class, sample the same number of centers from that class and build the same downstream prototype summaries repeatedly
+  compare learned prototypes against this baseline on purity, coverage, redundancy, and prototype-only accuracy
+
+Optional baseline if easy:
+- high-confidence centers:
+  choose classwise centers by top OOB or predicted class probability
+- class medoid or central point baseline in proximity space
+
+The learned prototype method should beat random same-class centers on at least several core metrics if it is doing meaningful work.
+
+Result schema
+Update raw results so they include both summary rows and detailed per-prototype rows.
+
+Summary rows should include at least:
+- experiment
+- status
+- task_kind
+- suite_name
+- dataset_id
+- dataset_name
+- task_id
+- random_state
+- model_name
+- prox_method
+- k
+- n_prototypes
+- n_centers
+- mean_same_class_neighbor_fraction
+- class_balanced_same_class_neighbor_fraction if added
+- coverage_fraction
+- class_balanced_coverage_fraction if added
+- redundancy metrics
+- prototype_accuracy
+- prototype_accuracy_gap_vs_forest if added
+- representativeness metrics
+- stability metrics
+- fit_runtime_seconds
+- prototype_runtime_seconds
+- projection_runtime_seconds
+- evaluation_runtime_seconds if added
+- total_runtime_seconds
+
+Detail rows should include at least:
+- task_kind
+- model_name
+- prox_method
+- dataset_name
+- dataset_id
+- random_state
+- class_label
+- prototype_number
+- center_position / center_index
+- neighbor_count
+- same_class_neighbor_count
+- same_class_neighbor_fraction
+- neighbourhood overlap or redundancy fields if added
+- prototype center confidence / OOB percentile fields if added
+
+Compiled outputs
+Create separate compiled summaries and plots for:
+- purity
+- coverage
+- redundancy
+- prototype-only predictive utility
+- representativeness / OOB confidence
+- baseline comparison against random same-class centers
+
+At minimum create:
+- summary.csv
+- model_comparison.csv
+- at least one plot each for:
+  - prototype accuracy
+  - coverage
+  - mean same-class neighbour fraction
+  - baseline improvement over random centers
+
+Implementation guidance
+- Keep helper logic in `experiments/common.py` where appropriate instead of putting everything into `run_prototypes.py`.
+- Preserve current unsupported/error row behavior.
+- If regression remains unsupported, continue logging explicit unsupported rows rather than skipping it.
+- Preserve the current raw / compiled results directory conventions.
+- Reuse existing notebook ideas where useful instead of inventing a disconnected evaluation.
+
+Validation
+- Smoke-test the updated prototype benchmark on at least:
+  - one synthetic scenario
+  - one small OpenML classification slice
+- Confirm that the new detail and summary outputs are generated correctly.
+- Confirm that random-center baseline comparisons run successfully.
+
+Documentation
+- Record the final prototype evaluation design in ObliqueProximitiesCode/results/results_summary.md
+- Explicitly explain what criteria were used to define a “good prototype”
+- Record unresolved issues or blockers in ObliqueProximitiesCode/results/questions.md
+
+Deliverables:
+- updated run_prototypes.py
+- any new or updated helpers in common.py
+- updated raw/compiled result schema
+- smoke-test evidence
+- concise documentation of the revised prototype validation methodology
