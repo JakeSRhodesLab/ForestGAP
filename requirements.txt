@@ -1,11 +1,11 @@
 numpy
-scipy>=1.14.0
-scikit-learn==1.5.2
+scipy>=1.5.0,<1.14
+scikit-learn==1.7.2
 pandas
 matplotlib
 phate
 aeon
-treeple==0.9.1
+treeple==0.10.3
 ipykernel
 nbconvert
 notebook
