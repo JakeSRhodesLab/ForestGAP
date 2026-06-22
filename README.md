@@ -18,3 +18,25 @@ GENERALFOREST_ENV=myenv bash scripts/run_outlier_detection.sh --task classificat
 ```
 
 If you previously saw errors like `ImportError: numpy.core.multiarray failed to import` or matplotlib imports from `~/.local/lib/python3.11/site-packages`, use this wrapper instead of calling `python experiments/run_outlier_detection.py` directly.
+Sparse proximity computations for random forest-like ensembles.
+
+## Installation
+
+### Install from local clone
+
+```bash
+pip install .
+```
+
+### Install directly from GitHub
+
+```bash
+pip install "git+https://github.com/JakeSRhodesLab/GeneralForestProximities.git"
+```
+
+### Install optional extras
+
+```bash
+pip install .[openml]
+pip install .[treeple]
+```
