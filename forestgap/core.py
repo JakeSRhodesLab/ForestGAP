@@ -58,7 +58,49 @@ def patch_treeple_regressor_tags() -> bool:
     return True
 
 
+def patch_treeple_sample_weight_signature() -> bool:
+    """Patch treeple helper imports for sklearn's keyword-only dtype arg.
+
+    treeple 0.10.3 calls ``_check_sample_weight(sample_weight, X, DOUBLE)``
+    positionally from its vendored tree classes, but newer scikit-learn
+    exposes ``dtype`` as a keyword-only argument. Rebind the copied helper
+    references inside treeple modules to a small compatibility wrapper.
+    """
+
+    try:
+        from treeple._lib.sklearn.tree import _classes as tree_classes
+        from treeple._lib.sklearn.ensemble import _forest as tree_forest
+        from sklearn.utils.validation import _check_sample_weight as sklearn_check_sample_weight
+    except Exception:
+        return False
+
+    if getattr(tree_classes, "_forestgap_sample_weight_patch", False):
+        return True
+
+    def _compat_check_sample_weight(
+        sample_weight: Any,
+        X: Any,
+        dtype: Any = None,
+        ensure_non_negative: bool = False,
+        copy: bool = False,
+    ) -> Any:
+        return sklearn_check_sample_weight(
+            sample_weight,
+            X,
+            dtype=dtype,
+            ensure_non_negative=ensure_non_negative,
+            copy=copy,
+        )
+
+    tree_classes._check_sample_weight = _compat_check_sample_weight
+    tree_forest._check_sample_weight = _compat_check_sample_weight
+    tree_classes._forestgap_sample_weight_patch = True
+    tree_forest._forestgap_sample_weight_patch = True
+    return True
+
+
 patch_treeple_regressor_tags()
+patch_treeple_sample_weight_signature()
 
 
 try:
@@ -420,6 +462,53 @@ class SparseProximityMixin:
             P_new.data = np.minimum(P_new.data, 1.0)
 
         return P_new.toarray() if self.matrix_type == "dense" else P_new
+
+    def embed(self, method: str = "phate", **kwargs: Any) -> np.ndarray:
+        """
+        Create a manifold embedding from this fitted forest's proximities.
+
+        Parameters
+        ----------
+        method : {'phate', 'tsne', 'isomap', 'umap'}
+            Manifold method to fit from the training proximity matrix.
+        **kwargs : dict
+            Method-specific options forwarded to ``forestgap.manifold``.
+
+        Returns
+        -------
+        embedding : ndarray of shape (n_train_samples, n_components)
+            Low-dimensional coordinates for the training samples.
+        """
+        self._check_proximity_ready()
+        from forestgap.manifold import embed_from_forest
+
+        return embed_from_forest(self, method=method, **kwargs)
+
+    def proximity_embedding(self, method: str = "phate", **kwargs: Any) -> np.ndarray:
+        """Alias for :meth:`embed`."""
+        return self.embed(method=method, **kwargs)
+
+    def phate(self, **kwargs: Any) -> np.ndarray:
+        """Fit a PHATE embedding from this fitted forest's proximities."""
+        return self.embed(method="phate", **kwargs)
+
+    def embed_transform(self, X_new: Any, method: str = "phate", **kwargs: Any) -> np.ndarray:
+        """
+        Project new observations through a stored manifold model when supported.
+
+        ``method='phate'`` is supported after calling ``embed(method='phate')``.
+        ``method='isomap'`` is supported when sklearn accepts precomputed
+        new-to-training distances for the fitted Isomap model. t-SNE does not
+        provide an out-of-sample transform.
+        """
+        self._check_proximity_ready()
+        from forestgap.manifold import transform_from_forest
+
+        return transform_from_forest(self, X_new, method=method, **kwargs)
+
+    def phate_transform(self, X_new: Any, **kwargs: Any) -> np.ndarray:
+        """Project new observations through a stored PHATE proximity embedding."""
+        return self.embed_transform(X_new, method="phate", **kwargs)
 
     def prox_predict(self, X: Any = None) -> np.ndarray:
         """

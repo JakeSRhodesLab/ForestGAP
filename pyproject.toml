@@ -19,6 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 openml = ["openml"]
 treeple = ["treeple==0.10.3"]
+phate = ["phate", "graphtools"]
+umap = ["umap-learn"]
+manifold = ["phate", "graphtools", "umap-learn"]
 dev = [
     "pytest",
 ]

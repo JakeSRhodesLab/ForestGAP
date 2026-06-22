@@ -8,6 +8,9 @@ Main exports:
     - SparseProximityMixin: Mixin class for sparse proximity computation
     - with_sparse_proximity: Decorator/factory for creating proximity-enabled estimators
     - _RotationForestApplyAdapter: Adapter for aeon's RotationForest models
+
+Manifold applications are available from fitted proximity-enabled forests via
+``forest.embed(...)`` and from the ``forestgap.manifold`` namespace.
 """
 
 from forestgap.core import (
