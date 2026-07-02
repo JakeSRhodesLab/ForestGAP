@@ -139,7 +139,7 @@ _generate_unsampled_indices = getattr(_sk_forest, "_generate_unsampled_indices",
 
 ArrayLike = Union[np.ndarray, Sequence[float]]
 MatrixLike = Union[np.ndarray, sparse.csr_matrix]
-ProxMethod = Literal["original", "oob", "rfgap"]
+ProxMethod = Literal["original", "oob", "rfgap", "honest_gap"]
 MatrixType = Literal["sparse", "dense"]
 SymmMode = Literal["arithmetic", "geometric", "none", None]
 
@@ -168,6 +168,18 @@ def _is_isolation_forest_instance(obj: Any) -> bool:
     return hasattr(obj, "estimators_features_") and hasattr(obj, "score_samples")
 
 
+def _is_honest_forest_instance(obj: Any) -> bool:
+    if any("HonestForest" in cls.__name__ for cls in type(obj).mro()):
+        return True
+    return (
+        all(
+            hasattr(obj, attr)
+            for attr in ("honest_indices_", "structure_indices_", "estimators_", "classes_")
+        )
+        and callable(getattr(obj, "predict_proba", None))
+    )
+
+
 def _is_rotation_forest_class(base_cls: Type[Any]) -> bool:
     if any("RotationForest" in cls.__name__ for cls in base_cls.mro()):
         return True
@@ -178,6 +190,10 @@ def _is_isolation_forest_class(base_cls: Type[Any]) -> bool:
     if any("IsolationForest" in cls.__name__ for cls in base_cls.mro()):
         return True
     return hasattr(base_cls, "score_samples") and hasattr(base_cls, "decision_function")
+
+
+def _is_honest_forest_class(base_cls: Type[Any]) -> bool:
+    return any("HonestForest" in cls.__name__ for cls in base_cls.mro())
 
 
 @runtime_checkable
@@ -214,6 +230,7 @@ class SparseProximityMixin:
     - `"original"`: classical RF proximity
     - `"oob"`: OOB-only approximation in separable sparse form
     - `"rfgap"`: RF-GAP asymmetric proximity
+    - `"honest_gap"`: prediction-preserving HonestForest classifier proximity
 
     Notes
     -----
@@ -239,8 +256,10 @@ class SparseProximityMixin:
         symm_mode: SymmMode = None,
         max_normalize: bool = False,
     ) -> None:
-        if prox_method not in ("original", "oob", "rfgap"):
-            raise ValueError("prox_method must be one of {'original', 'oob', 'rfgap'}")
+        if prox_method not in ("original", "oob", "rfgap", "honest_gap"):
+            raise ValueError(
+                "prox_method must be one of {'original', 'oob', 'rfgap', 'honest_gap'}"
+            )
         if matrix_type not in ("sparse", "dense"):
             raise ValueError("matrix_type must be 'sparse' or 'dense'")
         if symm_mode == "none":
@@ -339,16 +358,34 @@ class SparseProximityMixin:
         if apply_fn is None:
             raise RuntimeError("Estimator must implement apply(X) to use proximity methods.")
 
+        if self.prox_method == "honest_gap":
+            self._validate_honest_gap_inputs()
+
         leaves: Optional[np.ndarray] = None
 
-        if self.prox_method in ("oob", "rfgap"):
+        if self.prox_method in ("oob", "rfgap", "honest_gap"):
             n_samples = int(len(X))
-            oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples, X=X, y=y)
+            try:
+                oob_mask, in_bag_counts = self._compute_bootstrap_stats(n_samples, X=X, y=y)
+            except RuntimeError:
+                if self.prox_method != "honest_gap":
+                    raise
+                estimators = getattr(self, "estimators_", None)
+                if estimators is None:
+                    raise
+                oob_mask, in_bag_counts = self._honest_gap_oob_stats_from_indices(
+                    n_samples,
+                    len(estimators),
+                )
             self.oob_mask_ = oob_mask.astype(np.int8)
             self.in_bag_counts_ = in_bag_counts.astype(np.float32)
 
             surrogate_leaves = getattr(self, "_oob_surrogate_leaf_matrix_", None)
-            if surrogate_leaves is not None and surrogate_leaves.shape[0] == n_samples:
+            if (
+                self.prox_method in ("oob", "rfgap")
+                and surrogate_leaves is not None
+                and surrogate_leaves.shape[0] == n_samples
+            ):
                 # RotationForest: cache original-tree proximity structures for
                 # prox_extend so that P_ext @ y reproduces predict(X_test).
                 if _is_rotation_forest_instance(self) and self.prox_method == "rfgap":
@@ -470,6 +507,8 @@ class SparseProximityMixin:
 
         if self.prox_method == "oob":
             P_new.data = np.minimum(P_new.data, 1.0)
+        elif self.prox_method == "honest_gap":
+            self._csr_row_normalize_inplace(P_new)
 
         return P_new.toarray() if self.matrix_type == "dense" else P_new
 
@@ -522,14 +561,16 @@ class SparseProximityMixin:
 
     def prox_predict(self, X: Any = None) -> np.ndarray:
         """
-        Predict using rfgap proximity-weighted training labels.
+        Predict using prediction-preserving proximity-weighted training labels.
 
-        For classifiers, returns class probability estimates (matching
-        ``predict_proba`` for test data or ``oob_decision_function_`` for
-        training data).  For regressors, returns predicted values (matching
-        ``predict`` for test data or ``oob_prediction_`` for training data).
-        When ``X`` is ``None``, out-of-bag predictions for the training
-        data are returned.
+        For classifiers, returns class estimates (matching ``predict_proba``
+        for test data, and ``oob_decision_function_`` for OOB training data).
+        Honest-GAP preserves HonestForest's native OOB scale; with
+        ``kernel_method=True`` this can be raw/count-like rather than
+        probability-normalized. For regressors, returns predicted values
+        (matching ``predict`` for test data or ``oob_prediction_`` for
+        training data). When ``X`` is ``None``, out-of-bag predictions for the
+        training data are returned.
 
         Parameters
         ----------
@@ -544,8 +585,8 @@ class SparseProximityMixin:
             classifiers, or predicted values of shape (n_samples,) for
             regressors.
         """
-        if self.prox_method != "rfgap":
-            raise ValueError("prox_predict requires prox_method='rfgap'")
+        if self.prox_method not in ("rfgap", "honest_gap"):
+            raise ValueError("prox_predict requires prox_method='rfgap' or 'honest_gap'")
         if self._y_train is None:
             raise RuntimeError(
                 "No training labels available. Refit with labels to use prox_predict."
@@ -556,13 +597,16 @@ class SparseProximityMixin:
         classes = getattr(self, "classes_", None)
         if classes is not None:
             classes = np.asarray(classes)
-            y_idx = np.searchsorted(classes, self._y_train)
+            y_idx = self._class_indices_for_values(np.asarray(self._y_train), classes)
             y_hot = sparse.csc_matrix(
                 (np.ones(len(y_idx), dtype=np.float64), (np.arange(len(y_idx)), y_idx)),
                 shape=(len(y_idx), classes.shape[0]),
             )
-            prox_prob = np.asarray((P @ y_hot).todense() if sparse.issparse(P) else P @ y_hot)
-            if X is None:
+            if sparse.issparse(P):
+                prox_prob = np.asarray((P @ y_hot).todense())
+            else:
+                prox_prob = np.asarray(P @ y_hot.toarray())
+            if X is None and self.prox_method == "rfgap":
                 rs = prox_prob.sum(axis=1, keepdims=True)
                 rs[rs == 0] = 1.0
                 prox_prob /= rs
@@ -2091,11 +2135,232 @@ class SparseProximityMixin:
             np.concatenate(all_trees),
         )
 
+    def _validate_honest_gap_inputs(self) -> None:
+        if not _is_honest_forest_instance(self):
+            raise ValueError(
+                "prox_method='honest_gap' requires a fitted HonestForestClassifier-like "
+                "estimator exposing honest_indices_, structure_indices_, estimators_, "
+                "classes_, and predict_proba."
+            )
+        if self._y_train is None:
+            raise ValueError("prox_method='honest_gap' requires training labels.")
+        if np.asarray(self._y_train).ndim != 1:
+            raise ValueError("prox_method='honest_gap' currently supports single-output classification only.")
+        classes = getattr(self, "classes_", None)
+        if classes is None or isinstance(classes, list) or np.asarray(classes).ndim != 1:
+            raise ValueError("prox_method='honest_gap' currently supports single-output classification only.")
+        if not callable(getattr(self, "predict_proba", None)):
+            raise ValueError("prox_method='honest_gap' requires a classifier with predict_proba.")
+
+        estimators = getattr(self, "estimators_", None)
+        honest_indices = getattr(self, "honest_indices_", None)
+        structure_indices = getattr(self, "structure_indices_", None)
+        if estimators is None or honest_indices is None or structure_indices is None:
+            raise ValueError(
+                "prox_method='honest_gap' requires fitted honest_indices_, "
+                "structure_indices_, and estimators_."
+            )
+        if len(honest_indices) != len(estimators) or len(structure_indices) != len(estimators):
+            raise ValueError(
+                "prox_method='honest_gap' requires one honest_indices_ and "
+                "structure_indices_ entry per fitted estimator."
+            )
+
+    @staticmethod
+    def _valid_index_array(indices: Any, n_samples: int) -> np.ndarray:
+        if indices is None:
+            return np.zeros(0, dtype=np.int64)
+        arr = np.asarray(indices, dtype=np.int64).ravel()
+        if arr.size == 0:
+            return arr
+        return arr[(arr >= 0) & (arr < n_samples)]
+
+    @staticmethod
+    def _class_indices_for_values(values: np.ndarray, classes: np.ndarray) -> np.ndarray:
+        mapping = {cls: i for i, cls in enumerate(classes.tolist())}
+        indices = np.empty(values.shape[0], dtype=np.int64)
+        for i, value in enumerate(values):
+            try:
+                indices[i] = mapping[value]
+            except KeyError:
+                matches = np.flatnonzero(classes == value)
+                if matches.size == 0:
+                    raise ValueError("Training labels contain values not present in classes_.")
+                indices[i] = int(matches[0])
+        return indices
+
+    def _honest_gap_oob_stats_from_indices(
+        self,
+        n_samples: int,
+        n_trees: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        honest_indices = getattr(self, "honest_indices_", None)
+        structure_indices = getattr(self, "structure_indices_", None)
+        if honest_indices is None or structure_indices is None:
+            raise ValueError("prox_method='honest_gap' requires honest_indices_ and structure_indices_.")
+
+        oob_mask = np.ones((n_samples, n_trees), dtype=np.int8)
+        in_bag_counts = np.zeros((n_samples, n_trees), dtype=np.float32)
+
+        for t in range(n_trees):
+            honest_idx = self._valid_index_array(honest_indices[t], n_samples)
+            structure_idx = self._valid_index_array(structure_indices[t], n_samples)
+            if honest_idx.size == 0 and structure_idx.size == 0:
+                continue
+
+            sampled_idx = np.concatenate([honest_idx, structure_idx])
+            oob_mask[np.unique(sampled_idx), t] = 0
+            idx, cnt = np.unique(sampled_idx, return_counts=True)
+            in_bag_counts[idx, t] = cnt.astype(np.float32)
+
+        return oob_mask, in_bag_counts
+
+    def _tree_leaf_class_value_matrix(self, estimator: Any, forest_classes: np.ndarray) -> np.ndarray:
+        tree = getattr(estimator, "tree_", None)
+        values = getattr(tree, "value", None)
+        if values is None:
+            raise ValueError("prox_method='honest_gap' requires each estimator to expose tree_.value.")
+
+        value_arr = np.asarray(values, dtype=np.float64)
+        if value_arr.ndim == 3:
+            if value_arr.shape[1] != 1:
+                raise ValueError("prox_method='honest_gap' currently supports single-output classification only.")
+            value_arr = value_arr[:, 0, :]
+        elif value_arr.ndim != 2:
+            raise ValueError("Unexpected tree_.value shape for prox_method='honest_gap'.")
+
+        tree_classes_raw = getattr(estimator, "classes_", forest_classes)
+        if isinstance(tree_classes_raw, list):
+            if len(tree_classes_raw) != 1:
+                raise ValueError("prox_method='honest_gap' currently supports single-output classification only.")
+            tree_classes_raw = tree_classes_raw[0]
+        tree_classes = np.asarray(tree_classes_raw).ravel()
+
+        if (
+            value_arr.shape[1] == forest_classes.shape[0]
+            and tree_classes.shape[0] == forest_classes.shape[0]
+            and np.array_equal(tree_classes, forest_classes)
+        ):
+            return value_arr
+
+        aligned = np.zeros((value_arr.shape[0], forest_classes.shape[0]), dtype=np.float64)
+        n_cols = min(value_arr.shape[1], tree_classes.shape[0])
+        for src_col, cls_value in enumerate(tree_classes[:n_cols]):
+            matches = np.flatnonzero(forest_classes == cls_value)
+            if matches.size > 0:
+                aligned[:, int(matches[0])] = value_arr[:, src_col]
+        return aligned
+
+    def _build_honest_gap_W_matrix(self) -> sparse.csr_matrix:
+        if self.leaf_matrix_ is None or self._leaf_encoding is None:
+            raise RuntimeError("Cannot build honest_gap W before leaf structures are initialized.")
+        if self._y_train is None:
+            raise ValueError("prox_method='honest_gap' requires training labels.")
+
+        classes = np.asarray(getattr(self, "classes_", None))
+        y_train = np.asarray(self._y_train)
+        y_idx = self._class_indices_for_values(y_train, classes)
+
+        estimators = getattr(self, "estimators_", None)
+        honest_indices = getattr(self, "honest_indices_", None)
+        structure_indices = getattr(self, "structure_indices_", None)
+        if estimators is None or honest_indices is None or structure_indices is None:
+            raise ValueError("prox_method='honest_gap' requires fitted honest forest indices.")
+
+        n_samples, n_trees = self.leaf_matrix_.shape
+        total_cols = int(self._leaf_encoding.total_features)
+        kernel_method = bool(getattr(self, "kernel_method", True))
+
+        all_rows: List[np.ndarray] = []
+        all_cols: List[np.ndarray] = []
+        all_weights: List[np.ndarray] = []
+
+        for t in range(n_trees):
+            honest_idx = self._valid_index_array(honest_indices[t], n_samples)
+            structure_idx = self._valid_index_array(structure_indices[t], n_samples)
+            if structure_idx.size > 0 and honest_idx.size > 0:
+                honest_idx = np.setdiff1d(honest_idx, structure_idx, assume_unique=False)
+            if honest_idx.size == 0:
+                continue
+
+            leaf_ids = self.leaf_matrix_[honest_idx, t].astype(np.int64, copy=False)
+            known = self._leaf_encoding.values_per_tree[t]
+            pos = np.searchsorted(known, leaf_ids)
+            in_range = pos < known.shape[0]
+            eq = np.zeros_like(in_range, dtype=bool)
+            idx_in = np.nonzero(in_range)[0]
+            if idx_in.size > 0:
+                eq[idx_in] = known[pos[idx_in]] == leaf_ids[idx_in]
+            valid = in_range & eq
+            if not np.any(valid):
+                continue
+
+            honest_idx = honest_idx[valid]
+            leaf_ids = leaf_ids[valid]
+            cols = self._leaf_encoding.offsets[t] + pos[valid]
+            leaf_values = self._tree_leaf_class_value_matrix(estimators[t], classes)
+            node_valid = (leaf_ids >= 0) & (leaf_ids < leaf_values.shape[0])
+            if not np.any(node_valid):
+                continue
+
+            honest_idx = honest_idx[node_valid]
+            leaf_ids = leaf_ids[node_valid]
+            cols = cols[node_valid].astype(np.int64, copy=False)
+            y_idx_t = y_idx[honest_idx]
+
+            if not kernel_method:
+                leaf_totals = leaf_values.sum(axis=1, keepdims=True)
+                leaf_values = np.divide(
+                    leaf_values,
+                    leaf_totals,
+                    out=np.zeros_like(leaf_values),
+                    where=leaf_totals != 0,
+                )
+
+            for col in np.unique(cols):
+                in_leaf = cols == col
+                if not np.any(in_leaf):
+                    continue
+                node_id = int(leaf_ids[np.nonzero(in_leaf)[0][0]])
+                class_ids = np.unique(y_idx_t[in_leaf])
+                for class_id in class_ids:
+                    class_mask = in_leaf & (y_idx_t == class_id)
+                    sample_rows = honest_idx[class_mask]
+                    if sample_rows.size == 0:
+                        continue
+                    mass = float(leaf_values[node_id, class_id])
+                    if not np.isfinite(mass) or mass <= 0.0:
+                        continue
+                    all_rows.append(sample_rows.astype(np.int64, copy=False))
+                    all_cols.append(np.full(sample_rows.shape[0], int(col), dtype=np.int64))
+                    all_weights.append(
+                        np.full(sample_rows.shape[0], mass / sample_rows.shape[0], dtype=np.float64)
+                    )
+
+        if not all_rows:
+            return sparse.csr_matrix((n_samples, total_cols), dtype=np.float64)
+
+        rows = np.concatenate(all_rows)
+        cols = np.concatenate(all_cols)
+        weights = np.concatenate(all_weights)
+        keep_nonzero = weights > 0
+        return sparse.csr_matrix(
+            (weights[keep_nonzero], (rows[keep_nonzero], cols[keep_nonzero])),
+            shape=(n_samples, total_cols),
+            dtype=np.float64,
+        )
+
     def _build_W_matrix(self) -> None:
         if self.leaf_matrix_ is None or self._leaf_encoding is None:
             raise RuntimeError("Cannot build W before leaf structures are initialized.")
 
         n_samples, n_trees = self.leaf_matrix_.shape
+        if self.prox_method == "honest_gap":
+            self.W_mat = self._build_honest_gap_W_matrix()
+            self._n_total_features = int(self._leaf_encoding.total_features)
+            self._diag_offset = None
+            return
+
         rows, cols, tree_ids = self._map_leaves_to_global(self.leaf_matrix_)
         if rows.size == 0:
             raise RuntimeError("No valid leaf mappings found while building W matrix.")
@@ -2277,10 +2542,10 @@ class SparseProximityMixin:
         elif self.prox_method == "oob":
             vals = np.full(rows.shape[0], np.sqrt(n_trees) / n_trees, dtype=np.float32)
 
-        elif self.prox_method == "rfgap":
+        elif self.prox_method in ("rfgap", "honest_gap"):
             if is_training:
                 if self.oob_mask_ is None:
-                    raise RuntimeError("oob_mask_ must be available for prox_method='rfgap'.")
+                    raise RuntimeError(f"oob_mask_ must be available for prox_method='{self.prox_method}'.")
 
                 keep = self.oob_mask_[rows, tree_ids] == 1
                 rows = rows[keep]
@@ -2529,6 +2794,16 @@ class SparseProximityMixin:
         nnz_per_row = np.diff(A.indptr)
         A.data *= np.repeat(scale, nnz_per_row)
 
+    @classmethod
+    def _csr_row_normalize_inplace(cls, A: sparse.csr_matrix) -> None:
+        if not sparse.isspmatrix_csr(A):
+            raise ValueError("Matrix must be CSR for in-place row normalization.")
+        row_sums = np.asarray(A.sum(axis=1)).ravel()
+        scale = np.ones(row_sums.shape[0], dtype=np.float64)
+        nonzero = row_sums != 0
+        scale[nonzero] = 1.0 / row_sums[nonzero]
+        cls._csr_row_scale_inplace(A, scale)
+
     @staticmethod
     def _block_symmetrize(Q: sparse.csr_matrix, W: sparse.csr_matrix, mode: Literal["arithmetic", "geometric"]) -> sparse.csr_matrix:
         if mode == "arithmetic":
@@ -2592,6 +2867,7 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
 
     is_rotation_forest = _is_rotation_forest_class(base_cls)
     is_isolation_forest = _is_isolation_forest_class(base_cls)
+    is_honest_forest = _is_honest_forest_class(base_cls)
     needs_rotation_apply_adapter = is_rotation_forest and not callable(getattr(base_cls, "apply", None))
     needs_isolation_apply_adapter = is_isolation_forest and not callable(getattr(base_cls, "apply", None))
 
@@ -2697,6 +2973,14 @@ def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
                 symm_mode=symm_mode,
                 max_normalize=max_normalize,
             )
+            if prox_method == "rfgap" and is_honest_forest:
+                warn(
+                    "prox_method='rfgap' uses ordinary RF-GAP bootstrap semantics, "
+                    "which do not reconstruct HonestForestClassifier predictions. "
+                    "Use prox_method='honest_gap' for HonestForest prediction reconstruction.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             if is_rotation_forest:
                 self._rotation_oob_score = bool(effective_oob_score)
             if is_isolation_forest:
