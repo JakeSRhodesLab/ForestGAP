@@ -59,43 +59,53 @@ def patch_treeple_regressor_tags() -> bool:
 
 
 def patch_treeple_sample_weight_signature() -> bool:
-    """Patch treeple helper imports for sklearn's keyword-only dtype arg.
+    """Patch treeple's vendored sklearn tree helper for sklearn>=1.7.
 
-    treeple 0.10.3 calls ``_check_sample_weight(sample_weight, X, DOUBLE)``
-    positionally from its vendored tree classes, but newer scikit-learn
-    exposes ``dtype`` as a keyword-only argument. Rebind the copied helper
-    references inside treeple modules to a small compatibility wrapper.
+    treeple 0.10.3 still calls ``_check_sample_weight(sample_weight, X, DOUBLE)``
+    positionally, while sklearn 1.7 makes ``dtype`` keyword-only. Patch the
+    treeple-local reference so existing call sites keep working.
+
+    Returns
+    -------
+    bool
+        True when the patch is installed (or already present), False when
+        treeple is unavailable.
     """
 
     try:
-        from treeple._lib.sklearn.tree import _classes as tree_classes
-        from treeple._lib.sklearn.ensemble import _forest as tree_forest
         from sklearn.utils.validation import _check_sample_weight as sklearn_check_sample_weight
+        import treeple._lib.sklearn.tree._classes as treeple_tree_classes
     except Exception:
         return False
 
-    if getattr(tree_classes, "_forestgap_sample_weight_patch", False):
+    if getattr(treeple_tree_classes, "_forestgap_sample_weight_patch", False):
         return True
 
-    def _compat_check_sample_weight(
+    def _patched_check_sample_weight(
         sample_weight: Any,
         X: Any,
         dtype: Any = None,
-        ensure_non_negative: bool = False,
-        copy: bool = False,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
+        if args:
+            if dtype is None:
+                dtype = args[0]
+            else:
+                raise TypeError("dtype provided both positionally and by keyword.")
+            if len(args) > 1:
+                raise TypeError(
+                    "_check_sample_weight accepts at most one positional argument after X."
+                )
         return sklearn_check_sample_weight(
             sample_weight,
             X,
             dtype=dtype,
-            ensure_non_negative=ensure_non_negative,
-            copy=copy,
+            **kwargs,
         )
 
-    tree_classes._check_sample_weight = _compat_check_sample_weight
-    tree_forest._check_sample_weight = _compat_check_sample_weight
-    tree_classes._forestgap_sample_weight_patch = True
-    tree_forest._forestgap_sample_weight_patch = True
+    treeple_tree_classes._check_sample_weight = _patched_check_sample_weight
+    treeple_tree_classes._forestgap_sample_weight_patch = True
     return True
 
 

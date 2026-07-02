@@ -1,0 +1,8 @@
+model_family,model_name,score_source,prox_method,score_method,label_mode,outlier_fraction,roc_auc,average_precision,precision_at_k,recall_at_k,f1_at_k,spearman_rank_corr,topk_overlap_at_k,fit_runtime_seconds,score_runtime_seconds,total_runtime_seconds
+unsupervised_model,IsolationForest,native,not_applicable,score_samples,not_applicable,0.05,1.0,0.9999999999999999,1.0,1.0,1.0,,,0.037538733100518584,0.002367441076785326,0.03990617417730391
+unsupervised_model,IsolationForest,proximity,oob,breiman,unsupervised,0.05,0.986,0.6537004662004662,0.6,0.6,0.6,0.3676617888882732,0.6,0.05084891594015062,0.0016601479146629572,0.052509063854813576
+unsupervised_model,IsolationForest,proximity,oob,ene,unsupervised,0.05,0.9695,0.5225085589791472,0.5,0.5,0.5,0.38179831502164,0.5,0.05084891594015062,0.0016570030711591244,0.05250591901130974
+unsupervised_model,IsolationForest,proximity,original,breiman,unsupervised,0.05,0.998,0.9714285714285714,0.9,0.9,0.9,0.26131331766517085,0.9,0.037538733100518584,0.0027643090579658747,0.04030304215848446
+unsupervised_model,IsolationForest,proximity,original,ene,unsupervised,0.05,0.9730000000000001,0.8136037442641216,0.7,0.7,0.7,0.2878177237562912,0.7,0.037538733100518584,0.002390190027654171,0.039928923128172755
+unsupervised_model,IsolationForest,proximity,rfgap,breiman,unsupervised,0.05,0.7394999999999999,0.0937374229528666,0.0,0.0,0.0,-0.15346090589257375,0.0,0.05758498585782945,0.00414206413552165,0.0617270499933511
+unsupervised_model,IsolationForest,proximity,rfgap,ene,unsupervised,0.05,0.935,0.38993043816236705,0.5,0.5,0.5,0.2159950215800247,0.5,0.05758498585782945,0.003593882080167532,0.061178867937996984
