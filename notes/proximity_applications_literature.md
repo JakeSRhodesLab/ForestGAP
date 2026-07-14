@@ -2,9 +2,9 @@
 
 **Evidence snapshot:** 2026-07-14 (America/Denver)
 
-**Final evidence set:** 79 unique works: 28 foundational tree-method works, 49 direct forest-induced proximity/kernel works, and 3 adjacent distance-consuming tree methods; Breiman (2001) appears in both the first two groups and is counted once.
+**Final evidence set:** 80 unique works: 28 foundational tree-method works, 50 direct forest-induced proximity/kernel works, and 3 adjacent distance-consuming tree methods; Breiman (2001) appears in both the first two groups and is counted once.
 
-**Local full text:** 57 lawful/open PDFs, all stored under `../papers/`.
+**Local full text:** 58 lawful/open PDFs, all stored under `../papers/`.
 
 This is the evidence ledger requested by `plan.md`. It is a research artifact, not prose inserted into the manuscript. Paper-reported claims are labeled “Reported” or “Evidence”; statements about this project are labeled “Project inference.” “Not found” records a bounded search result, not proof of nonexistence.
 
@@ -174,7 +174,7 @@ Tier interpretation follows the plan: A = canonical/seminal plus strong practica
 | Definitions / smoothing / kernels | `breiman2001randomforests`, `lin2006adaptive`, `shi2006unsupervised`, `scornet2016kernel`, `englund2012proximity`, `davies2014randompartition`, `pang2023rfgap`, `aumon2026revisiting`, `olson2018probabilities` |
 | Kernel classification / prediction | `cavalheiro2023rfkernel`, `ting2018isolationkernel`, `zafari2019landcoverkernel`, `lee2017patientspecific` |
 | Clustering / anomaly / prototypes | `shi2005tumor`, `wang2013networktraffic`, `kruber2018trafficscenarios`, `baron2017galaxies`, `zhou2015novelty`, `tan2020prototypes` |
-| Manifold / representation / fusion | `gray2011dementia`, `pouyan2016cytometry`, `cao2019radiomics`, `cao2020novel`, `rhodes2021rfphate`, `rhodes2023supervisedmanifold`, `rhodes2024manifoldalignment`, `ni2024autoencoder`, `stavropoulos2021datafusion`, `aumon2025randomforestautoencoders`, `vu2025autoencoding`, `rhodes2026gaining`, `aumon2026fosta`, `bernard2020multiview`, `golino2014visualizing` |
+| Manifold / representation / fusion | `gray2011dementia`, `pouyan2016cytometry`, `feng2018autoencoderbyforest`, `cao2019radiomics`, `cao2020novel`, `rhodes2021rfphate`, `rhodes2023supervisedmanifold`, `rhodes2024manifoldalignment`, `ni2024autoencoder`, `stavropoulos2021datafusion`, `aumon2025randomforestautoencoders`, `vu2025autoencoding`, `rhodes2026gaining`, `aumon2026fosta`, `bernard2020multiview`, `golino2014visualizing` |
 | Imputation / causal matching | `crookston2008yaimpute`, `zhao2016matching`, `rhodes2025timeseriesimputation`, `lee2026dualforest` |
 | Explanation / uncertainty | `whitmore2018explicating`, `rosaler2024trust`, `li2024quantile`, `li2025conformal`, `geertsema2023axil` |
 | Structured data / graphs | `shaw2024timeseries`, `shaw2026generalizedpf`, `farokhi2024rfgnn`, `chen2026rfgnn`, `jeyapaulraj2022bonds`, `seoane2014geneannotation` |
@@ -203,6 +203,7 @@ The index provides the plan's table view; the detailed annotations immediately a
 | `zhou2015novelty` | Clustering / anomaly / prototypes | C | DOI `10.1016/j.eswa.2014.12.028` | not found | V2 | not held |
 | `gray2011dementia` | Manifold / representation / fusion | B | DOI `10.1007/978-3-642-24319-6_20` | not found | V2 | not held |
 | `pouyan2016cytometry` | Manifold / representation / fusion | C | DOI `10.1109/EMBC.2016.7591260` | not found | V1 | not held |
+| `feng2018autoencoderbyforest` | Manifold / representation / fusion | C | DOI `10.1609/AAAI.V32I1.11732` | not found | V3 | [Feng2018AutoEncoderByForest.pdf](../papers/Feng2018AutoEncoderByForest.pdf) |
 | `cao2019radiomics` | Manifold / representation / fusion | B | DOI `10.1016/j.patcog.2018.11.011` | not found | V2 | not held |
 | `cao2020novel` | Manifold / representation / fusion | B | DOI `10.1109/ICPR48806.2021.9412961` | not found | V3 | [Cao2021NovelDissimilarity.pdf](../papers/Cao2021NovelDissimilarity.pdf) |
 | `rhodes2021rfphate` | Manifold / representation / fusion | B | DOI `10.1109/SSP49050.2021.9513749` | official | V3 | not held |
@@ -259,6 +260,7 @@ The index provides the plan's table view; the detailed annotations immediately a
 | `zhou2015novelty` | 2015 | 23 (1.9/yr) | 25 (1) |
 | `gray2011dementia` | 2011 | NA | 34 (2) |
 | `pouyan2016cytometry` | 2016 | NA | 7 (0) |
+| `feng2018autoencoderbyforest` | 2018 | NA | NA |
 | `cao2019radiomics` | 2019 | 59 (7.4/yr) | 61 (2) |
 | `cao2020novel` | 2021 | 5 (final; arXiv duplicate not summed) (0.8/yr) | 10 (2) |
 | `rhodes2021rfphate` | 2021 | NA | 10 (0) |
@@ -391,9 +393,11 @@ The index provides the plan's table view; the detailed annotations immediately a
 
 49. **`seoane2014geneannotation` — Seoane et al., “A Random Forest Proximity Matrix as a New Measure for Gene Annotation,” ESANN 2014, 425–430.** Relation/task: a supervised forest over genotype–phenotype association summaries induces gene similarity for Gene Ontology annotation. Reported: the proposed score improved annotation precision against the STRING-derived comparison in the studied data. Limits: short paper, one biological construction, older annotation resources, and no code. Code: not found. OA: ESANN proceedings. Citations: **OA NA / S2 2 (1)**. Project inference: an early non-prediction use of RF proximity as a scientific relation. Verification: **V3**. Local full text: [Seoane2014GeneAnnotation.pdf](../papers/Seoane2014GeneAnnotation.pdf).
 
+50. **`feng2018autoencoderbyforest` — Feng and Zhou, “AutoEncoder by Forest,” Proceedings of the AAAI Conference on Artificial Intelligence 32(1) (2018), 2967–2973. DOI `10.1609/AAAI.V32I1.11732`; arXiv `1709.09018`.** Relation/task: EncoderForest (`eForest`) treats a trained tree ensemble as an autoencoder by encoding observations through tree decision-path signatures and reconstructing from the maximal input region consistent with those paths. Reported: MNIST and UCI experiments show lower reconstruction error than the compared DNN autoencoders, along with fast training and partial-model damage tolerance. Limits: this is a forest-induced representation/reconstruction method rather than a pairwise proximity/kernel matrix; experiments are relatively small and the paper predates later forest-autoencoding benchmarks. Code: not found. OA: official AAAI open-access PDF and arXiv preprint. Citations: **OA NA / S2 NA** in the current environment because the relevant APIs were rate-limited during this patch. Project inference: important early direct prior art for forest-based autoencoding and a clear predecessor to the 2025 forest-autoencoder papers already in the ledger. Verification: **V3**. Local full text: [Feng2018AutoEncoderByForest.pdf](../papers/Feng2018AutoEncoderByForest.pdf).
+
 ## Adjacent distance/similarity-consuming tree methods
 
-These are retained as Tier C algorithmic comparators but are not counted among the 49 direct applications.
+These are retained as Tier C algorithmic comparators but are not counted among the 50 direct applications.
 
 | Work / retained key | Direction of relation | Why adjacent | Code / OA |
 |---|---|---|---|
@@ -448,7 +452,7 @@ The statements in this subsection are **project inferences**, not claims made by
 
 ## Local PDF provenance and integrity
 
-Only lawful publisher, repository, proceedings, author, or preprint copies were retained. A paywalled final may therefore be represented locally by a preprint or accepted manuscript, while `main.bib` cites the final metadata. `RandomProjectionForests.pdf` is retained solely because the plan forbids renaming/removing baseline filenames; it is not evidence for the Cannings–Samworth work. The table records full SHA-256 checksums; all 57 hashes are unique and every file begins with `%PDF`.
+Only lawful publisher, repository, proceedings, author, or preprint copies were retained. A paywalled final may therefore be represented locally by a preprint or accepted manuscript, while `main.bib` cites the final metadata. `RandomProjectionForests.pdf` is retained solely because the plan forbids renaming/removing baseline filenames; it is not evidence for the Cannings–Samworth work. The table records full SHA-256 checksums; all 58 hashes are unique and every file begins with `%PDF`.
 
 | Local file | SHA-256 | Lawful source | Local/final relationship |
 |---|---|---|---|
@@ -468,6 +472,7 @@ Only lawful publisher, repository, proceedings, author, or preprint copies were 
 | [Crookston2008YaImpute.pdf](../papers/Crookston2008YaImpute.pdf) | `d3f95bd8c0600b22628cdfdf95184d10739d721e895902e851ff7559e64acaa8` | [source](https://www.jstatsoft.org/article/view/v023i10/v23i10.pdf) | JSS open version of record; current endpoint is byte-repackaged relative to held copy |
 | [Davies2014RandomForestKernel.pdf](../papers/Davies2014RandomForestKernel.pdf) | `40380adc66fa20187b449bbb00919a8a203627b6f1f5ac75e026788b53464ae2` | [source](https://arxiv.org/pdf/1402.4293) | arXiv preprint |
 | [ExplicatingFeature.pdf](../papers/ExplicatingFeature.pdf) | `0129970f09bac0ee6de195e3ef582adea67ff27f2d00f26ffc25780e3c743871` | [source](https://arxiv.org/pdf/1807.06572) | official arXiv v1 |
+| [Feng2018AutoEncoderByForest.pdf](../papers/Feng2018AutoEncoderByForest.pdf) | `59bcdab019d3d13815a379dd7faf062b307daf9d9c572094258e51cb388edd93` | [source](https://ojs.aaai.org/index.php/AAAI/article/download/11732/11591) | AAAI 2018 open-access version of record |
 | [Farokhi2024RandomForestGNN.pdf](../papers/Farokhi2024RandomForestGNN.pdf) | `36d59a086f3e3cd8344d63d3d9f2bfeebe13bb899f08f422576bcf75b48b8e9f` | [source](https://par.nsf.gov/servlets/purl/10620541) | NSF public-access manuscript for IEEE Big Data |
 | [Freund1997AdaBoost.pdf](../papers/Freund1997AdaBoost.pdf) | `6bcbba23d15a3f082e6b701bc23d14807af788edeb96dbd5a11c6caa8c125c84` | [source](https://www.schapire.net/papers/FreundSc95.pdf) | author-hosted final-paper manuscript |
 | [Geertsema2023AXIL.pdf](../papers/Geertsema2023AXIL.pdf) | `937a6d7ed2b0aa7d56b23c40e30f496e88d49646450758a6cfd02eae89dbe600` | [source](https://arxiv.org/pdf/2301.01864) | current arXiv revision |
