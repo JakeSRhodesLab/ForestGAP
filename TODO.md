@@ -1,5 +1,11 @@
 # TODOs
 
+The implementation decision ledger, evidence boundary, valid
+estimator–relation combinations, and phased acceptance criteria are in
+[`notes/application_roadmap.md`](notes/application_roadmap.md).  The immediate
+documentation follow-up is to reconcile the literature ledger's counts,
+bibliography, and local PDF provenance.
+
 1. Outline all applications for which proximities have been used.
 2. Determine which are crucial to keep for comparisons across tree models.
    1. Side note: for applications, relate to overall (test) performance of the respective models.
