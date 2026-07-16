@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from sklearn.datasets import make_classification, make_regression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
@@ -56,3 +57,18 @@ def test_quantiles_conformal_attribution_retrieval_and_active_learning():
     probabilities = np.array([[0.8, 0.2], [0.2, 0.8], [0.7, 0.3], [0.1, 0.9]])
     sets = split_conformal_classification([0, 1], probabilities[:2], probabilities[2:], classes=[0, 1])
     assert len(sets) == 2
+
+
+def test_tier1_helpers_reject_misaligned_or_empty_inputs():
+    with pytest.raises(ValueError, match="must align"):
+        split_conformal_regression(np.ones((2, 1)), np.ones(3), [0.0])
+    with pytest.raises(ValueError, match="at least one"):
+        split_conformal_regression([], [], [0.0])
+    with pytest.raises(ValueError, match="same class columns"):
+        split_conformal_classification([0, 1], np.ones((2, 2)), np.ones((1, 3)), classes=[0, 1])
+    with pytest.raises(ValueError, match="one label"):
+        split_conformal_classification([0, 1], np.ones((2, 2)), np.ones((1, 2)), classes=[0])
+    with pytest.raises(ValueError, match="one set"):
+        retrieval_metrics([[0, 1], [1, 2]], [{0}])
+    with pytest.raises(ValueError, match="at least one"):
+        select_active_batch([], np.empty((0, 0)), 1)

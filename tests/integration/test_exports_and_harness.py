@@ -47,3 +47,53 @@ def test_harness_reuses_parent_and_records_unsupported_cells():
         )
     ])[0]
     assert unsupported["status"] == "unsupported"
+    assert unsupported["runtime_seconds"] >= 0
+    assert unsupported["peak_memory_bytes"] >= 0
+    assert unsupported["relation_runtime_seconds"] is not None
+    assert unsupported["relation_diagnostics"] is None
+
+
+def test_harness_does_not_reuse_different_parent_configurations():
+    X, y = make_classification(n_samples=50, n_features=5, random_state=43)
+    fits = {"count": 0}
+
+    class CountingForest(RandomForestClassifier):
+        def fit(self, X, y, **kwargs):
+            fits["count"] += 1
+            return super().fit(X, y, **kwargs)
+
+    def metrics(proximity, cell):
+        return {"rows": proximity.get_proximities().shape[0]}
+
+    rows = run_cells([
+        ExperimentCell(
+            "rf", "original", "smoke", "synthetic",
+            lambda depth=depth: CountingForest(
+                n_estimators=5, max_depth=depth, random_state=44,
+            ),
+            metrics, X, y, seed=44, split_id="same-split",
+            configuration={"max_depth": depth},
+        )
+        for depth in (2, 4)
+    ])
+    assert fits["count"] == 2
+    assert all(row["status"] == "ok" for row in rows)
+
+
+def test_harness_error_rows_keep_timing_memory_and_relation_diagnostics():
+    X, y = make_classification(n_samples=45, n_features=5, random_state=45)
+
+    def fail_after_relation(proximity, cell):
+        raise RuntimeError("deliberate downstream failure")
+
+    row = run_cells([
+        ExperimentCell(
+            "rf", "original", "failure", "synthetic",
+            lambda: RandomForestClassifier(n_estimators=5, random_state=46),
+            fail_after_relation, X, y, seed=46,
+        )
+    ])[0]
+    assert row["status"] == "error"
+    assert row["application_runtime_seconds"] is not None
+    assert row["peak_memory_bytes"] > 0
+    assert row["relation_diagnostics"] is not None

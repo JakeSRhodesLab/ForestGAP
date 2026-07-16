@@ -50,7 +50,7 @@ def plot_mds(
     ).fit_transform(distance)
     if ax is None:
         _, ax = plt.subplots()
-    scatter = ax.scatter(coords[:, 0], coords[:, 1], c=y)
+    ax.scatter(coords[:, 0], coords[:, 1], c=y)
     ax.set_xlabel("MDS 1")
     ax.set_ylabel("MDS 2")
     ax.set_title(f"{proximity.relation} proximity MDS")

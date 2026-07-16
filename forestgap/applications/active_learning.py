@@ -19,6 +19,8 @@ def select_active_batch(
 
     uncertainty = np.asarray(uncertainty, dtype=float).ravel()
     affinity = pool_affinity.toarray() if sparse.issparse(pool_affinity) else np.asarray(pool_affinity, dtype=float)
+    if uncertainty.size == 0:
+        raise ValueError("uncertainty must contain at least one pool sample")
     if affinity.shape != (uncertainty.size, uncertainty.size):
         raise ValueError("pool_affinity must be square and align with uncertainty")
     batch_size = min(max(1, int(batch_size)), uncertainty.size)

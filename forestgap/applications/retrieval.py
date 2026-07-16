@@ -26,6 +26,10 @@ def retrieval_metrics(retrieved: Any, relevant: list[set[int]]) -> dict[str, flo
     """Compute macro Recall@k, average precision, and binary nDCG@k."""
 
     retrieved = np.asarray(retrieved, dtype=int)
+    if retrieved.ndim != 2 or retrieved.shape[0] == 0:
+        raise ValueError("retrieved must be a non-empty two-dimensional array")
+    if len(relevant) != retrieved.shape[0]:
+        raise ValueError("relevant must contain one set for each retrieved row")
     recalls, aps, ndcgs = [], [], []
     for row, truth in zip(retrieved, relevant):
         hits = np.asarray([int(index in truth) for index in row], dtype=float)

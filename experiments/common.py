@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import inspect
+from importlib import import_module
 import json
 import math
 import os
@@ -10,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 import traceback
-from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
+from typing import Any, Iterator, Literal, Optional, Sequence
 
 for env_name in (
     "OMP_NUM_THREADS",
@@ -27,7 +28,6 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
-import openml
 import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.ensemble import (
@@ -591,7 +591,14 @@ def safe_mean(values: Sequence[float]) -> float:
 
 
 def iter_openml_suite(task_kind: TaskKind, limit: Optional[int] = None) -> Iterator[tuple[int, Any]]:
-    suite_id, suite_name = suite_metadata(task_kind)
+    try:
+        openml = import_module("openml")
+    except ImportError as exc:
+        raise ImportError(
+            "OpenML experiment suites require the optional 'openml' extra; "
+            "install forestgap[openml] before running full-data experiments."
+        ) from exc
+    suite_id, _ = suite_metadata(task_kind)
     suite = openml.study.get_suite(suite_id)
     task_ids = list(getattr(suite, "tasks", []))
     if limit is not None:

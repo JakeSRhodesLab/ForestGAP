@@ -20,6 +20,8 @@ jobs:
           python -m pip install -e '.[dev,aeon,treeple,quantile,survival]'
       - name: Reject stale wrapper imports
         run: python scripts/check_removed_api.py
+      - name: Run static checks
+        run: python -m ruff check forestgap experiments scripts tests
       - name: Run tests
         run: python -m pytest -q
       - name: Execute all maintained notebooks in clean kernels

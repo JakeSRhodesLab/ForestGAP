@@ -43,3 +43,26 @@ def test_every_maintained_runner_exposes_a_cli_help_surface():
             text=True,
         )
         assert "usage:" in completed.stdout.lower()
+
+
+def test_runner_help_does_not_import_optional_openml():
+    blocker = r'''
+import importlib.abc
+import runpy
+import sys
+
+class BlockOpenML(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "openml" or fullname.startswith("openml."):
+            raise ModuleNotFoundError("openml deliberately unavailable")
+        return None
+
+sys.meta_path.insert(0, BlockOpenML())
+sys.argv = ["run_imputation", "--help"]
+runpy.run_module("experiments.run_imputation", run_name="__main__")
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", blocker], capture_output=True, text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout.lower()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from importlib.util import find_spec
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Mapping
 
 
 class UnsupportedRelationError(ValueError):

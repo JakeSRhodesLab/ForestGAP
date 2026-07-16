@@ -30,6 +30,7 @@ dev = [
     "pytest",
     "nbclient",
     "nbformat",
+    "ruff>=0.12",
 ]
 
 [tool.setuptools.packages.find]
@@ -37,3 +38,14 @@ include = ["forestgap*"]
 
 [tool.setuptools.package-data]
 "forestgap.adapters" = ["fixtures/*.json"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"experiments/common.py" = ["E402"]
+"experiments/run_imputation.py" = ["E402"]
+"experiments/run_local_feature_importance.py" = ["E402"]
+"experiments/run_prediction_identity.py" = ["E402"]
+"experiments/run_prototypes.py" = ["E402"]

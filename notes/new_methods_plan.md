@@ -55,6 +55,20 @@ and blockers so work can resume without reconstructing context.
   passed, and the legacy archive contains the expected 1,217 files (1,215
   figures plus two raw CSVs). This is the definitive continuation point; no
   implementation work from this plan remains.
+- **2026-07-16 07:14 MDT — post-completion review/debug checkpoint.** A fresh
+  CI-equivalent environment without the OpenML extra exposed an eager optional
+  import in the experiment CLI; OpenML loading is now lazy and produces an
+  actionable extra-install message. The review also fixed shared-parent cache
+  collisions between distinct declared configurations, made successful and
+  failed harness rows retain complete timing/memory/diagnostic provenance, and
+  corrected silent shape/truncation edge cases in conformal, retrieval, and
+  active-learning helpers. Added Ruff to the development/CI gate. Verification
+  in the clean environment: Ruff and removed-API scans passed; `117 passed, 9
+  subtests passed`; all 17 notebooks executed; lock and installed requirements
+  checks passed; and both distributions built successfully with the CCF fixture
+  and without `core.py`. Next: commit this reviewed state, run the full default
+  486-cell method matrix from that exact clean revision, audit every result row,
+  and record the definitive run summary here.
 - [x] Composition package and public exports (`proximity`, `adapters`,
   `applications`); remove `core.py` and wrapper API.
 - [x] Relation constructors and validity gates (`original`, `oob`, `rfgap`,
