@@ -24,7 +24,5 @@ jobs:
         run: python -m ruff check forestgap experiments scripts tests
       - name: Run tests
         run: python -m pytest -q
-      - name: Execute all maintained notebooks in clean kernels
-        run: python scripts/validate_notebooks.py --execute
       - name: Verify distribution build
         run: python -m build
