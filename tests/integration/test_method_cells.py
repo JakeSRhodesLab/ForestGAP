@@ -4,7 +4,7 @@ from experiments.harness import run_cells
 
 def test_cross_method_cells_cover_cartesian_matrix_and_keep_unsupported_rows():
     cells = build_cells(
-        estimators=["random_forest", "ccf"],
+        estimators=["random_forest", "ccf", "ccf_bag"],
         relations=["original", "rfgap"],
         applications=["prediction", "retrieval"],
         data_regimes=["axis_aligned", "rotated_oblique"],
@@ -12,7 +12,7 @@ def test_cross_method_cells_cover_cartesian_matrix_and_keep_unsupported_rows():
         n_samples=70,
         n_estimators=5,
     )
-    assert len(cells) == 16
+    assert len(cells) == 24
     rows = run_cells(cells)
     assert len(rows) == len(cells)
     assert {row["status"] for row in rows} == {"ok", "unsupported"}
@@ -25,4 +25,9 @@ def test_cross_method_cells_cover_cartesian_matrix_and_keep_unsupported_rows():
         row["status"] == "unsupported"
         for row in rows
         if row["estimator"] == "ccf" and row["relation"] == "rfgap"
+    )
+    assert all(
+        row["status"] == "ok"
+        for row in rows
+        if row["estimator"] == "ccf_bag" and row["relation"] == "rfgap"
     )

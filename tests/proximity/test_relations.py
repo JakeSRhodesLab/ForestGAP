@@ -15,7 +15,7 @@ def classification_data():
     return X[:80], y[:80], X[80:], y[80:]
 
 
-@pytest.mark.parametrize("relation", ["original", "kerf", "path", "random_height"])
+@pytest.mark.parametrize("relation", ["original", "kerf", "path", "englund", "random_height"])
 def test_symmetric_kernel_relations_are_psd_and_extend(classification_data, relation):
     X, y, X_test, _ = classification_data
     proximity = Proximity(
@@ -29,6 +29,38 @@ def test_symmetric_kernel_relations_are_psd_and_extend(classification_data, rela
     assert np.linalg.eigvalsh(dense).min() >= -1e-6
     assert proximity.prox_extend(X_test).shape == (len(X_test), len(X))
     assert proximity.diagnostics(matrix)["psd"] is True
+
+
+def test_englund_uses_terminal_node_branch_distance(classification_data):
+    X, y, X_test, _ = classification_data
+    estimator = RandomForestClassifier(
+        n_estimators=1, bootstrap=False, max_depth=4, random_state=23,
+    ).fit(X, y)
+    weight = 0.7
+    proximity = Proximity(
+        estimator, relation="englund", matrix_type="dense", englund_weight=weight,
+    ).attach(X, y)
+    actual = proximity.get_proximities()
+
+    indicator, node_ptr = estimator.decision_path(X)
+    paths = []
+    block = indicator[:, node_ptr[0]:node_ptr[1]].tocsr()
+    for row in range(block.shape[0]):
+        paths.append(block.indices[block.indptr[row]:block.indptr[row + 1]])
+
+    expected = np.empty((len(X), len(X)), dtype=float)
+    for i, left in enumerate(paths):
+        for j, right in enumerate(paths):
+            common = min(len(left), len(right))
+            mismatch = np.flatnonzero(left[:common] != right[:common])
+            common = int(mismatch[0]) if mismatch.size else common
+            branches = len(left) + len(right) - 2 * common
+            expected[i, j] = np.exp(-weight * branches)
+
+    np.testing.assert_allclose(actual, expected)
+    assert np.all(np.diag(actual) == 1.0)
+    assert proximity.prox_extend(X_test).shape == (len(X_test), len(X))
+    assert proximity.relation_metadata_["englund_weight"] == weight
 
 
 def test_random_height_is_seeded_and_cached(classification_data):

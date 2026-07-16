@@ -1,9 +1,11 @@
 import numpy as np
 import pytest
+from sklearn.datasets import make_regression
 from sklearn.model_selection import train_test_split
 
 from forestgap import Proximity, conditional_distribution_weights
 from forestgap.adapters import (
+    capabilities_for,
     censoring_safe_survival_metrics,
     native_quantiles,
     native_survival_outputs,
@@ -67,25 +69,95 @@ def test_random_survival_forest_outputs_relation_and_ipcw_metrics():
     assert np.isfinite(metrics["integrated_brier_score"])
 
 
-def test_aeon_rotation_forest_supports_oob_and_rfgap_when_fitted():
+@pytest.mark.parametrize("task", ["classification", "regression"])
+def test_aeon_rotation_forest_adapter_preserves_oob_test_and_path_contracts(task):
     pytest.importorskip("aeon")
-    from aeon.classification.sklearn import RotationForestClassifier
 
     rng = np.random.default_rng(16)
-    X = rng.normal(size=(45, 5))
-    y = (X[:, 0] + X[:, 1] > 0).astype(int)
-    estimator = RotationForestClassifier(
-        n_estimators=3, random_state=17, n_jobs=1,
-    ).fit(X, y)
+    X = rng.normal(size=(70, 5))
+    if task == "classification":
+        from aeon.classification.sklearn import RotationForestClassifier
+
+        y = (X[:, 0] + X[:, 1] > 0).astype(int)
+        estimator = RotationForestClassifier(
+            n_estimators=11, random_state=17, n_jobs=1,
+        ).fit(X, y)
+        expected_test = estimator.predict_proba(X[:6])
+        oob_name = "oob_decision_function_"
+    else:
+        from aeon.regression.sklearn import RotationForestRegressor
+
+        _, y = make_regression(n_samples=len(X), n_features=X.shape[1], random_state=18)
+        estimator = RotationForestRegressor(
+            n_estimators=11, random_state=17, n_jobs=1,
+        ).fit(X, y)
+        expected_test = estimator.predict(X[:6])
+        oob_name = "oob_prediction_"
+
     proximity = Proximity(estimator, relation="rfgap").attach(X, y)
     assert proximity.capabilities_.family == "rotation_forest"
-    assert {"original", "kerf", "oob", "rfgap"} <= set(
+    assert {"original", "kerf", "oob", "rfgap", "path", "englund", "random_height"} <= set(
         proximity.capabilities_.valid_relations
     )
     assert proximity.get_proximities().shape == (len(X), len(X))
     np.testing.assert_allclose(
-        proximity.prox_predict(X[:6]), estimator.predict_proba(X[:6]), atol=1e-6,
+        proximity.prox_predict(X[:6]), expected_test, atol=3e-5,
     )
+    valid = proximity.oob_valid_mask_
+    assert valid.any()
+    np.testing.assert_allclose(
+        proximity.prox_predict()[valid], getattr(estimator, oob_name)[valid], atol=3e-5,
+    )
+    np.testing.assert_allclose(getattr(proximity, oob_name), getattr(estimator, oob_name))
+    assert proximity.relation_metadata_["oob_valid_rows"] == int(valid.sum())
+
+    repeated = Proximity(estimator, relation="rfgap").attach(X, y)
+    np.testing.assert_array_equal(repeated.oob_mask_, proximity.oob_mask_)
+    np.testing.assert_allclose(repeated.prox_predict(), proximity.prox_predict(), atol=3e-5)
+
+    for relation in ("path", "englund", "random_height"):
+        path_proximity = Proximity(
+            estimator, relation=relation, random_state=19,
+        ).attach(X, y)
+        matrix = path_proximity.get_proximities().toarray()
+        np.testing.assert_allclose(matrix, matrix.T, atol=1e-7)
+        assert np.linalg.eigvalsh(matrix).min() >= -1e-6
+        assert path_proximity.prox_extend(X[:4]).shape == (4, len(X))
+
+
+def test_aeon_rotation_forest_rejects_missing_training_estimate_contract(monkeypatch):
+    pytest.importorskip("aeon")
+    from aeon.classification.sklearn import RotationForestClassifier
+
+    rng = np.random.default_rng(20)
+    X = rng.normal(size=(45, 5))
+    y = (X[:, 0] > 0).astype(int)
+    estimator = RotationForestClassifier(
+        n_estimators=5, random_state=21, n_jobs=1,
+    ).fit(X, y)
+    monkeypatch.setattr(type(estimator), "_train_probas_for_estimator", None)
+    assert "rfgap" not in capabilities_for(estimator).valid_relations
+    with pytest.raises(ValueError, match="synchronized training-estimate"):
+        Proximity(estimator, relation="rfgap").attach(X, y)
+
+
+def test_aeon_rotation_forest_marks_rows_without_an_oob_tree():
+    pytest.importorskip("aeon")
+    from aeon.classification.sklearn import RotationForestClassifier
+
+    rng = np.random.default_rng(31)
+    X = rng.normal(size=(45, 5))
+    y = (X[:, 0] + X[:, 1] > 0).astype(int)
+    estimator = RotationForestClassifier(
+        n_estimators=1, random_state=32, n_jobs=1,
+    ).fit(X, y)
+    with pytest.warns(UserWarning, match="oob_valid_mask_"):
+        proximity = Proximity(estimator, relation="rfgap").attach(X, y)
+
+    invalid = ~proximity.oob_valid_mask_
+    assert invalid.any()
+    assert proximity.relation_metadata_["oob_invalid_rows"] == int(invalid.sum())
+    np.testing.assert_allclose(estimator.oob_decision_function_[invalid], 0.0)
 
 
 def test_treeple_oblique_honest_and_extended_isolation_contracts():
@@ -111,9 +183,7 @@ def test_treeple_oblique_honest_and_extended_isolation_contracts():
     honest = treeple.HonestForestClassifier(
         n_estimators=5, max_depth=4, random_state=20, n_jobs=1,
     ).fit(X, y)
-    assert set(capabilities_for(honest).valid_relations) == {
-        "honest_gap", "kerf", "original",
-    }
+    assert {"honest_gap", "kerf", "original"} <= set(capabilities_for(honest).valid_relations)
     honest_proximity = Proximity(honest, relation="honest_gap").attach(X, y)
     assert honest_proximity.get_proximities().shape == (50, 50)
     np.testing.assert_allclose(

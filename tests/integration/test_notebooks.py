@@ -15,3 +15,8 @@ def test_all_notebooks_have_fresh_composition_smoke_outputs():
         if (errors := validate(path, execute=False))
     }
     assert failures == {}
+
+def test_rotation_forest_tutorial_has_a_fresh_targeted_smoke_output():
+    path = ROOT / "notebooks" / "rotation_forest_proximities.ipynb"
+    assert validate(path, execute=False) == []
+
