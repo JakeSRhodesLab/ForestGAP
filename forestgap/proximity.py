@@ -23,7 +23,12 @@ from forestgap.adapters import (
     capabilities_for,
     validate_relation,
 )
-from forestgap.adapters.aeon import rotation_forest_leaf_ids
+from forestgap.adapters.aeon import (
+    rotation_forest_decision_path,
+    rotation_forest_leaf_ids,
+    rotation_forest_node_depths,
+    rotation_forest_transforms,
+)
 from forestgap.adapters.sklearn import isolation_leaf_ids
 from forestgap.manifold.proximity import (
     is_symmetric,
@@ -77,6 +82,7 @@ ProxMethod = Literal[
     "honest_gap",
     "kerf",
     "path",
+    "englund",
     "random_height",
     "collision",
     "conditional",
@@ -154,6 +160,7 @@ class Proximity:
     - `"oob"`: OOB-only approximation in separable sparse form
     - `"rfgap"`: RF-GAP asymmetric proximity
     - `"honest_gap"`: prediction-preserving HonestForest classifier proximity
+    - `"englund"`: Englund–Verikas terminal-node branch-distance kernel
 
     Notes
     -----
@@ -181,6 +188,7 @@ class Proximity:
         symm_mode: SymmMode = None,
         max_normalize: bool = False,
         random_state: int | None = None,
+        englund_weight: float = 1.0,
     ) -> None:
         """Create an unfitted relation index around an estimator.
 
@@ -196,6 +204,9 @@ class Proximity:
         self.estimator = estimator
         self.relation = relation
         self.random_state = random_state
+        if not np.isfinite(englund_weight) or englund_weight < 0:
+            raise ValueError("englund_weight must be a finite non-negative number")
+        self.englund_weight = float(englund_weight)
         self.capabilities_: EstimatorCapabilities | None = None
         self.relation_metadata_: dict[str, Any] = {}
         self._relation_feature_cache: dict[str, Any] = {}
@@ -228,7 +239,7 @@ class Proximity:
     ) -> None:
         valid_relations = {
             "original", "oob", "rfgap", "honest_gap", "kerf", "path",
-            "random_height", "collision", "conditional", "survival_leaf",
+            "englund", "random_height", "collision", "conditional", "survival_leaf",
         }
         if prox_method not in valid_relations:
             raise ValueError(
@@ -418,7 +429,7 @@ class Proximity:
         """
         self._check_proximity_ready()
 
-        if self.prox_method in {"kerf", "path", "random_height"}:
+        if self.prox_method in {"kerf", "path", "englund", "random_height"}:
             result = self._kernel_relation(self.prox_method, X_new=None)
             self.relation_metadata_.update(self.diagnostics(result))
             return result
@@ -483,7 +494,7 @@ class Proximity:
         """
         self._check_proximity_ready()
 
-        if self.prox_method in {"kerf", "path", "random_height"}:
+        if self.prox_method in {"kerf", "path", "englund", "random_height"}:
             return self._kernel_relation(self.prox_method, X_new=X_new)
 
         # RotationForest rfgap: use original-tree W (c_j=1) so that
@@ -577,7 +588,7 @@ class Proximity:
 
     def _base_relation_metadata(self) -> dict[str, Any]:
         capabilities = self.capabilities_ or capabilities_for(self.estimator)
-        return {
+        metadata = {
             "relation": self.relation,
             "estimator_family": capabilities.family,
             "task_type": capabilities.task_type,
@@ -586,6 +597,14 @@ class Proximity:
             "prediction_identity": self.relation in {"rfgap", "honest_gap"},
             "random_state": self.random_state,
         }
+        if self.relation == "englund":
+            metadata["englund_weight"] = self.englund_weight
+        oob_valid = getattr(self, "oob_valid_mask_", None)
+        if self.relation in {"oob", "rfgap"} and oob_valid is not None:
+            valid = np.asarray(oob_valid, dtype=bool)
+            metadata["oob_valid_rows"] = int(np.count_nonzero(valid))
+            metadata["oob_invalid_rows"] = int(valid.size - np.count_nonzero(valid))
+        return metadata
 
     def _alternate_relation(self, relation: str) -> "Proximity":
         alternate = Proximity(
@@ -596,6 +615,7 @@ class Proximity:
             symm_mode=self.symm_mode,
             max_normalize=self.max_normalize,
             random_state=self.random_state,
+            englund_weight=self.englund_weight,
         )
         if self._X_train is None:
             raise RuntimeError("Training features are unavailable for relation dispatch.")
@@ -609,6 +629,8 @@ class Proximity:
         elif relation == "path":
             train_features = self._path_features(self._X_train, training=True)
             query_features = train_features if X_new is None else self._path_features(X_new, training=False)
+        elif relation == "englund":
+            return self._englund_relation(X_new)
         elif relation == "random_height":
             train_features = self._random_height_features(self._X_train, training=True)
             query_features = train_features if X_new is None else self._random_height_features(X_new, training=False)
@@ -645,7 +667,11 @@ class Proximity:
         return features
 
     def _decision_path_indicator(self, X: Any) -> tuple[sparse.csr_matrix, np.ndarray]:
-        result = self.estimator.decision_path(X)
+        result = (
+            rotation_forest_decision_path(self.estimator, X)
+            if _is_rotation_forest_instance(self.estimator)
+            else self.estimator.decision_path(X)
+        )
         if not isinstance(result, tuple) or len(result) != 2:
             raise UnsupportedRelationError(
                 self.capabilities_.family if self.capabilities_ else "unknown",
@@ -653,7 +679,22 @@ class Proximity:
                 "decision_path must return (indicator, node_ptr)",
             )
         indicator, node_ptr = result
-        return sparse.csr_matrix(indicator), np.asarray(node_ptr, dtype=np.int64)
+        indicator = sparse.csr_matrix(indicator)
+        node_ptr = np.asarray(node_ptr, dtype=np.int64)
+        n_trees = len(getattr(self.estimator, "estimators_", ()))
+        if (
+            node_ptr.ndim != 1
+            or node_ptr.shape[0] != n_trees + 1
+            or node_ptr[0] != 0
+            or node_ptr[-1] != indicator.shape[1]
+            or np.any(np.diff(node_ptr) < 0)
+        ):
+            raise UnsupportedRelationError(
+                self.capabilities_.family if self.capabilities_ else "unknown",
+                self.relation,
+                "decision_path must return stable per-tree node offsets",
+            )
+        return indicator, node_ptr
 
     def _path_features(self, X: Any, *, training: bool) -> sparse.csr_matrix:
         if training and "path" in self._relation_feature_cache:
@@ -670,6 +711,113 @@ class Proximity:
             self._relation_feature_cache["path"] = features
         return features
 
+    def _englund_paths(
+        self, X: Any, *, training: bool,
+    ) -> list[tuple[np.ndarray, dict[int, np.ndarray]]]:
+        """Return terminal assignments and root-to-terminal paths per tree.
+
+        Englund and Verikas define the per-tree similarity as
+        ``exp(-w * g)``, where ``g`` is the number of tree branches on the
+        path between the two occupied terminal nodes.  Keeping one path per
+        distinct terminal node lets the pairwise kernel reuse the same tree
+        geometry for all observations in that leaf.
+        """
+
+        cache_key = "englund_paths"
+        if training and cache_key in self._relation_feature_cache:
+            return self._relation_feature_cache[cache_key]
+
+        indicator, node_ptr = self._decision_path_indicator(X)
+        if training:
+            self._relation_feature_cache["englund_ptr"] = node_ptr
+        elif not np.array_equal(node_ptr, self._relation_feature_cache.get("englund_ptr")):
+            raise RuntimeError("Estimator path inventory changed after attachment.")
+
+        paths_by_tree: list[tuple[np.ndarray, dict[int, np.ndarray]]] = []
+        for tree_idx in range(node_ptr.shape[0] - 1):
+            start, stop = int(node_ptr[tree_idx]), int(node_ptr[tree_idx + 1])
+            block = indicator[:, start:stop].tocsr()
+            if block.shape[1] == 0 or np.any(np.diff(block.indptr) == 0):
+                raise RuntimeError("Every observation must have a non-empty tree decision path.")
+
+            row_ends = block.indptr[1:] - 1
+            terminals = block.indices[row_ends].astype(np.int64, copy=False)
+            _, first_rows = np.unique(terminals, return_index=True)
+            paths: dict[int, np.ndarray] = {}
+            for row in first_rows:
+                row_start, row_stop = block.indptr[row], block.indptr[row + 1]
+                terminal = int(terminals[row])
+                paths[terminal] = block.indices[row_start:row_stop].astype(
+                    np.int64, copy=True,
+                )
+            paths_by_tree.append((terminals, paths))
+
+        if training:
+            self._relation_feature_cache[cache_key] = paths_by_tree
+        return paths_by_tree
+
+    @staticmethod
+    def _englund_tree_kernel(
+        query_terminals: np.ndarray,
+        query_paths: dict[int, np.ndarray],
+        train_terminals: np.ndarray,
+        train_paths: dict[int, np.ndarray],
+        weight: float,
+    ) -> np.ndarray:
+        """Compute one tree's terminal-node branch-distance kernel."""
+
+        query_unique, query_inverse = np.unique(query_terminals, return_inverse=True)
+        train_unique, train_inverse = np.unique(train_terminals, return_inverse=True)
+        leaf_kernel = np.empty(
+            (query_unique.size, train_unique.size), dtype=np.float64,
+        )
+
+        for query_idx, query_terminal in enumerate(query_unique):
+            query_path = query_paths[int(query_terminal)]
+            for train_idx, train_terminal in enumerate(train_unique):
+                train_path = train_paths[int(train_terminal)]
+                common_length = min(query_path.size, train_path.size)
+                mismatch = np.flatnonzero(
+                    query_path[:common_length] != train_path[:common_length]
+                )
+                common_length = int(mismatch[0]) if mismatch.size else common_length
+                branch_distance = query_path.size + train_path.size - 2 * common_length
+                leaf_kernel[query_idx, train_idx] = np.exp(
+                    -weight * float(branch_distance)
+                )
+
+        return leaf_kernel[query_inverse[:, None], train_inverse[None, :]]
+
+    def _englund_relation(self, X_new: Any | None) -> MatrixLike:
+        """Compute the Englund–Verikas PBK over all fitted forest trees."""
+
+        if self._X_train is None:
+            raise RuntimeError("Training features are unavailable for relation dispatch.")
+        train_paths = self._englund_paths(self._X_train, training=True)
+        query_paths = train_paths if X_new is None else self._englund_paths(X_new, training=False)
+        if len(query_paths) != len(train_paths):
+            raise RuntimeError("Query and training forests have different tree counts.")
+
+        n_query = query_paths[0][0].shape[0] if query_paths else 0
+        n_train = train_paths[0][0].shape[0] if train_paths else 0
+        result = np.zeros((n_query, n_train), dtype=np.float64)
+        for (query_terminals, query_tree_paths), (train_terminals, train_tree_paths) in zip(
+            query_paths, train_paths,
+        ):
+            result += self._englund_tree_kernel(
+                query_terminals,
+                query_tree_paths,
+                train_terminals,
+                train_tree_paths,
+                self.englund_weight,
+            )
+        if train_paths:
+            result /= float(len(train_paths))
+
+        if self.matrix_type == "dense":
+            return result
+        return sparse.csr_matrix(result)
+
     @staticmethod
     def _node_depths(tree: Any) -> np.ndarray:
         children_left = np.asarray(tree.children_left)
@@ -684,6 +832,28 @@ class Proximity:
                     stack.append(int(child))
         return depths
 
+    def _forest_node_depths(self) -> list[np.ndarray]:
+        """Return node depths using the estimator's declared tree layout."""
+
+        if _is_rotation_forest_instance(self.estimator):
+            return rotation_forest_node_depths(self.estimator)
+
+        depths: list[np.ndarray] = []
+        for tree in self.estimators_:
+            adapter_depths = getattr(tree, "node_depths_", None)
+            if adapter_depths is not None:
+                depths.append(np.asarray(adapter_depths, dtype=np.int32))
+                continue
+            tree_state = getattr(tree, "tree_", None)
+            if tree_state is None:
+                raise UnsupportedRelationError(
+                    self.capabilities_.family if self.capabilities_ else "unknown",
+                    self.relation,
+                    "the estimator does not expose per-tree node depths",
+                )
+            depths.append(self._node_depths(tree_state))
+        return depths
+
     def _random_height_features(self, X: Any, *, training: bool) -> sparse.csr_matrix:
         cache_key = "random_height"
         if training and cache_key in self._relation_feature_cache:
@@ -692,7 +862,13 @@ class Proximity:
         estimators = list(self.estimators_)
         if training:
             rng = np.random.default_rng(self.random_state)
-            depths = [self._node_depths(tree.tree_) for tree in estimators]
+            depths = self._forest_node_depths()
+            if len(depths) != len(estimators):
+                raise RuntimeError("Node-depth inventory does not match fitted tree inventory.")
+            for tree_idx, depth in enumerate(depths):
+                expected = int(node_ptr[tree_idx + 1] - node_ptr[tree_idx])
+                if depth.shape != (expected,):
+                    raise RuntimeError("Node-depth inventory does not match decision-path offsets.")
             heights = np.asarray(
                 [rng.integers(0, int(depth.max()) + 1) for depth in depths],
                 dtype=np.int32,
@@ -2455,7 +2631,7 @@ class Proximity:
 
         if self.prox_method in {
             "original", "collision", "survival_leaf",
-            "kerf", "path", "random_height",
+            "kerf", "path", "englund", "random_height",
         }:
             weights = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
 
@@ -2630,7 +2806,7 @@ class Proximity:
 
         elif self.prox_method in {
             "original", "collision", "survival_leaf",
-            "kerf", "path", "random_height",
+            "kerf", "path", "englund", "random_height",
         }:
             vals = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
 
@@ -2677,30 +2853,11 @@ class Proximity:
             raise RuntimeError("RotationForest surrogate estimators are not initialized.")
 
         with _suppress_base_validate_data_futurewarning():
-            X_proc = self._check_X(X)
-            X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-            X_proc = X_proc[:, self._useful_atts]
-            X_proc = (X_proc - self._min) / self._ptp
-
-            leaves: List[np.ndarray] = []
-            for t, surrogate in enumerate(surrogate_estimators):
-                pcas = self._pcas[t]
-                groups = self._groups[t]
-
-                X_t = np.concatenate(
-                    [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-                    axis=1,
-                )
-                X_t = X_t.astype(np.float32)
-                X_t = np.nan_to_num(
-                    X_t,
-                    copy=False,
-                    nan=0.0,
-                    posinf=float(np.finfo(np.float32).max),
-                    neginf=float(np.finfo(np.float32).min),
-                )
-
-                leaves.append(surrogate.apply(X_t))
+            transformed = rotation_forest_transforms(self.estimator, X)
+            leaves = [
+                surrogate.apply(X_tree)
+                for surrogate, X_tree in zip(surrogate_estimators, transformed)
+            ]
 
         return np.column_stack(leaves)
 
@@ -2729,104 +2886,82 @@ class Proximity:
         in_bag_counts = np.zeros((n_samples, n_trees), dtype=np.float32)
 
         if _is_rotation_forest_instance(self):
-            if X is not None and y is not None:
-                try:
-                    train_estimate_fn = getattr(self, "_train_probas_for_estimator", None)
-                    if train_estimate_fn is None:
-                        train_estimate_fn = getattr(self, "_train_preds_for_estimator", None)
+            train_estimate_fn = getattr(self, "_train_probas_for_estimator", None)
+            if not callable(train_estimate_fn):
+                train_estimate_fn = getattr(self, "_train_preds_for_estimator", None)
+            required = (
+                X is not None,
+                y is not None,
+                callable(train_estimate_fn),
+                hasattr(self, "_base_estimator"),
+                hasattr(self, "n_cases_"),
+            )
+            if not all(required):
+                raise RuntimeError(
+                    "RotationForest OOB/RF-GAP requires aeon's private "
+                    "training-estimate contract (_train_*_for_estimator), "
+                    "fitted rotations, and the original training labels."
+                )
 
-                    if callable(train_estimate_fn):
-                        y_arr = np.asarray(y)
+            y_arr = np.asarray(y)
+            n_cases = int(self.n_cases_)
+            if n_cases != n_samples:
+                raise RuntimeError("RotationForest n_cases_ does not match attached training rows.")
 
-                        with _suppress_base_validate_data_futurewarning():
-                            X_proc = self._check_X(X)
-                            X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-                            X_proc = X_proc[:, self._useful_atts]
-                            X_proc = (X_proc - self._min) / self._ptp
+            with _suppress_base_validate_data_futurewarning():
+                transformed = rotation_forest_transforms(self.estimator, X)
+            if len(transformed) != n_trees:
+                raise RuntimeError("RotationForest transformed-tree inventory changed after fitting.")
 
-                            X_t = [
-                                np.nan_to_num(
-                                    np.concatenate(
-                                        [
-                                            self._pcas[t][g_idx].transform(X_proc[:, group])
-                                            for g_idx, group in enumerate(self._groups[t])
-                                        ],
-                                        axis=1,
-                                    ).astype(np.float32),
-                                    copy=False,
-                                    nan=0.0,
-                                    posinf=float(np.finfo(np.float32).max),
-                                    neginf=float(np.finfo(np.float32).min),
-                                )
-                                for t in range(n_trees)
-                            ]
-
-                        n_cases = int(getattr(self, "n_cases_", n_samples))
-                        if n_cases != n_samples:
-                            raise ValueError("RotationForest n_cases_ does not match fit sample size.")
-
-                        rng = check_random_state(getattr(self, "random_state", None))
-                        max_int = np.iinfo(np.int32).max
-                        surrogate_estimators: List[Any] = []
-                        surrogate_leaves: List[np.ndarray] = []
-
-                        base_estimator = getattr(self, "_base_estimator", None)
-
-                        for t in range(n_trees):
-                            est_seed = rng.randint(max_int)
-                            est_rng = check_random_state(est_seed)
-
-                            # Pull OOB indices from RotationForest's own
-                            # train-estimate routine so masks match the
-                            # original model definition exactly.
-                            with _suppress_base_validate_data_futurewarning():
-                                train_result = train_estimate_fn(
-                                    X_t,
-                                    y_arr,
-                                    t,
-                                    check_random_state(est_seed),
-                                )
-                            if not isinstance(train_result, (tuple, list)) or len(train_result) != 2:
-                                raise RuntimeError("RotationForest train-estimate function returned an unexpected result.")
-                            oob_idx_model = train_result[1]
-                            oob_idx_model = np.asarray(oob_idx_model, dtype=np.int64)
-
-                            sampled = est_rng.choice(n_cases, size=n_cases, replace=True)
-
-                            if base_estimator is not None:
-                                surrogate = clone(base_estimator)
-                            else:
-                                surrogate = clone(self.estimators_[t])
-                            if hasattr(surrogate, "random_state"):
-                                surrogate.random_state = est_rng
-                            surrogate.fit(X_t[t][sampled], y_arr[sampled])
-                            surrogate_estimators.append(surrogate)
-                            surrogate_leaves.append(np.asarray(surrogate.apply(X_t[t])))
-
-                            idx, cnt = np.unique(sampled, return_counts=True)
-                            in_bag_counts[idx, t] = cnt.astype(np.float32)
-                            oob_mask[:, t] = 0
-                            oob_mask[oob_idx_model, t] = 1
-
-                        self._oob_surrogate_estimators_ = surrogate_estimators
-                        self._oob_surrogate_leaf_matrix_ = np.column_stack(surrogate_leaves)
-
-                        return oob_mask, in_bag_counts
-                except Exception:
-                    raise
-
-            rng = check_random_state(getattr(self, "random_state", None))
+            # aeon's fit and train-estimate routines advance from the parent
+            # estimator seed.  Proximity.random_state controls relation cuts,
+            # not this reconstructed resampling protocol.
+            rng = check_random_state(getattr(self.estimator, "random_state", None))
             max_int = np.iinfo(np.int32).max
+            surrogate_estimators: List[Any] = []
+            surrogate_leaves: List[np.ndarray] = []
 
             for t in range(n_trees):
-                est_rng = check_random_state(rng.randint(max_int))
-                sampled = est_rng.choice(n_samples, size=n_samples, replace=True)
+                est_seed = int(rng.randint(max_int))
+                est_rng = check_random_state(est_seed)
+
+                # This call is the contract source of truth for aeon's OOB
+                # role assignment.  Reconstruct the matching bootstrap sample
+                # from the same seed, then refuse to continue if that private
+                # contract no longer agrees with the reconstructed roles.
+                with _suppress_base_validate_data_futurewarning():
+                    train_result = train_estimate_fn(
+                        transformed, y_arr, t, check_random_state(est_seed),
+                    )
+                if not isinstance(train_result, (tuple, list)) or len(train_result) != 2:
+                    raise RuntimeError(
+                        "RotationForest training-estimate function returned an unexpected result."
+                    )
+                oob_idx = np.asarray(train_result[1], dtype=np.int64)
+                if np.any((oob_idx < 0) | (oob_idx >= n_cases)):
+                    raise RuntimeError("RotationForest training-estimate returned invalid OOB indices.")
+
+                sampled = est_rng.choice(n_cases, size=n_cases, replace=True)
+                expected_oob = np.setdiff1d(np.arange(n_cases), np.unique(sampled))
+                if not np.array_equal(np.sort(oob_idx), expected_oob):
+                    raise RuntimeError(
+                        "RotationForest training-estimate resampling no longer matches "
+                        "the synchronized aeon seed contract."
+                    )
+
+                surrogate = clone(self._base_estimator)
+                if hasattr(surrogate, "random_state"):
+                    surrogate.random_state = est_rng
+                surrogate.fit(transformed[t][sampled], y_arr[sampled])
+                surrogate_estimators.append(surrogate)
+                surrogate_leaves.append(np.asarray(surrogate.apply(transformed[t])))
 
                 idx, cnt = np.unique(sampled, return_counts=True)
                 in_bag_counts[idx, t] = cnt.astype(np.float32)
-                oob_mask[:, t] = 1
-                oob_mask[idx, t] = 0
+                oob_mask[oob_idx, t] = 1
 
+            self._oob_surrogate_estimators_ = surrogate_estimators
+            self._oob_surrogate_leaf_matrix_ = np.column_stack(surrogate_leaves)
             return oob_mask, in_bag_counts
 
         estimators_samples = getattr(self, "estimators_samples_", None)
@@ -2927,206 +3062,70 @@ class Proximity:
 
 class _RotationForestOOBAdapter:
     def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
-        if not bool(getattr(self, "_rotation_oob_score", True)):
-            return
-
         if y is None:
             return
         y_arr = np.asarray(y)
 
-        try:
-            train_proba_fn = getattr(self, "_train_probas_for_estimator", None)
-            train_pred_fn = getattr(self, "_train_preds_for_estimator", None)
-            n_trees = int(getattr(self, "_n_estimators", 0))
+        surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
+        oob_mask = getattr(self, "oob_mask_", None)
+        if surrogate_estimators is None or oob_mask is None:
+            raise RuntimeError(
+                "RotationForest OOB attributes require the synchronized aeon "
+                "training-estimate adapter to reconstruct surrogate trees."
+            )
+        if len(surrogate_estimators) != oob_mask.shape[1]:
+            raise RuntimeError("RotationForest OOB surrogate inventory does not match its OOB mask.")
 
-            if (
-                hasattr(self, "estimators_")
-                and n_trees > 0
-                and hasattr(self, "_pcas")
-                and hasattr(self, "_groups")
-                and hasattr(self, "_check_X")
-                and (callable(train_proba_fn) or callable(train_pred_fn))
-            ):
-                with _suppress_base_validate_data_futurewarning():
-                    X_proc = self._check_X(X)
-                    X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-                    X_proc = X_proc[:, self._useful_atts]
-                    X_proc = (X_proc - self._min) / self._ptp
+        with _suppress_base_validate_data_futurewarning():
+            transformed = rotation_forest_transforms(self.estimator, X)
+        if len(transformed) != len(surrogate_estimators):
+            raise RuntimeError("RotationForest transformed-tree inventory changed after fitting.")
 
-                    X_t = [
-                        np.nan_to_num(
-                            np.concatenate(
-                                [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-                                axis=1,
-                            ).astype(np.float32),
-                            copy=False,
-                            nan=0.0,
-                            posinf=float(np.finfo(np.float32).max),
-                            neginf=float(np.finfo(np.float32).min),
-                        )
-                        for pcas, groups in zip(self._pcas, self._groups)
-                    ]
+        counts = oob_mask.sum(axis=1).astype(np.int32)
+        valid = counts > 0
+        divisors = counts.astype(np.float64)
+        if not np.all(valid):
+            warn(
+                "Some inputs do not have OOB scores because no refitted OOB tree "
+                "excluded them; inspect oob_valid_mask_ before using OOB outputs.",
+                UserWarning,
+            )
+            divisors[~valid] = 1.0
 
-                rng = check_random_state(getattr(self, "random_state", None))
-                max_int = np.iinfo(np.int32).max
-                n_samples = X_proc.shape[0]
-                surrogate_estimators = getattr(self, "_oob_surrogate_estimators_", None)
-                oob_mask = getattr(self, "oob_mask_", None)
+        def publish(name: str, value: Any) -> None:
+            setattr(self, name, value)
+            setattr(self.estimator, name, value)
 
-                if surrogate_estimators is not None and oob_mask is not None:
-                    divisors = oob_mask.sum(axis=1).astype(np.float64)
+        publish("oob_counts_", counts)
+        publish("oob_valid_mask_", valid)
 
-                    if hasattr(self, "classes_"):
-                        classes = np.asarray(self.classes_)
-                        class_to_col = {cls: i for i, cls in enumerate(classes)}
-                        results = np.zeros((n_samples, classes.shape[0]), dtype=np.float64)
+        if hasattr(self.estimator, "classes_"):
+            classes = np.asarray(self.estimator.classes_)
+            class_to_col = {cls: index for index, cls in enumerate(classes)}
+            results = np.zeros((len(y_arr), len(classes)), dtype=np.float64)
+            for tree_index, surrogate in enumerate(surrogate_estimators):
+                oob_rows = np.flatnonzero(oob_mask[:, tree_index])
+                if oob_rows.size == 0:
+                    continue
+                probabilities = np.asarray(
+                    surrogate.predict_proba(transformed[tree_index][oob_rows]),
+                    dtype=np.float64,
+                )
+                for column, label in enumerate(np.asarray(surrogate.classes_)):
+                    results[oob_rows, class_to_col[label]] += probabilities[:, column]
+            oob_decision = results / divisors[:, None]
+            publish("oob_decision_function_", oob_decision)
+            publish("oob_score_", float(accuracy_score(y_arr, classes[np.argmax(oob_decision, axis=1)])))
+            return
 
-                        for t, surrogate in enumerate(surrogate_estimators):
-                            oob_idx = np.flatnonzero(oob_mask[:, t] == 1)
-                            if oob_idx.size == 0:
-                                continue
-
-                            probas = np.asarray(surrogate.predict_proba(X_t[t][oob_idx]), dtype=np.float64)
-                            mapped = np.zeros((oob_idx.size, classes.shape[0]), dtype=np.float64)
-                            surrogate_classes = np.asarray(getattr(surrogate, "classes_", classes))
-                            for j, cls in enumerate(surrogate_classes):
-                                mapped[:, class_to_col[cls]] = probas[:, j]
-
-                            results[oob_idx] += mapped
-
-                        if (divisors == 0).any():
-                            warn(
-                                (
-                                    "Some inputs do not have OOB scores. This probably means "
-                                    "too few trees were used to compute any reliable OOB "
-                                    "estimates."
-                                ),
-                                UserWarning,
-                            )
-                            divisors[divisors == 0] = 1.0
-
-                        self.oob_decision_function_ = results / divisors[:, None]
-                        y_pred = classes[np.argmax(self.oob_decision_function_, axis=1)]
-                        self.oob_score_ = float(accuracy_score(y_arr, y_pred))
-                        return
-
-                    results = np.zeros(n_samples, dtype=np.float64)
-                    for t, surrogate in enumerate(surrogate_estimators):
-                        oob_idx = np.flatnonzero(oob_mask[:, t] == 1)
-                        if oob_idx.size == 0:
-                            continue
-                        results[oob_idx] += np.asarray(surrogate.predict(X_t[t][oob_idx]), dtype=np.float64)
-
-                    if (divisors == 0).any():
-                        warn(
-                            (
-                                "Some inputs do not have OOB scores. This probably means "
-                                "too few trees were used to compute any reliable OOB "
-                                "estimates."
-                            ),
-                            UserWarning,
-                        )
-                        divisors[divisors == 0] = 1.0
-
-                    self.oob_prediction_ = results / divisors
-                    self.oob_score_ = float(r2_score(y_arr, self.oob_prediction_))
-                    return
-
-                if hasattr(self, "classes_") and callable(train_proba_fn):
-                    with _suppress_base_validate_data_futurewarning():
-                        p = [
-                            train_proba_fn(
-                                X_t,
-                                y_arr,
-                                t,
-                                check_random_state(rng.randint(max_int)),
-                            )
-                            for t in range(n_trees)
-                        ]
-                    y_probas, oobs = zip(*p)
-
-                    results = np.sum(y_probas, axis=0)
-                    divisors = np.zeros(n_samples, dtype=np.float64)
-                    for oob in oobs:
-                        for inst in oob:
-                            divisors[inst] += 1.0
-
-                    if (divisors == 0).any():
-                        warn(
-                            (
-                                "Some inputs do not have OOB scores. This probably means "
-                                "too few trees were used to compute any reliable OOB "
-                                "estimates."
-                            ),
-                            UserWarning,
-                        )
-                        divisors[divisors == 0] = 1.0
-
-                    results = results / divisors[:, None]
-
-                    classes = np.asarray(self.classes_)
-                    self.oob_decision_function_ = np.asarray(results, dtype=np.float64)
-                    y_pred = classes[np.argmax(self.oob_decision_function_, axis=1)]
-                    self.oob_score_ = float(accuracy_score(y_arr, y_pred))
-                    return
-
-                if callable(train_pred_fn):
-                    with _suppress_base_validate_data_futurewarning():
-                        p = [
-                            train_pred_fn(
-                                X_t,
-                                y_arr,
-                                t,
-                                check_random_state(rng.randint(max_int)),
-                            )
-                            for t in range(n_trees)
-                        ]
-                    y_preds, oobs = zip(*p)
-
-                    results = np.sum(y_preds, axis=0)
-                    divisors = np.zeros(n_samples, dtype=np.float64)
-                    for oob in oobs:
-                        for inst in oob:
-                            divisors[inst] += 1.0
-
-                    if (divisors == 0).any():
-                        warn(
-                            (
-                                "Some inputs do not have OOB scores. This probably means "
-                                "too few trees were used to compute any reliable OOB "
-                                "estimates."
-                            ),
-                            UserWarning,
-                        )
-                        divisors[divisors == 0] = 1.0
-
-                    results = results / divisors
-
-                    self.oob_prediction_ = np.asarray(results, dtype=np.float64)
-                    self.oob_score_ = float(r2_score(y_arr, self.oob_prediction_))
-                    return
-        except Exception:
-            raise
-
-        try:
-            oob_model = clone(self.estimator)
-
-            if hasattr(self, "classes_") and hasattr(oob_model, "fit_predict_proba"):
-                with _suppress_base_validate_data_futurewarning():
-                    oob_proba = np.asarray(oob_model.fit_predict_proba(X, y_arr), dtype=np.float64)
-                classes = np.asarray(getattr(oob_model, "classes_", self.classes_))
-
-                self.oob_decision_function_ = oob_proba
-                pred_idx = np.argmax(oob_proba, axis=1)
-                y_pred = classes[pred_idx]
-                self.oob_score_ = float(accuracy_score(y_arr, y_pred))
-                return
-
-            if hasattr(oob_model, "fit_predict"):
-                with _suppress_base_validate_data_futurewarning():
-                    oob_prediction = np.asarray(oob_model.fit_predict(X, y_arr), dtype=np.float64)
-                self.oob_prediction_ = oob_prediction
-                self.oob_score_ = float(r2_score(y_arr, oob_prediction))
-                return
-        except Exception:
-            raise
+        results = np.zeros(len(y_arr), dtype=np.float64)
+        for tree_index, surrogate in enumerate(surrogate_estimators):
+            oob_rows = np.flatnonzero(oob_mask[:, tree_index])
+            if oob_rows.size:
+                results[oob_rows] += np.asarray(
+                    surrogate.predict(transformed[tree_index][oob_rows]), dtype=np.float64,
+                )
+        oob_prediction = results / divisors
+        publish("oob_prediction_", oob_prediction)
+        publish("oob_score_", float(r2_score(y_arr, oob_prediction)))
+        return

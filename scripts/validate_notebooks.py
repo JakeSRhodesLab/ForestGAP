@@ -66,6 +66,11 @@ def validate(path: Path, *, execute: bool) -> list[str]:
         "quantile_forest_proximities.ipynb": ('relation="conditional"',),
         "random_survival_forest_proximities.ipynb": ('relation="survival_leaf"',),
         "synthetic_null_urf.ipynb": ('relation="original"', 'relation="oob"'),
+        "rotation_forest_proximities.ipynb": (
+            'relation="rfgap"', '"path"', '"random_height"',
+            "prox_predict", "oob_decision_function_", "rotated_xor",
+            "UnsupervisedRandomForest", "ExtendedIsolationForest",
+        ),
     }
     for token in required_relations.get(path.name, ()):
         if token not in sources:
@@ -81,11 +86,19 @@ def validate(path: Path, *, execute: bool) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--only", metavar="NOTEBOOK", help="Validate one notebook by filename.")
     args = parser.parse_args()
-    paths = sorted((ROOT / "notebooks").glob("*.ipynb"))
-    found = {path.name for path in paths}
-    failures = [f"missing notebook {name}" for name in sorted(EXPECTED - found)]
-    failures += [f"unexpected notebook {name}" for name in sorted(found - EXPECTED)]
+    if args.only:
+        path = ROOT / "notebooks" / args.only
+        if not path.is_file():
+            parser.error(f"notebook not found: {args.only}")
+        paths = [path]
+        failures: list[str] = []
+    else:
+        paths = sorted((ROOT / "notebooks").glob("*.ipynb"))
+        found = {path.name for path in paths}
+        failures = [f"missing notebook {name}" for name in sorted(EXPECTED - found)]
+        failures += [f"unexpected notebook {name}" for name in sorted(found - EXPECTED)]
     for path in paths:
         failures.extend(f"{path.name}: {error}" for error in validate(path, execute=args.execute))
     if failures:

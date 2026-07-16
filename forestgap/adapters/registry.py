@@ -47,6 +47,7 @@ class EstimatorCapabilities:
     leaf_ids: bool
     tree_inventory: bool
     decision_paths: bool
+    node_depths: bool
     bootstrap: bool
     in_bag: bool
     oob: bool
@@ -68,24 +69,24 @@ class EstimatorCapabilities:
 METHOD_REGISTRY: Mapping[str, MethodCapability] = {
     "random_forest": MethodCapability(
         "random_forest", "available", ("classification", "regression"),
-        ("original", "oob", "rfgap", "kerf", "path", "random_height"),
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"),
     ),
     "extra_trees": MethodCapability(
         "extra_trees", "available", ("classification", "regression"),
-        ("original", "oob", "rfgap", "kerf", "path", "random_height"),
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"),
     ),
     "rotation_forest": MethodCapability(
         "rotation_forest", "optional", ("classification", "regression"),
-        ("original", "oob", "rfgap", "kerf"), "aeon",
-        "OOB/RF-GAP are enabled only when bootstrap state can be reconstructed.",
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"), "aeon",
+        "OOB/RF-GAP require aeon's synchronized training-estimate contract.",
     ),
     "treeple_oblique_forest": MethodCapability(
         "treeple_oblique_forest", "optional", ("classification", "regression"),
-        ("original", "oob", "rfgap", "kerf", "path", "random_height"), "treeple",
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"), "treeple",
     ),
     "honest_forest": MethodCapability(
         "honest_forest", "optional", ("classification",),
-        ("original", "honest_gap", "kerf"), "treeple",
+        ("original", "honest_gap", "kerf", "path", "englund", "random_height"), "treeple",
         "Prediction identity is valid only for honest_gap.",
     ),
     "isolation_forest": MethodCapability(
@@ -99,13 +100,12 @@ METHOD_REGISTRY: Mapping[str, MethodCapability] = {
     ),
     "canonical_correlation_forest": MethodCapability(
         "canonical_correlation_forest", "available", ("classification", "regression"),
-        ("original",), None,
-        "The native CCF supports original co-leaf proximity; CCF-Bag OOB/RF-GAP "
-        "semantics remain explicitly gated.",
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"), None,
+        "OOB and RF-GAP are available only for CCF-Bag (bootstrap=True).",
     ),
     "quantile_forest": MethodCapability(
         "quantile_forest", "optional", ("quantile_regression",),
-        ("conditional", "original", "kerf", "path", "random_height"),
+        ("conditional", "original", "kerf", "path", "englund", "random_height"),
         "quantile_forest",
     ),
     "random_survival_forest": MethodCapability(
@@ -114,7 +114,7 @@ METHOD_REGISTRY: Mapping[str, MethodCapability] = {
     ),
     "synthetic_null_urf": MethodCapability(
         "synthetic_null_urf", "available", ("anomaly", "clustering"),
-        ("original", "oob", "kerf", "path", "random_height"),
+        ("original", "oob", "kerf", "path", "englund", "random_height"),
     ),
     "boosted_trees": MethodCapability(
         "boosted_trees", "gated", ("classification", "regression"), (), None,
@@ -237,6 +237,7 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
             leaf_ids=callable(getattr(estimator, "apply", None)),
             tree_inventory=hasattr(estimator, "estimators_"),
             decision_paths=callable(getattr(estimator, "decision_path", None)),
+            node_depths=False,
             bootstrap=False,
             in_bag=False,
             oob=False,
@@ -251,13 +252,43 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
         "rotation_forest", "isolation_forest", "extended_isolation_forest"
     }
     inventory = hasattr(estimator, "estimators_")
-    paths = callable(getattr(estimator, "decision_path", None)) and family not in {
-        "rotation_forest", "isolation_forest", "extended_isolation_forest"
-    }
-    rotation_oob_contract = (
+    estimators = tuple(getattr(estimator, "estimators_", ()))
+    rotation_path_contract = (
         family == "rotation_forest"
         and inventory
         and all(hasattr(estimator, attr) for attr in ("_pcas", "_groups", "_check_X"))
+        and len(getattr(estimator, "_pcas", ())) == len(estimators)
+        and len(getattr(estimator, "_groups", ())) == len(estimators)
+        and all(callable(getattr(tree, "decision_path", None)) for tree in estimators)
+    )
+    paths = (
+        rotation_path_contract
+        or (
+            callable(getattr(estimator, "decision_path", None))
+            and family not in {"isolation_forest", "extended_isolation_forest"}
+        )
+    )
+    node_depths = paths and (
+        (
+            family == "rotation_forest"
+            and all(hasattr(tree, "tree_") for tree in estimators)
+        )
+        or all(
+            hasattr(tree, "node_depths_") or hasattr(tree, "tree_")
+            for tree in estimators
+        )
+    )
+    rotation_oob_contract = (
+        family == "rotation_forest"
+        and inventory
+        and len(estimators) > 0
+        and all(
+            hasattr(estimator, attr)
+            for attr in ("_pcas", "_groups", "_check_X", "_base_estimator", "n_cases_", "_n_estimators")
+        )
+        and len(getattr(estimator, "_pcas", ())) == len(estimators)
+        and len(getattr(estimator, "_groups", ())) == len(estimators)
+        and int(getattr(estimator, "_n_estimators", 0)) == len(estimators)
         and (
             callable(getattr(estimator, "_train_probas_for_estimator", None))
             or callable(getattr(estimator, "_train_preds_for_estimator", None))
@@ -267,7 +298,7 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
     bootstrap = bool(getattr(estimator, "bootstrap", False)) or rotation_oob_contract
     samples = hasattr(estimator, "estimators_samples_")
     recoverable_sklearn_bootstrap = (
-        bootstrap and inventory and all(hasattr(tree, "random_state") for tree in getattr(estimator, "estimators_", ()))
+        bootstrap and inventory and all(hasattr(tree, "random_state") for tree in estimators)
     )
     in_bag = samples or recoverable_sklearn_bootstrap or rotation_oob_contract
     oob = bootstrap and in_bag
@@ -284,10 +315,13 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
     if not leaf_ids or not inventory:
         valid -= {
             "original", "collision", "conditional", "survival_leaf", "kerf",
-            "path", "random_height",
+            "path", "englund", "random_height",
         }
     if not paths:
-        valid -= {"path", "random_height"}
+        valid.discard("path")
+        valid.discard("englund")
+    if not node_depths:
+        valid.discard("random_height")
     if not (bootstrap and in_bag and oob):
         valid.discard("oob")
     if not (bootstrap and in_bag and oob and contribution):
@@ -305,6 +339,7 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
         leaf_ids=leaf_ids,
         tree_inventory=inventory,
         decision_paths=paths,
+        node_depths=node_depths,
         bootstrap=bootstrap,
         in_bag=in_bag,
         oob=oob,

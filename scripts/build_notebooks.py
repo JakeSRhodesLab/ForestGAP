@@ -6,6 +6,7 @@ Run this script after changing a tutorial template, then execute
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 from textwrap import dedent
 
@@ -24,7 +25,7 @@ N_ESTIMATORS = 20 if SMOKE else 300
 
 SEMANTICS = """
 All examples use local synthetic data, fixed seeds, and a reduced smoke
-configuration by default. `original`, `kerf`, `path`, `random_height`, and the
+configuration by default. `original`, `kerf`, `path`, `englund`, `random_height`, and the
 separately named isolation `collision` relation are symmetric affinities.
 `rfgap`, `honest_gap`, and conditional weights are directed query-to-training
 weights; downstream visualization, clustering, or attribution must state any
@@ -322,27 +323,265 @@ prototypes = get_prototypes(proximity, k=5, n_prototypes=1)
         ],
     ),
     "rotation_forest_proximities.ipynb": notebook(
-        "Rotation Forest proximities",
-        "aeon is optional; its adapter reconstructs leaf assignments, and bootstrap relations remain capability-gated.",
+        "Forest proximity comparison with RotationForest",
+        "This 1.0 tutorial preserves the original comparison's local rotated-XOR "
+        "dataset and full forest-family roster. Each relation is composed around "
+        "an ordinary fitted estimator, which remains available as "
+        "`proximity.estimator`.",
         [
-            code(SETUP_CLASSIFICATION),
             code("""
-from forestgap import Proximity
+import numpy as np
+from sklearn.model_selection import train_test_split
+from forestgap import load_simulated_dataset
+
+# Preserve the original tutorial's deterministic default dataset.
+DATASET_NAME = "rotated_xor"
+DATASET_FEATURES = 2
+
+dataset = load_simulated_dataset(
+    DATASET_NAME,
+    n_samples=N_SAMPLES,
+    n_features=DATASET_FEATURES,
+    random_state=RANDOM_STATE,
+)
+X, y = dataset.X, dataset.y
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, stratify=y, random_state=RANDOM_STATE,
+)
+{
+    "dataset": dataset.name,
+    "description": dataset.description,
+    "shape": X.shape,
+    "class_counts": np.bincount(y).tolist(),
+}
+"""),
+            code("""
+import inspect
+
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.ensemble import ExtraTreesClassifier, IsolationForest, RandomForestClassifier
+
+from forestgap import Proximity, embed
 
 try:
     from aeon.classification.sklearn import RotationForestClassifier
 except ImportError:
     RotationForestClassifier = None
 
-if RotationForestClassifier is None:
-    result = {"status": "skipped", "reason": "install forestgap[aeon]"}
-else:
-    forest = RotationForestClassifier(
-        n_estimators=max(3, N_ESTIMATORS // 4), random_state=RANDOM_STATE, n_jobs=1,
+try:
+    from treeple import (
+        ExtendedIsolationForest,
+        ExtraObliqueRandomForestClassifier,
+        HonestForestClassifier,
+        ObliqueRandomForestClassifier,
+        PatchObliqueRandomForestClassifier,
+        UnsupervisedObliqueRandomForest,
+        UnsupervisedRandomForest,
     )
-    proximity = Proximity(forest, relation="original").fit(X_train, y_train)
-    result = {"status": "ok", "valid_relations": proximity.capabilities_.valid_relations, "shape": proximity.get_proximities().shape}
-result
+except ImportError:
+    ExtendedIsolationForest = None
+    ExtraObliqueRandomForestClassifier = None
+    HonestForestClassifier = None
+    ObliqueRandomForestClassifier = None
+    PatchObliqueRandomForestClassifier = None
+    UnsupervisedObliqueRandomForest = None
+    UnsupervisedRandomForest = None
+"""),
+            markdown("""
+## RotationForest RF-GAP identity
+
+`aeon` is optional. When installed, forestgap reconstructs aeon's per-tree
+training-estimate roles for OOB/RF-GAP and uses the fitted rotation trees for
+external-query weights. The checks below compare unsymmetrized RF-GAP weights
+with the parent forest's test and OOB probabilities. OOB rows with no excluded
+tree are reported rather than treated as an identity failure.
+"""),
+            code("""
+if RotationForestClassifier is None:
+    rotation_forest = None
+    rotation_result = {"status": "skipped", "reason": "install forestgap[aeon]"}
+else:
+    rotation_forest = RotationForestClassifier(
+        n_estimators=max(8, N_ESTIMATORS), random_state=RANDOM_STATE, n_jobs=1,
+    )
+    rotation_rfgap = Proximity(rotation_forest, relation="rfgap").fit(X_train, y_train)
+    test_weights = rotation_rfgap.prox_predict(X_test)
+    test_error = float(np.max(np.abs(test_weights - rotation_forest.predict_proba(X_test))))
+
+    oob_weights = rotation_rfgap.prox_predict()
+    oob_valid = np.asarray(rotation_rfgap.oob_valid_mask_, dtype=bool)
+    oob_reference = np.asarray(rotation_forest.oob_decision_function_)
+    oob_error = (
+        float(np.max(np.abs(oob_weights[oob_valid] - oob_reference[oob_valid])))
+        if oob_valid.any()
+        else None
+    )
+    assert test_error < 3e-5
+    if oob_error is not None:
+        assert oob_error < 3e-5
+
+    rotation_result = {
+        "status": "ok",
+        "valid_relations": rotation_rfgap.capabilities_.valid_relations,
+        "train_shape": rotation_rfgap.get_proximities().shape,
+        "test_shape": rotation_rfgap.prox_extend(X_test).shape,
+        "test_max_abs_error": test_error,
+        "oob_max_abs_error": oob_error,
+        "oob_valid_rows": int(oob_valid.sum()),
+        "oob_invalid_rows": int((~oob_valid).sum()),
+        "rfgap_diagnostics": rotation_rfgap.diagnostics(),
+    }
+rotation_result
+"""),
+            markdown("""
+## RotationForest path relations
+
+Path and random-height relations are symmetric alternatives for geometry and
+embedding. They intentionally use separate `Proximity` indexes around the
+already fitted RotationForest; no parent forest is refit.
+"""),
+            code("""
+rotation_path_rows = []
+if rotation_forest is not None:
+    for relation in ("path", "random_height"):
+        path_proximity = Proximity(
+            rotation_forest, relation=relation, random_state=RANDOM_STATE,
+        ).attach(X_train, y_train)
+        train_relation = path_proximity.get_proximities()
+        diagnostics = path_proximity.diagnostics(train_relation)
+        rotation_path_rows.append({
+            "relation": relation,
+            "train_shape": train_relation.shape,
+            "test_shape": path_proximity.prox_extend(X_test).shape,
+            "symmetric": diagnostics["symmetric"],
+            "psd": diagnostics["psd"],
+        })
+pd.DataFrame(rotation_path_rows)
+"""),
+            markdown("""
+## Full symmetric multi-forest comparison
+
+This restores the original tutorial's eleven-family roster: RandomForest,
+ExtraTrees, RotationForest, IsolationForest, three supervised oblique forests,
+HonestForest, two unsupervised forests, and Extended Isolation Forest. Optional
+families remain visible as skipped rows when their dependency is unavailable.
+
+The embedding uses `path` for supervised forests when the fitted adapter
+supports it, original co-leaf affinity as a supervised fallback, original
+co-leaf affinity for unsupervised forests, and collision affinity for isolation
+forests. RF-GAP is directed and is therefore excluded from Isomap.
+"""),
+            code("""
+def make_forest(estimator_class):
+    parameters = inspect.signature(estimator_class.__init__).parameters
+    kwargs = {"n_estimators": N_ESTIMATORS, "random_state": RANDOM_STATE}
+    if "n_jobs" in parameters:
+        kwargs["n_jobs"] = 1
+    if "bootstrap" in parameters:
+        kwargs["bootstrap"] = True
+    return estimator_class(**kwargs)
+
+
+family_specs = [
+    ("RandomForest", lambda: RandomForestClassifier(
+        n_estimators=N_ESTIMATORS, random_state=RANDOM_STATE,
+    ), "supervised", None),
+    ("ExtraTrees", lambda: ExtraTreesClassifier(
+        n_estimators=N_ESTIMATORS, bootstrap=True, random_state=RANDOM_STATE,
+    ), "supervised", None),
+    ("RotationForest", lambda: rotation_forest, "supervised", "install forestgap[aeon]"),
+    ("IsolationForest", lambda: IsolationForest(
+        n_estimators=N_ESTIMATORS, random_state=RANDOM_STATE,
+    ), "isolation", None),
+    ("ObliqueRandomForest", lambda: make_forest(ObliqueRandomForestClassifier)
+        if ObliqueRandomForestClassifier is not None else None, "supervised", "install forestgap[treeple]"),
+    ("PatchObliqueRandomForest", lambda: make_forest(PatchObliqueRandomForestClassifier)
+        if PatchObliqueRandomForestClassifier is not None else None, "supervised", "install forestgap[treeple]"),
+    ("ExtraObliqueRandomForest", lambda: make_forest(ExtraObliqueRandomForestClassifier)
+        if ExtraObliqueRandomForestClassifier is not None else None, "supervised", "install forestgap[treeple]"),
+    ("HonestForest", lambda: make_forest(HonestForestClassifier)
+        if HonestForestClassifier is not None else None, "supervised", "install forestgap[treeple]"),
+    ("UnsupervisedRandomForest", lambda: make_forest(UnsupervisedRandomForest)
+        if UnsupervisedRandomForest is not None else None, "unsupervised", "install forestgap[treeple]"),
+    ("UnsupervisedObliqueRandomForest", lambda: make_forest(UnsupervisedObliqueRandomForest)
+        if UnsupervisedObliqueRandomForest is not None else None, "unsupervised", "install forestgap[treeple]"),
+    ("ExtendedIsolationForest", lambda: make_forest(ExtendedIsolationForest)
+        if ExtendedIsolationForest is not None else None, "isolation", "install forestgap[treeple]"),
+]
+
+
+comparison_rows = []
+embeddings = {}
+for name, factory, family_type, unavailable_reason in family_specs:
+    forest = factory()
+    if forest is None:
+        comparison_rows.append({
+            "family": name,
+            "status": "skipped",
+            "reason": unavailable_reason,
+            "relation": None,
+            "parent_accuracy": None,
+            "density": None,
+        })
+        continue
+
+    initial_relation = "collision" if family_type == "isolation" else "original"
+    indexed = Proximity(forest, relation=initial_relation)
+    if family_type == "supervised":
+        indexed.fit(X_train, y_train)
+    else:
+        indexed.fit(X_train)
+    relation = (
+        "path"
+        if family_type == "supervised" and "path" in indexed.capabilities_.valid_relations
+        else initial_relation
+    )
+    proximity = indexed if relation == initial_relation else Proximity(
+        forest, relation=relation, random_state=RANDOM_STATE,
+    ).attach(X_train, y_train)
+    coordinates = embed(proximity, method="isomap", n_components=2, n_neighbors=5)
+    embeddings[name] = coordinates
+    comparison_rows.append({
+        "family": name,
+        "status": "ok",
+        "reason": None,
+        "relation": relation,
+        "parent_accuracy": (
+            float((forest.predict(X_test) == y_test).mean())
+            if family_type == "supervised"
+            else None
+        ),
+        "density": proximity.diagnostics()["density"],
+    })
+
+comparison = pd.DataFrame(comparison_rows)
+comparison
+"""),
+            code("""
+model_names = list(embeddings)
+n_models = len(model_names)
+ncols = min(4, n_models)
+nrows = int(np.ceil(n_models / ncols))
+figure, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
+for axis, name in zip(axes.ravel(), model_names):
+    coordinates = embeddings[name]
+    axis.scatter(coordinates[:, 0], coordinates[:, 1], c=y_train, cmap="tab10", s=24)
+    relation = comparison.loc[comparison["family"] == name, "relation"].iat[0]
+    axis.set(title=f"{name}: {relation}", xlabel="component 1", ylabel="component 2")
+for axis in axes.ravel()[n_models:]:
+    axis.axis("off")
+figure.suptitle(f"Forest-relation embeddings: {dataset.name}", y=1.02)
+figure.tight_layout()
+"""),
+            markdown("""
+## Reading the comparison
+
+The restored rotated-XOR data makes the contrast between axis-aligned and
+rotated/oblique partition geometries visible. Parent accuracy is reported only
+as context; compare embeddings only among rows with the same declared
+symmetric relation. Use the RF-GAP section above—not these embeddings—when
+checking RotationForest prediction identity.
 """),
         ],
     ),
@@ -556,10 +795,17 @@ native_observed_scores = forest.score_samples(X)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--only", choices=sorted(TUTORIALS),
+        help="Regenerate one notebook without rewriting the rest.",
+    )
+    args = parser.parse_args()
     NOTEBOOKS.mkdir(exist_ok=True)
-    for filename, nb in TUTORIALS.items():
+    tutorials = {args.only: TUTORIALS[args.only]} if args.only else TUTORIALS
+    for filename, nb in tutorials.items():
         nbf.write(nb, NOTEBOOKS / filename)
-    print(f"wrote {len(TUTORIALS)} notebooks")
+    print(f"wrote {len(tutorials)} notebooks")
 
 
 if __name__ == "__main__":

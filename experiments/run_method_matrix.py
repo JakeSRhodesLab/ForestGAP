@@ -66,6 +66,10 @@ ESTIMATORS: dict[str, EstimatorFactory] = {
     "ccf": lambda n, seed: CanonicalCorrelationForestClassifier(
         n_estimators=n, max_depth=10, random_state=seed,
     ),
+    "ccf_bag": lambda n, seed: CanonicalCorrelationForestClassifier(
+        n_estimators=n, max_depth=10, bootstrap=True, oob_score=True,
+        random_state=seed,
+    ),
 }
 
 
@@ -170,8 +174,8 @@ def write_rows(rows: list[dict[str, Any]], output: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--estimators", default="random_forest,extra_trees,ccf")
-    parser.add_argument("--relations", default="original,oob,rfgap,kerf,path,random_height")
+    parser.add_argument("--estimators", default="random_forest,extra_trees,ccf,ccf_bag")
+    parser.add_argument("--relations", default="original,oob,rfgap,kerf,path,englund,random_height")
     parser.add_argument("--applications", default="prediction,clustering,retrieval")
     parser.add_argument("--data-regimes", default="axis_aligned,rotated_oblique,correlated_oblique")
     parser.add_argument("--seeds", default="0,1,2")

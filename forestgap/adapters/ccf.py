@@ -5,8 +5,9 @@ node forms supervised canonical directions between a random subset of the
 features and the (expanded) response, then chooses the best impurity-reducing
 threshold in that projected space.  Trees are not bagged by default; local
 projection bootstrapping supplies the diversity described by Rainforth and
-Wood.  ``bootstrap=True`` is available as the CCF-Bag variant, but forestgap
-does not interpret its weights as RF-GAP weights.
+Wood.  ``bootstrap=True`` is the CCF-Bag variant. It persists each tree's
+sampled-row multiplicities so OOB and RF-GAP relations have a concrete,
+ordinary bootstrap contract, while the default CCF remains non-bagged.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import Any, Literal
 import numpy as np
 from scipy import sparse
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.metrics import r2_score
 from sklearn.utils import check_random_state
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_array, check_is_fitted, validate_data
@@ -317,6 +319,21 @@ class _CanonicalCorrelationTree:
             shape=(len(X_checked), len(self.nodes_)),
         )
 
+    @property
+    def node_depths_(self) -> np.ndarray:
+        """Depth of every node in this tree's stable, integer node layout."""
+
+        depths = np.zeros(len(self.nodes_), dtype=np.int32)
+        stack = [0]
+        while stack:
+            node_id = stack.pop()
+            node = self.nodes_[node_id]
+            if not node.is_leaf:
+                depths[node.left] = depths[node_id] + 1
+                depths[node.right] = depths[node_id] + 1
+                stack.extend((node.left, node.right))
+        return depths
+
     def predict_values(self, X: Any) -> np.ndarray:
         leaves = self.apply(X)
         return np.vstack([self.nodes_[int(leaf)].value for leaf in leaves])
@@ -337,6 +354,7 @@ class _CanonicalCorrelationForestBase(BaseEstimator):
         min_samples_leaf: int = 1,
         projection_bootstrap: bool = True,
         bootstrap: bool = False,
+        oob_score: bool = False,
         regularization: float = 1e-4,
         random_state: int | None = None,
     ) -> None:
@@ -347,6 +365,7 @@ class _CanonicalCorrelationForestBase(BaseEstimator):
         self.min_samples_leaf = min_samples_leaf
         self.projection_bootstrap = projection_bootstrap
         self.bootstrap = bootstrap
+        self.oob_score = oob_score
         self.regularization = regularization
         self.random_state = random_state
 
@@ -359,6 +378,12 @@ class _CanonicalCorrelationForestBase(BaseEstimator):
             raise ValueError("min_samples_split must be at least 2")
         if self.min_samples_leaf < 1:
             raise ValueError("min_samples_leaf must be at least 1")
+        if not isinstance(self.bootstrap, (bool, np.bool_)):
+            raise ValueError("bootstrap must be a boolean")
+        if not isinstance(self.oob_score, (bool, np.bool_)):
+            raise ValueError("oob_score must be a boolean")
+        if self.oob_score and not self.bootstrap:
+            raise ValueError("oob_score=True requires bootstrap=True for CCF-Bag")
         if self.regularization <= 0:
             raise ValueError("regularization must be positive")
 
@@ -389,6 +414,48 @@ class _CanonicalCorrelationForestBase(BaseEstimator):
             self.estimators_samples_.append(indices)
         importances = np.vstack([tree.feature_importances_ for tree in self.estimators_])
         self.feature_importances_ = importances.mean(axis=0)
+
+    def _set_oob_predictions(self, X: np.ndarray) -> None:
+        """Calculate CCF-Bag OOB outputs from persisted sampled-row inventories."""
+
+        if not (self.bootstrap and self.oob_score):
+            return
+
+        n_samples = X.shape[0]
+        counts = np.zeros(n_samples, dtype=np.int32)
+        if self._task == "classification":
+            totals = np.zeros((n_samples, self.n_classes_), dtype=float)
+        else:
+            totals = np.zeros((n_samples, self.n_outputs_), dtype=float)
+
+        for tree, sampled in zip(self.estimators_, self.estimators_samples_):
+            in_bag = np.zeros(n_samples, dtype=bool)
+            in_bag[np.unique(np.asarray(sampled, dtype=np.int64))] = True
+            oob_rows = np.flatnonzero(~in_bag)
+            if oob_rows.size == 0:
+                continue
+            totals[oob_rows] += tree.predict_values(X[oob_rows])
+            counts[oob_rows] += 1
+
+        valid = counts > 0
+        divisors = counts.astype(float)
+        divisors[~valid] = 1.0
+        self.oob_counts_ = counts
+        self.oob_valid_mask_ = valid
+
+        if self._task == "classification":
+            self.oob_decision_function_ = totals / divisors[:, None]
+            self.oob_score_ = float(
+                np.mean(
+                    self.classes_[np.argmax(self.oob_decision_function_, axis=1)]
+                    == self._y_original_
+                )
+            )
+            return
+
+        predictions = totals / divisors[:, None]
+        self.oob_prediction_ = predictions[:, 0] if self._single_output else predictions
+        self.oob_score_ = float(r2_score(self._y_original_, self.oob_prediction_))
 
     def apply(self, X: Any) -> np.ndarray:
         check_is_fitted(self, "estimators_")
@@ -422,7 +489,9 @@ class CanonicalCorrelationForestClassifier(
         self.n_features_in_ = X_checked.shape[1]
         self.classes_, encoded = np.unique(y_checked, return_inverse=True)
         self.n_classes_ = len(self.classes_)
+        self._y_original_ = np.asarray(y_checked).copy()
         self._fit_encoded(X_checked, encoded, self.n_classes_)
+        self._set_oob_predictions(X_checked)
         return self
 
     def predict_proba(self, X: Any) -> np.ndarray:
@@ -464,7 +533,9 @@ class CanonicalCorrelationForestRegressor(
         self._single_output = y_checked.ndim == 1
         y_matrix = np.asarray(y_checked, dtype=float).reshape(len(y_checked), -1)
         self.n_outputs_ = y_matrix.shape[1]
+        self._y_original_ = np.asarray(y_checked).copy()
         self._fit_encoded(X_checked, y_matrix, self.n_outputs_)
+        self._set_oob_predictions(X_checked)
         return self
 
     def predict(self, X: Any) -> np.ndarray:

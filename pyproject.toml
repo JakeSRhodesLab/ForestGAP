@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 openml = ["openml"]
 treeple = ["treeple==0.10.3"]
-aeon = ["aeon"]
+aeon = ["aeon>=1.0,<1.4"]
 quantile = ["quantile-forest"]
 survival = ["scikit-survival>=0.26,<0.27"]
 phate = ["phate", "graphtools"]
