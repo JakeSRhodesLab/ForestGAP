@@ -39,6 +39,7 @@ import pandas as pd
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from forestgap import local_feature_importance
 from experiments.common import (
     add_common_arguments,
     available_model_names,
@@ -97,7 +98,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 dataset_id=dataset_id,
                                 task_id=task_id,
                                 random_state=random_state,
-                                reason="local_feature_importance is only implemented for classifiers in forestgap.core",
+                                reason="the standalone local_feature_importance application is classification-only",
                             )
                         )
                         continue
@@ -170,7 +171,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
                         importance_start = time.perf_counter()
                         importance_pred = np.asarray(
-                            model.local_feature_importance(
+                            local_feature_importance(
+                                model,
                                 X_query,
                                 perturbation="auto",
                                 n_repeats=args.n_repeats,
@@ -179,7 +181,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             dtype=np.float64,
                         )
                         importance_true = np.asarray(
-                            model.local_feature_importance(
+                            local_feature_importance(
+                                model,
                                 X_query,
                                 labels=y_query,
                                 perturbation="auto",

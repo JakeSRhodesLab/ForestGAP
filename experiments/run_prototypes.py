@@ -25,6 +25,7 @@ from sklearn.model_selection import train_test_split
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from forestgap import get_prototypes
 from experiments.common import (
     PreparedDataset,
     add_common_arguments,
@@ -839,7 +840,8 @@ def _evaluate_case(
     forest_accuracy = float(accuracy_score(prepared.y_test, forest_pred))
 
     prototype_start = time.perf_counter()
-    prototypes = model.get_prototypes(
+    prototypes = get_prototypes(
+        model,
         k=args.k,
         n_prototypes=args.n_prototypes,
         categorical_features=prepared.categorical_indices,
@@ -1010,7 +1012,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                     dataset_id=dataset_id,
                                     task_id=task_id,
                                     random_state=random_state,
-                                    reason="get_prototypes is only implemented for classifiers in forestgap.core",
+                                    reason="the standalone get_prototypes application is classification-only",
                                     extra_fields={
                                         "suite_name": "OpenML-CTR23",
                                         "prox_method": prox_method,

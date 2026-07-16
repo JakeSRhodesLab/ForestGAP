@@ -1,0 +1,27 @@
+{
+  "fixture_version": 1,
+  "source": {
+    "implementation": "twgr/ccfs MATLAB",
+    "repository": "https://github.com/twgr/ccfs",
+    "commit": "f4b7bf45958f089d5c75441b35a95d62572e4559",
+    "oracle_path": "src/training/twoPointMaxMarginSplit.m",
+    "derivation": "The source has an exact two-unique-row branch: its maximum-margin plane is perpendicular to the two points and halfway between them. The expected leaf outputs below therefore have no floating-point or stochastic ambiguity."
+  },
+  "estimator_parameters": {
+    "n_estimators": 1,
+    "max_features": "all",
+    "projection_bootstrap": false,
+    "bootstrap": false,
+    "random_state": 0
+  },
+  "X_train": [[-1.0, 0.0], [-1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+  "X_test": [[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]],
+  "classification": {
+    "y_train": [0, 0, 1, 1],
+    "expected_predictions": [0, 0, 1]
+  },
+  "regression": {
+    "y_train": [-2.0, -2.0, 3.0, 3.0],
+    "expected_predictions": [-2.0, -2.0, 3.0]
+  }
+}

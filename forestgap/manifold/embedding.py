@@ -144,7 +144,7 @@ def transform_from_forest(
     if not hasattr(forest, "manifold_models_") or key not in forest.manifold_models_:
         raise NotFittedError(
             "No fitted Isomap manifold model is stored on this forest. "
-            "Call forest.embed(method='isomap') first."
+            "Call forestgap.embed(proximity, method='isomap') first."
         )
     if not hasattr(forest, "prox_extend"):
         raise TypeError("forest must provide prox_extend(X_new).")

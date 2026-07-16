@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forestgap"
-version = "0.1.0"
-description = "Sparse proximity computations for random forest-like ensembles"
+version = "1.0.0"
+description = "Composition-based sparse relations and applications for forest estimators"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "scipy>=1.5.0,<1.14",
@@ -19,12 +19,21 @@ dependencies = [
 [project.optional-dependencies]
 openml = ["openml"]
 treeple = ["treeple==0.10.3"]
+aeon = ["aeon"]
+quantile = ["quantile-forest"]
+survival = ["scikit-survival>=0.26,<0.27"]
 phate = ["phate", "graphtools"]
 umap = ["umap-learn"]
 manifold = ["phate", "graphtools", "umap-learn"]
 dev = [
+    "build",
     "pytest",
+    "nbclient",
+    "nbformat",
 ]
 
 [tool.setuptools.packages.find]
 include = ["forestgap*"]
+
+[tool.setuptools.package-data]
+"forestgap.adapters" = ["fixtures/*.json"]

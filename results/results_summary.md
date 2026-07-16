@@ -70,7 +70,7 @@ Smoke-test evidence:
 Date: April 23, 2026
 
 Status:
-- `experiments/run_prototypes.py` was rewritten around the existing `model.get_prototypes(...)` extraction path.
+- `experiments/run_prototypes.py` used the pre-1.0 bound prototype extraction path; current runs use `get_prototypes(proximity, ...)`.
 - `experiments/common.py` gained a small estimator-parameter introspection helper so the prototype benchmark only requests OOB diagnostics when the estimator family supports them cleanly.
 - The full OpenML-CC18 prototype sweep has not been rerun yet after this redesign.
 - The notes below describe the new design and the smoke tests that validated the updated raw and compiled outputs.
@@ -100,7 +100,7 @@ Updated prototype design:
   `run_prototypes.py` now records unsupported rows for every requested model family and every proximity mode on `OpenML-CTR23`, rather than skipping regression silently.
 
 Learned path and baseline:
-- Prototype extraction still goes through `model.get_prototypes(k=..., n_prototypes=..., categorical_features=...)`.
+- Current prototype extraction uses `get_prototypes(proximity, k=..., n_prototypes=..., categorical_features=...)`.
 - The required baseline is now implemented:
   `random_same_class_center`.
 - For each learned run, the benchmark samples classwise random centers with the same requested `k` and `n_prototypes`, builds neighborhoods using the same fitted proximity matrix and the same within-class neighborhood-removal rule, and repeats that baseline multiple times with deterministic seeds.
@@ -189,10 +189,10 @@ Coverage:
   Regression: `2100/2170` rows succeeded; `70` `HonestForest` regression rows were unsupported.
 - `prototypes`
   Classification: `862/864` rows succeeded; `2` `HonestForest` rows errored.
-  Regression: `420/420` rows were logged as unsupported because prototypes are classifier-only in `forestgap.core`.
+  Regression: `420/420` rows were logged as unsupported because the prototype application is classifier-only.
 - `local_feature_importance`
   Classification: `720/864` rows succeeded; `144` `HonestForest` rows were logged as unsupported because the current build segfaults during fit.
-  Regression: `420/420` rows were logged as unsupported because local feature importance is classifier-only in `forestgap.core`.
+  Regression: `420/420` rows were logged as unsupported because local feature importance is classifier-only.
 - `mds_visualization`
   Classification: `860/864` rows succeeded; `4` `HonestForest` rows errored.
   Regression: `350/420` rows succeeded; `70` `HonestForest` regression rows were unsupported.
@@ -235,7 +235,7 @@ Runtime notes:
 
 Important limitations:
 - `HonestForestRegressor` is not available in the current environment, so all regression `HonestForest` rows are unsupported.
-- `get_prototypes()` and `local_feature_importance()` remain classifier-only in `forestgap.core`.
+- The standalone `get_prototypes()` and `local_feature_importance()` applications remain classifier-only.
 - Several small or highly imbalanced CC18 datasets still fail for `HonestForest` because the least-populated class can drop below `2` after the capped split.
 - Some imputation rows still fail on datasets where NaNs remain unacceptable to specific estimators after the masking workflow.
 
@@ -296,9 +296,9 @@ Date: April 28, 2026
 
 ### Experiment Design
 
-The local feature importance benchmark evaluates whether proximity-based local feature importances, as implemented in `forestgap.core`, identify genuinely informative features for individual predictions on classification tasks.
+The local feature importance benchmark evaluates whether the standalone proximity-based application identifies genuinely informative features for individual predictions on classification tasks.
 
-**Scope:** Classification only (`OpenML-CC18`). Regression is unsupported by `forestgap.core`. `HonestForest` is excluded because the current treeple build segfaults during fit on this sweep.
+**Scope:** Classification only (`OpenML-CC18`). Regression is unsupported by the application. `HonestForest` is excluded because the treeple build used for this legacy sweep segfaulted during fit.
 
 **Coverage:** `720/864` rows succeeded; `144` `HonestForest` rows were logged as unsupported.
 

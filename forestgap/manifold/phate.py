@@ -161,7 +161,7 @@ def transform_phate_from_forest(
     if not hasattr(forest, "manifold_models_") or model_key not in forest.manifold_models_:
         raise NotFittedError(
             "No fitted PHATE manifold model is stored on this forest. "
-            "Call forest.embed(method='phate') first."
+            "Call forestgap.embed(proximity, method='phate') first."
         )
     if not hasattr(forest, "prox_extend"):
         raise TypeError("forest must provide prox_extend(X_new).")

@@ -50,7 +50,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from forestgap import load_openml_dataset, with_sparse_proximity
+from forestgap import Proximity, impute, load_openml_dataset
 
 
 TaskKind = Literal["classification", "regression"]
@@ -847,24 +847,26 @@ def build_proximity_model(
         raise ValueError(f"Model {model_name!r} is not available for task_kind={task_kind!r}.")
 
     base_cls = spec.estimator_cls
-    prox_cls = with_sparse_proximity(base_cls)
     kwargs = {
         "n_estimators": n_estimators,
         "random_state": random_state,
-        "prox_method": prox_method,
-        "matrix_type": "sparse",
-        "n_jobs": int(os.environ.get("FORESTGAP_N_JOBS", "-1")),
     }
     signature = inspect.signature(base_cls.__init__)
+    if "n_jobs" in signature.parameters:
+        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "-1"))
     if "bootstrap" in signature.parameters:
         kwargs["bootstrap"] = bootstrap
     if "oob_score" in signature.parameters:
         kwargs["oob_score"] = oob_score
-    elif oob_score:
-        kwargs["oob_score"] = oob_score
+    proximity_kwargs: dict[str, Any] = {}
     if extra_kwargs:
-        kwargs.update(extra_kwargs)
-    return prox_cls(**kwargs)
+        for key, value in extra_kwargs.items():
+            if key in {"matrix_type", "non_zero_diagonal", "symm_mode", "max_normalize"}:
+                proximity_kwargs[key] = value
+            else:
+                kwargs[key] = value
+    estimator = base_cls(**kwargs)
+    return Proximity(estimator, relation=prox_method, matrix_type="sparse", **proximity_kwargs)
 
 
 def build_outlier_model(
@@ -882,15 +884,13 @@ def build_outlier_model(
         raise ValueError(f"Outlier model {model_name!r} is not available for task_kind={task_kind!r}.")
 
     base_cls = spec.estimator_cls
-    prox_cls = with_sparse_proximity(base_cls)
     signature = inspect.signature(base_cls.__init__)
     kwargs: dict[str, Any] = {
         "n_estimators": n_estimators,
         "random_state": random_state,
-        "prox_method": prox_method,
-        "matrix_type": "sparse",
-        "n_jobs": int(os.environ.get("FORESTGAP_N_JOBS", "-1")),
     }
+    if "n_jobs" in signature.parameters:
+        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "-1"))
 
     if spec.model_family == "supervised_forest":
         if "bootstrap" in signature.parameters:
@@ -916,7 +916,7 @@ def build_outlier_model(
             spec.supports_native_scores and spec.native_scores_share_fit_across_prox_methods
         ),
     }
-    return prox_cls(**kwargs), spec, fit_metadata
+    return Proximity(base_cls(**kwargs), relation=prox_method, matrix_type="sparse"), spec, fit_metadata
 
 
 def fit_outlier_model(model: Any, spec: OutlierModelSpec, X: np.ndarray, y: np.ndarray) -> Any:
@@ -1495,7 +1495,8 @@ def iterative_imputation(
         model.fit(current_train, prepared.y_train)
         fit_runtime_seconds += time.perf_counter() - fit_start
         impute_start = time.perf_counter()
-        current_train, current_test = model.impute(
+        current_train, current_test = impute(
+            model,
             X_train_masked,
             categorical_features=prepared.categorical_indices,
             X_test=X_test_masked,

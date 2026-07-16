@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from forestgap import plot_mds
 from experiments.common import (
     add_common_arguments,
     available_model_names,
@@ -95,7 +96,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         model.fit(X_train_filled, y_train)
                         fit_runtime_seconds = time.perf_counter() - fit_start
                         plot_start = time.perf_counter()
-                        fig = model.plot_mds(y=y_train)
+                        fig = plot_mds(model, y=y_train)
                         out_dir = compiled_output_dir(EXPERIMENT_NAME, task_kind)
                         filename = f"{_safe_slug(model_name)}__{_safe_slug(prepared.dataset_name)}__seed{random_state}.png"
                         path = out_dir / filename

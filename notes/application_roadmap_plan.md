@@ -57,7 +57,7 @@ Correct the current evidence boundary by adding the earlier proximity-based conf
    - Record code revision, configuration, dataset/split identifiers, runtime, memory, and failure status.
 
 3. **Architecture**
-   - Preserve the public `with_sparse_proximity`, `get_proximities`, and `prox_extend` APIs.
+   - Preserve proximity operation names on the public `Proximity` composition API.
    - Extract an adapter-capability contract covering leaf assignment, estimator inventory, task type, in-bag multiplicities, OOB/query masks, and tree contribution weights.
    - Separate estimator adapters, relation constructors, and downstream application modules.
    - Reject scientifically invalid combinations explicitly—for example, ordinary RF-GAP semantics on boosted, Bayesian, or isolation ensembles without the required bootstrap structure.

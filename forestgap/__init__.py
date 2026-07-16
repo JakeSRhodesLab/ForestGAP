@@ -1,23 +1,38 @@
-"""
-forestgap: Sparse proximity computations for random forest-like ensembles.
+"""Composition-based sparse relations and applications for forest estimators."""
 
-This package provides a mixin and factory pattern for adding sparse proximity
-computations to forest-based estimators from scikit-learn and aeon.
-
-Main exports:
-    - SparseProximityMixin: Mixin class for sparse proximity computation
-    - with_sparse_proximity: Decorator/factory for creating proximity-enabled estimators
-    - _RotationForestApplyAdapter: Adapter for aeon's RotationForest models
-
-Manifold applications are available from fitted proximity-enabled forests via
-``forest.embed(...)`` and from the ``forestgap.manifold`` namespace.
-"""
-
-from forestgap.core import (
-    SparseProximityMixin,
-    with_sparse_proximity,
-    _RotationForestApplyAdapter,
+from forestgap.adapters import (
+    CanonicalCorrelationForestClassifier,
+    CanonicalCorrelationForestRegressor,
+    SyntheticNullForest,
+    UnsupportedRelationError,
+    capabilities_for,
+    method_registry_rows,
 )
+from forestgap.applications import (
+    ProximityKernelPredictor,
+    conditional_distribution_weights,
+    conditional_quantiles,
+    embed,
+    embed_transform,
+    get_prototypes,
+    impute,
+    instance_attributions,
+    knn_predict,
+    local_feature_importance,
+    native_anomaly_scores,
+    neighborhood_feature_scores,
+    outlier_scores,
+    plot_mds,
+    prediction_identity,
+    proximity_clustering,
+    retrieve_neighbors,
+    retrieval_metrics,
+    select_active_batch,
+    select_features,
+    split_conformal_classification,
+    split_conformal_regression,
+)
+from forestgap.proximity import Proximity
 from forestgap.datasets import (
     OpenMLBenchmarkSuite,
     OpenMLDataset,
@@ -37,11 +52,37 @@ from forestgap.datasets import (
     make_sparse_oblique_hyperplane,
 )
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __all__ = [
-    "SparseProximityMixin",
-    "with_sparse_proximity",
-    "_RotationForestApplyAdapter",
+    "Proximity",
+    "CanonicalCorrelationForestClassifier",
+    "CanonicalCorrelationForestRegressor",
+    "ProximityKernelPredictor",
+    "SyntheticNullForest",
+    "UnsupportedRelationError",
+    "capabilities_for",
+    "conditional_distribution_weights",
+    "conditional_quantiles",
+    "embed",
+    "embed_transform",
+    "get_prototypes",
+    "impute",
+    "instance_attributions",
+    "knn_predict",
+    "local_feature_importance",
+    "method_registry_rows",
+    "native_anomaly_scores",
+    "neighborhood_feature_scores",
+    "outlier_scores",
+    "plot_mds",
+    "prediction_identity",
+    "proximity_clustering",
+    "retrieve_neighbors",
+    "retrieval_metrics",
+    "select_active_batch",
+    "select_features",
+    "split_conformal_classification",
+    "split_conformal_regression",
     "OpenMLBenchmarkSuite",
     "OpenMLDataset",
     "SyntheticDataset",

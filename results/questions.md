@@ -12,7 +12,7 @@ Is that a known property of the honest variant under the proximity wrapper, or d
 Those failures come from NaNs reaching estimators that do not accept them, and from a few `HonestForest` class-balance failures on tiny splits.
 Should the imputation pipeline explicitly drop fully missing columns or add another deterministic fill step before estimator fitting?
 
-4. `get_prototypes()` and `local_feature_importance()` are still classifier-only in `forestgap.core`.
+4. The standalone `get_prototypes()` and `local_feature_importance()` applications are still classifier-only.
 Do you want those APIs extended to regression, or is classification-only the intended scope?
 
 5. `RotationForest` is often competitive in quality but dominates runtime across multiple applications.

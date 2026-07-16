@@ -11,6 +11,7 @@ import pandas as pd
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from forestgap import outlier_scores
 from experiments.common import (
     OUTLIER_PROX_METHODS,
     OUTLIER_SCORE_METHODS,
@@ -268,7 +269,12 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
                         try:
                             native_scores = None
-                            for prox_method in OUTLIER_PROX_METHODS:
+                            prox_methods = (
+                                ("collision",)
+                                if model_name in {"IsolationForest", "ExtendedIsolationForest"}
+                                else OUTLIER_PROX_METHODS
+                            )
+                            for prox_method in prox_methods:
                                 model, spec, fit_metadata = build_outlier_model(
                                     task_kind,
                                     model_name=model_name,
@@ -306,7 +312,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                     for label_mode in outlier_label_modes(task_kind, model_name):
                                         score_labels = prepared.y_train if label_mode == "supervised" else None
                                         score_start = time.perf_counter()
-                                        scores = model.outlier_scores(score_labels, method=score_method)
+                                        scores = outlier_scores(model, score_labels, method=score_method)
                                         score_runtime_seconds = time.perf_counter() - score_start
                                         append_proximity_row(
                                             rows=rows,

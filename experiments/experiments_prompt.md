@@ -187,9 +187,9 @@ First review:
 
 Important notebook-alignment requirements:
 - Mirror the import / wrapping patterns already used in the notebooks.
-- Use `with_sparse_proximity(...)` from `forestgap`.
+- Compose estimator instances with `Proximity(estimator, relation=...)` from `forestgap`.
 - For sklearn isolation models, native anomaly scores should be `-score_samples(X)` so that larger means “more anomalous”.
-- For proximity-based unsupervised scores, use `model.outlier_scores()` with no labels.
+- For relation-based unsupervised scores, use `outlier_scores(proximity)`; isolation models use native `score_samples`.
 - For supervised forests, preserve the option to use label-aware proximity outlier scores where appropriate.
 - Follow the notebook fitting conventions:
   - supervised models fit with `fit(X, y)`
@@ -381,7 +381,7 @@ First review:
 - ObliqueProximitiesCode/papers/ExplicatingFeature.pdf
 
 Current limitations to address:
-- the benchmark is currently classification-only because `local_feature_importance()` is classifier-only in `forestgap.core`
+- the standalone local feature importance application is currently classification-only
 - it only uses `prox_method="original"`
 - it only uses `perturbation="auto"`
 - it only samples a small test-query subset and evaluates mostly whether perturbing the top-ranked feature drops predicted probability more than perturbing a random feature
@@ -389,10 +389,10 @@ Current limitations to address:
 - HonestForest is currently unstable here; keep unsupported/error rows explicit if that remains true
 
 Goal:
-Design a stronger validation suite for proximity-based local feature importance that is faithful to the Whitmore / ExplicatingFeature methodology, but also validates the generalized implementation actually present in `forestgap.core`. If the paper does not fully specify benchmark methodology, devise additional validation methods and document the reasoning.
+Design a stronger validation suite for the standalone proximity-based local feature importance application that is faithful to the Whitmore / ExplicatingFeature methodology. If the paper does not fully specify benchmark methodology, devise additional validation methods and document the reasoning.
 
 Scope:
-- Keep classification as the default supported scope unless you intentionally and safely extend `forestgap.core` to regression.
+- Keep classification as the declared supported scope unless the standalone application is intentionally and safely extended to regression.
 - If regression is not extended, continue logging explicit unsupported rows for regression rather than silently skipping it.
 
 Methodology requirements:
@@ -688,7 +688,7 @@ First review:
 - ObliqueProximitiesCode/notes/proximity_applications_summary.md
 
 Current limitations to address:
-- the benchmark is currently classification-only because `get_prototypes()` is classifier-only in `forestgap.core`
+- the standalone prototype application is currently classification-only
 - it only uses `prox_method="original"`
 - it evaluates prototypes mostly with:
   - `same_class_neighbor_fraction`
@@ -698,10 +698,10 @@ Current limitations to address:
 - it does not compare against simple prototype baselines such as random same-class centers
 
 Goal:
-Strengthen the proximity-based prototype benchmark so it evaluates whether selected prototypes are actually representative, pure, non-redundant, stable, and useful. If the current `forestgap.core` prototype API remains classification-only, keep regression as explicit unsupported rows unless you intentionally and safely extend the core implementation.
+Strengthen the proximity-based prototype benchmark so it evaluates whether selected prototypes are actually representative, pure, non-redundant, stable, and useful. While the standalone prototype application remains classification-only, keep regression as explicit unsupported rows.
 
 Methodology requirements:
-1. Preserve the current prototype extraction path through `model.get_prototypes(...)`.
+1. Preserve prototype extraction through `get_prototypes(proximity, ...)`.
 2. Expand comparisons across proximity constructions where supported:
    - `original`
    - `oob`

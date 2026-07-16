@@ -38,6 +38,7 @@ import pandas as pd
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from forestgap import impute
 from experiments.common import (
     DEFAULT_MISSINGNESS_MECHANISMS,
     DEFAULT_MISSING_RATES,
@@ -287,7 +288,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         model.fit(X_fit_train, prepared.y_train)
                                         fit_runtime_seconds = time.perf_counter() - fit_start
                                         impute_start = time.perf_counter()
-                                        X_imp_train, X_imp_test = model.impute(
+                                        X_imp_train, X_imp_test = impute(
+                                            model,
                                             X_train_masked,
                                             categorical_features=prepared.categorical_indices,
                                             X_test=X_test_masked,

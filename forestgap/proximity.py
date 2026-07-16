@@ -1,10 +1,10 @@
+"""Composition-based forest proximity construction and relation dispatch."""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import inspect
-from inspect import Parameter, Signature
-from typing import Any, List, Literal, Optional, Protocol, Sequence, Tuple, Type, TypeVar, Union, cast, runtime_checkable
+from typing import Any, List, Literal, Optional, Protocol, Sequence, Tuple, Union, cast, runtime_checkable
 import warnings
 from warnings import warn
 
@@ -15,102 +15,33 @@ from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils import check_random_state
 from sklearn.utils.validation import check_is_fitted
 
-import matplotlib.pyplot as plt
-from sklearn.manifold import MDS
 import pandas as pd
 
+from forestgap.adapters import (
+    EstimatorCapabilities,
+    UnsupportedRelationError,
+    capabilities_for,
+    validate_relation,
+)
+from forestgap.adapters.aeon import rotation_forest_leaf_ids
+from forestgap.adapters.sklearn import isolation_leaf_ids
+from forestgap.manifold.proximity import (
+    is_symmetric,
+    prepare_proximity_affinity,
+    proximity_to_distance,
+    symmetrize_affinity,
+)
 
-def patch_treeple_regressor_tags() -> bool:
-    """Patch treeple regressor sklearn tags across sklearn versions.
-
-    treeple 0.10.3 tries to set ``tags.regressor_tags.multi_label = True`` in
-    its bundled sklearn forest regressor implementation. Some scikit-learn
-    versions do not define ``multi_label`` on ``RegressorTags``, which raises
-    ``AttributeError`` during fit.
-
-    Returns
-    -------
-    bool
-        True when the patch is installed (or already present), False when
-        treeple is unavailable.
-    """
-
-    try:
-        from treeple._lib.sklearn.ensemble._forest import ForestRegressor
-    except Exception:
-        return False
-
-    if getattr(ForestRegressor, "_forestgap_tags_patch", False):
-        return True
-
-    def _patched_sklearn_tags(self):
-        tags = super(ForestRegressor, self).__sklearn_tags__()
-        regressor_tags = getattr(tags, "regressor_tags", None)
-        if regressor_tags is not None:
-            try:
-                regressor_tags.multi_label = True
-            except AttributeError:
-                pass
-        return tags
-
-    ForestRegressor.__sklearn_tags__ = _patched_sklearn_tags
-    ForestRegressor._forestgap_tags_patch = True
-    return True
+__all__ = [
+    "Proximity",
+    "UnsupportedRelationError",
+    "is_symmetric",
+    "prepare_proximity_affinity",
+    "proximity_to_distance",
+    "symmetrize_affinity",
+]
 
 
-def patch_treeple_sample_weight_signature() -> bool:
-    """Patch treeple's vendored sklearn tree helper for sklearn>=1.7.
-
-    treeple 0.10.3 still calls ``_check_sample_weight(sample_weight, X, DOUBLE)``
-    positionally, while sklearn 1.7 makes ``dtype`` keyword-only. Patch the
-    treeple-local reference so existing call sites keep working.
-
-    Returns
-    -------
-    bool
-        True when the patch is installed (or already present), False when
-        treeple is unavailable.
-    """
-
-    try:
-        from sklearn.utils.validation import _check_sample_weight as sklearn_check_sample_weight
-        import treeple._lib.sklearn.tree._classes as treeple_tree_classes
-    except Exception:
-        return False
-
-    if getattr(treeple_tree_classes, "_forestgap_sample_weight_patch", False):
-        return True
-
-    def _patched_check_sample_weight(
-        sample_weight: Any,
-        X: Any,
-        dtype: Any = None,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        if args:
-            if dtype is None:
-                dtype = args[0]
-            else:
-                raise TypeError("dtype provided both positionally and by keyword.")
-            if len(args) > 1:
-                raise TypeError(
-                    "_check_sample_weight accepts at most one positional argument after X."
-                )
-        return sklearn_check_sample_weight(
-            sample_weight,
-            X,
-            dtype=dtype,
-            **kwargs,
-        )
-
-    treeple_tree_classes._check_sample_weight = _patched_check_sample_weight
-    treeple_tree_classes._forestgap_sample_weight_patch = True
-    return True
-
-
-patch_treeple_regressor_tags()
-patch_treeple_sample_weight_signature()
 
 
 try:
@@ -139,7 +70,18 @@ _generate_unsampled_indices = getattr(_sk_forest, "_generate_unsampled_indices",
 
 ArrayLike = Union[np.ndarray, Sequence[float]]
 MatrixLike = Union[np.ndarray, sparse.csr_matrix]
-ProxMethod = Literal["original", "oob", "rfgap", "honest_gap"]
+ProxMethod = Literal[
+    "original",
+    "oob",
+    "rfgap",
+    "honest_gap",
+    "kerf",
+    "path",
+    "random_height",
+    "collision",
+    "conditional",
+    "survival_leaf",
+]
 MatrixType = Literal["sparse", "dense"]
 SymmMode = Literal["arithmetic", "geometric", "none", None]
 
@@ -180,22 +122,6 @@ def _is_honest_forest_instance(obj: Any) -> bool:
     )
 
 
-def _is_rotation_forest_class(base_cls: Type[Any]) -> bool:
-    if any("RotationForest" in cls.__name__ for cls in base_cls.mro()):
-        return True
-    return all(hasattr(base_cls, attr) for attr in ("fit_predict", "fit_predict_proba"))
-
-
-def _is_isolation_forest_class(base_cls: Type[Any]) -> bool:
-    if any("IsolationForest" in cls.__name__ for cls in base_cls.mro()):
-        return True
-    return hasattr(base_cls, "score_samples") and hasattr(base_cls, "decision_function")
-
-
-def _is_honest_forest_class(base_cls: Type[Any]) -> bool:
-    return any("HonestForest" in cls.__name__ for cls in base_cls.mro())
-
-
 @runtime_checkable
 class ForestLike(Protocol):
     estimators_: Sequence[Any]
@@ -203,9 +129,6 @@ class ForestLike(Protocol):
 
     def apply(self, X: Any) -> np.ndarray:
         ...
-
-
-TForest = TypeVar("TForest")
 
 
 @dataclass
@@ -217,9 +140,9 @@ class _LeafEncoding:
     total_features: int
 
 
-class SparseProximityMixin:
+class Proximity:
     """
-    Sparse random-forest proximity mixin based on a `Q @ W.T` factorization.
+    Composition-based sparse forest relation index.
 
     This mixin is designed for forest-like estimators that expose:
     - `fit(X, y, ...)`
@@ -248,6 +171,53 @@ class SparseProximityMixin:
     symm_mode: SymmMode
     max_normalize: bool
 
+    def __init__(
+        self,
+        estimator: Any,
+        relation: ProxMethod = "rfgap",
+        *,
+        matrix_type: MatrixType = "sparse",
+        non_zero_diagonal: bool = False,
+        symm_mode: SymmMode = None,
+        max_normalize: bool = False,
+        random_state: int | None = None,
+    ) -> None:
+        """Create an unfitted relation index around an estimator.
+
+        ``fit`` fits the supplied estimator before indexing it; ``attach``
+        indexes an estimator that has already been fitted.  The estimator is
+        never dynamically subclassed and remains available as ``estimator``.
+        """
+
+        if estimator is None:
+            raise TypeError("estimator must be a forest-like estimator instance")
+        if isinstance(estimator, type):
+            raise TypeError("estimator must be an instance, not an estimator class")
+        self.estimator = estimator
+        self.relation = relation
+        self.random_state = random_state
+        self.capabilities_: EstimatorCapabilities | None = None
+        self.relation_metadata_: dict[str, Any] = {}
+        self._relation_feature_cache: dict[str, Any] = {}
+        self._init_sparse_proximity(
+            prox_method=relation,
+            matrix_type=matrix_type,
+            non_zero_diagonal=non_zero_diagonal,
+            symm_mode=symm_mode,
+            max_normalize=max_normalize,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate estimator state used by the sparse factor implementation."""
+
+        estimator = self.__dict__.get("estimator")
+        if estimator is None:
+            raise AttributeError(name)
+        try:
+            return getattr(estimator, name)
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+
     def _init_sparse_proximity(
         self,
         prox_method: ProxMethod = "rfgap",
@@ -256,9 +226,13 @@ class SparseProximityMixin:
         symm_mode: SymmMode = None,
         max_normalize: bool = False,
     ) -> None:
-        if prox_method not in ("original", "oob", "rfgap", "honest_gap"):
+        valid_relations = {
+            "original", "oob", "rfgap", "honest_gap", "kerf", "path",
+            "random_height", "collision", "conditional", "survival_leaf",
+        }
+        if prox_method not in valid_relations:
             raise ValueError(
-                "prox_method must be one of {'original', 'oob', 'rfgap', 'honest_gap'}"
+                f"relation must be one of {sorted(valid_relations)!r}"
             )
         if matrix_type not in ("sparse", "dense"):
             raise ValueError("matrix_type must be 'sparse' or 'dense'")
@@ -289,7 +263,7 @@ class SparseProximityMixin:
         self._X_train_columns_: Optional[pd.Index] = None
         self._X_train_was_dataframe_: bool = False
 
-    def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "SparseProximityMixin":
+    def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "Proximity":
         """
         Fit the base estimator, then build sparse proximity factors on training data.
 
@@ -304,11 +278,11 @@ class SparseProximityMixin:
 
         Returns
         -------
-        SparseProximityMixin
+        Proximity
             Fitted estimator with sparse proximity factors cached.
         """
-        base_fit = getattr(super(), "fit")
-        if _is_rotation_forest_instance(self):
+        base_fit = getattr(self.estimator, "fit")
+        if _is_rotation_forest_instance(self.estimator):
             with _suppress_base_validate_data_futurewarning():
                 if y is None:
                     base_fit(X, **fit_kwargs)
@@ -320,23 +294,46 @@ class SparseProximityMixin:
             else:
                 base_fit(X, y, **fit_kwargs)
 
-        self.prox_fit(X, y)
+        return self.attach(X, y)
+
+    def attach(self, X: Any, y: Optional[Any] = None) -> "Proximity":
+        """Index ``X`` with an already-fitted estimator and build relation state."""
+
+        check_is_fitted(self.estimator)
+        self.capabilities_ = validate_relation(self.estimator, self.relation)
+        self._index_training_data(X, y)
         self._set_rotation_forest_oob_attributes(X, y)
+        self.relation_metadata_ = self._base_relation_metadata()
         return self
 
     def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
-        super_hook = getattr(super(), "_set_rotation_forest_oob_attributes", None)
-        if callable(super_hook):
-            super_hook(X, y)
+        if _is_rotation_forest_instance(self.estimator) and self.relation in {"oob", "rfgap"}:
+            _RotationForestOOBAdapter._set_rotation_forest_oob_attributes(self, X, y)
 
     def predict(self, X: Any) -> Any:
-        base_predict = getattr(super(), "predict")
-        if _is_rotation_forest_instance(self):
+        base_predict = getattr(self.estimator, "predict")
+        if _is_rotation_forest_instance(self.estimator):
             with _suppress_base_validate_data_futurewarning():
                 return base_predict(X)
         return base_predict(X)
 
-    def prox_fit(self, X: Any, y: Optional[Any] = None) -> None:
+    def apply(self, X: Any) -> np.ndarray:
+        """Return leaf IDs through the estimator-specific apply adapter."""
+
+        apply_fn = getattr(self.estimator, "apply", None)
+        if callable(apply_fn):
+            return np.asarray(apply_fn(X))
+        if _is_rotation_forest_instance(self.estimator):
+            return rotation_forest_leaf_ids(self.estimator, X)
+        if _is_isolation_forest_instance(self.estimator):
+            return isolation_leaf_ids(self.estimator, X)
+        raise UnsupportedRelationError(
+            self.capabilities_.family if self.capabilities_ else "unknown",
+            self.relation,
+            "the estimator does not expose leaf assignments",
+        )
+
+    def _index_training_data(self, X: Any, y: Optional[Any] = None) -> None:
         """
         Build sparse factors required for proximity computations.
 
@@ -345,7 +342,7 @@ class SparseProximityMixin:
         X : array-like of shape (n_samples, n_features)
             Data used during model fitting.
         """
-        check_is_fitted(cast(Any, self))
+        check_is_fitted(self.estimator)
 
         self._y_train = np.asarray(y) if y is not None else None
         self._store_training_features(X)
@@ -421,6 +418,11 @@ class SparseProximityMixin:
         """
         self._check_proximity_ready()
 
+        if self.prox_method in {"kerf", "path", "random_height"}:
+            result = self._kernel_relation(self.prox_method, X_new=None)
+            self.relation_metadata_.update(self.diagnostics(result))
+            return result
+
         W = self.W_mat
         if W is None:
             raise RuntimeError("W matrix is not initialized.")
@@ -429,7 +431,9 @@ class SparseProximityMixin:
         if leaves is None:
             raise RuntimeError("Leaf matrix is not initialized.")
 
-        if self.prox_method in ("original", "oob"):
+        if self.prox_method in {
+            "original", "oob", "collision", "survival_leaf",
+        }:
             Q = W.copy()
         else:
             Q = self._build_Q_matrix(leaves, is_training=True)
@@ -447,7 +451,16 @@ class SparseProximityMixin:
         if self.prox_method == "oob":
             P.data = np.minimum(P.data, 1.0)
 
-        return P.toarray() if self.matrix_type == "dense" else P
+        result = P.toarray() if self.matrix_type == "dense" else P
+        self.relation_metadata_.update(self.diagnostics(result))
+        return result
+
+    def get_relation(self, relation: str | None = None) -> MatrixLike:
+        """Return the indexed training relation, optionally selecting another valid relation."""
+
+        if relation is None or relation == self.relation:
+            return self.get_proximities()
+        return self._alternate_relation(relation).get_proximities()
 
     def prox_extend(self, X_new: Any) -> MatrixLike:
         """
@@ -469,6 +482,9 @@ class SparseProximityMixin:
             `(n_test, n_train)` proximity matrix.
         """
         self._check_proximity_ready()
+
+        if self.prox_method in {"kerf", "path", "random_height"}:
+            return self._kernel_relation(self.prox_method, X_new=X_new)
 
         # RotationForest rfgap: use original-tree W (c_j=1) so that
         # P_ext @ y_train reproduces predict(X_test).
@@ -512,52 +528,203 @@ class SparseProximityMixin:
 
         return P_new.toarray() if self.matrix_type == "dense" else P_new
 
-    def embed(self, method: str = "phate", **kwargs: Any) -> np.ndarray:
-        """
-        Create a manifold embedding from this fitted forest's proximities.
+    def extend_relation(self, X_new: Any, relation: str | None = None) -> MatrixLike:
+        """Return a query-to-training relation for new observations."""
 
-        Parameters
-        ----------
-        method : {'phate', 'tsne', 'isomap', 'umap'}
-            Manifold method to fit from the training proximity matrix.
-        **kwargs : dict
-            Method-specific options forwarded to ``forestgap.manifold``.
+        if relation is None or relation == self.relation:
+            return self.prox_extend(X_new)
+        return self._alternate_relation(relation).prox_extend(X_new)
 
-        Returns
-        -------
-        embedding : ndarray of shape (n_train_samples, n_components)
-            Low-dimensional coordinates for the training samples.
-        """
-        self._check_proximity_ready()
-        from forestgap.manifold import embed_from_forest
+    def diagnostics(self, matrix: MatrixLike | None = None) -> dict[str, Any]:
+        """Summarize directionality, mass, sparsity, symmetry, and PSD evidence."""
 
-        return embed_from_forest(self, method=method, **kwargs)
+        if matrix is None:
+            matrix = self.get_proximities()
+        shape = tuple(int(value) for value in matrix.shape)
+        if sparse.issparse(matrix):
+            csr = cast(sparse.csr_matrix, matrix.tocsr())
+            nnz = int(csr.nnz)
+            values = csr.data
+            row_mass = np.asarray(csr.sum(axis=1)).ravel()
+            symmetric = shape[0] == shape[1] and (csr - csr.T).nnz == 0
+            dense_for_psd = csr.toarray() if symmetric and shape[0] <= 512 else None
+        else:
+            dense = np.asarray(matrix, dtype=float)
+            nnz = int(np.count_nonzero(dense))
+            values = dense.ravel()
+            row_mass = dense.sum(axis=1)
+            symmetric = shape[0] == shape[1] and bool(np.allclose(dense, dense.T))
+            dense_for_psd = dense if symmetric and shape[0] <= 512 else None
+        min_eigenvalue: float | None = None
+        psd: bool | None = None
+        if dense_for_psd is not None:
+            min_eigenvalue = float(np.linalg.eigvalsh((dense_for_psd + dense_for_psd.T) / 2).min())
+            psd = bool(min_eigenvalue >= -1e-7)
+        return {
+            "relation": self.relation,
+            "shape": shape,
+            "directed": self.relation in {"rfgap", "honest_gap", "conditional"},
+            "symmetric": symmetric,
+            "psd": psd,
+            "min_eigenvalue": min_eigenvalue,
+            "nnz": nnz,
+            "density": float(nnz / (shape[0] * shape[1])) if shape[0] and shape[1] else 0.0,
+            "value_min": float(np.min(values)) if values.size else 0.0,
+            "value_max": float(np.max(values)) if values.size else 0.0,
+            "row_mass_min": float(np.min(row_mass)) if row_mass.size else 0.0,
+            "row_mass_max": float(np.max(row_mass)) if row_mass.size else 0.0,
+        }
 
-    def proximity_embedding(self, method: str = "phate", **kwargs: Any) -> np.ndarray:
-        """Alias for :meth:`embed`."""
-        return self.embed(method=method, **kwargs)
+    def _base_relation_metadata(self) -> dict[str, Any]:
+        capabilities = self.capabilities_ or capabilities_for(self.estimator)
+        return {
+            "relation": self.relation,
+            "estimator_family": capabilities.family,
+            "task_type": capabilities.task_type,
+            "direction": "query_to_training" if self.relation in {"rfgap", "honest_gap", "conditional"} else "symmetric",
+            "symmetrization": self.symm_mode,
+            "prediction_identity": self.relation in {"rfgap", "honest_gap"},
+            "random_state": self.random_state,
+        }
 
-    def phate(self, **kwargs: Any) -> np.ndarray:
-        """Fit a PHATE embedding from this fitted forest's proximities."""
-        return self.embed(method="phate", **kwargs)
+    def _alternate_relation(self, relation: str) -> "Proximity":
+        alternate = Proximity(
+            self.estimator,
+            relation=cast(ProxMethod, relation),
+            matrix_type=self.matrix_type,
+            non_zero_diagonal=self.non_zero_diagonal,
+            symm_mode=self.symm_mode,
+            max_normalize=self.max_normalize,
+            random_state=self.random_state,
+        )
+        if self._X_train is None:
+            raise RuntimeError("Training features are unavailable for relation dispatch.")
+        alternate.attach(self._X_train, self._y_train)
+        return alternate
 
-    def embed_transform(self, X_new: Any, method: str = "phate", **kwargs: Any) -> np.ndarray:
-        """
-        Project new observations through a stored manifold model when supported.
+    def _kernel_relation(self, relation: str, X_new: Any | None) -> MatrixLike:
+        if relation == "kerf":
+            train_features = self._kerf_features(self._X_train, training=True)
+            query_features = train_features if X_new is None else self._kerf_features(X_new, training=False)
+        elif relation == "path":
+            train_features = self._path_features(self._X_train, training=True)
+            query_features = train_features if X_new is None else self._path_features(X_new, training=False)
+        elif relation == "random_height":
+            train_features = self._random_height_features(self._X_train, training=True)
+            query_features = train_features if X_new is None else self._random_height_features(X_new, training=False)
+        else:  # pragma: no cover - internal dispatch guard
+            raise ValueError(f"Unknown kernel relation: {relation}")
+        result = cast(sparse.csr_matrix, query_features @ train_features.T).tocsr()
+        result.eliminate_zeros()
+        return result.toarray() if self.matrix_type == "dense" else result
 
-        ``method='phate'`` is supported after calling ``embed(method='phate')``.
-        ``method='isomap'`` is supported when sklearn accepts precomputed
-        new-to-training distances for the fitted Isomap model. t-SNE does not
-        provide an out-of-sample transform.
-        """
-        self._check_proximity_ready()
-        from forestgap.manifold import transform_from_forest
+    def _kerf_features(self, X: Any, *, training: bool) -> sparse.csr_matrix:
+        if training and "kerf" in self._relation_feature_cache:
+            return self._relation_feature_cache["kerf"]
+        if self._leaf_encoding is None or self.leaf_matrix_ is None:
+            raise RuntimeError("Leaf encoding is unavailable.")
+        leaves = self.leaf_matrix_ if training else self.apply(X)
+        rows, cols, _ = self._map_leaves_to_global(leaves)
+        if training:
+            masses = np.bincount(cols, minlength=self._leaf_encoding.total_features).astype(float)
+            self._relation_feature_cache["kerf_masses"] = masses
+        else:
+            masses = np.asarray(self._relation_feature_cache.get("kerf_masses"))
+        if masses.size == 0:
+            raise RuntimeError("KeRF leaf masses are unavailable.")
+        n_trees = leaves.shape[1]
+        values = np.zeros(rows.shape[0], dtype=float)
+        nonzero = masses[cols] > 0
+        values[nonzero] = 1.0 / np.sqrt(n_trees * masses[cols[nonzero]])
+        features = sparse.csr_matrix(
+            (values[nonzero], (rows[nonzero], cols[nonzero])),
+            shape=(leaves.shape[0], self._leaf_encoding.total_features),
+        )
+        if training:
+            self._relation_feature_cache["kerf"] = features
+        return features
 
-        return transform_from_forest(self, X_new, method=method, **kwargs)
+    def _decision_path_indicator(self, X: Any) -> tuple[sparse.csr_matrix, np.ndarray]:
+        result = self.estimator.decision_path(X)
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise UnsupportedRelationError(
+                self.capabilities_.family if self.capabilities_ else "unknown",
+                self.relation,
+                "decision_path must return (indicator, node_ptr)",
+            )
+        indicator, node_ptr = result
+        return sparse.csr_matrix(indicator), np.asarray(node_ptr, dtype=np.int64)
 
-    def phate_transform(self, X_new: Any, **kwargs: Any) -> np.ndarray:
-        """Project new observations through a stored PHATE proximity embedding."""
-        return self.embed_transform(X_new, method="phate", **kwargs)
+    def _path_features(self, X: Any, *, training: bool) -> sparse.csr_matrix:
+        if training and "path" in self._relation_feature_cache:
+            return self._relation_feature_cache["path"]
+        indicator, node_ptr = self._decision_path_indicator(X)
+        if training:
+            self._relation_feature_cache["path_ptr"] = node_ptr
+        elif not np.array_equal(node_ptr, self._relation_feature_cache.get("path_ptr")):
+            raise RuntimeError("Estimator path inventory changed after attachment.")
+        row_norm = np.sqrt(np.asarray(indicator.multiply(indicator).sum(axis=1)).ravel())
+        row_norm[row_norm == 0] = 1.0
+        features = indicator.multiply((1.0 / row_norm)[:, None]).tocsr()
+        if training:
+            self._relation_feature_cache["path"] = features
+        return features
+
+    @staticmethod
+    def _node_depths(tree: Any) -> np.ndarray:
+        children_left = np.asarray(tree.children_left)
+        children_right = np.asarray(tree.children_right)
+        depths = np.zeros(tree.node_count, dtype=np.int32)
+        stack = [0]
+        while stack:
+            node = stack.pop()
+            for child in (children_left[node], children_right[node]):
+                if child >= 0:
+                    depths[child] = depths[node] + 1
+                    stack.append(int(child))
+        return depths
+
+    def _random_height_features(self, X: Any, *, training: bool) -> sparse.csr_matrix:
+        cache_key = "random_height"
+        if training and cache_key in self._relation_feature_cache:
+            return self._relation_feature_cache[cache_key]
+        indicator, node_ptr = self._decision_path_indicator(X)
+        estimators = list(self.estimators_)
+        if training:
+            rng = np.random.default_rng(self.random_state)
+            depths = [self._node_depths(tree.tree_) for tree in estimators]
+            heights = np.asarray(
+                [rng.integers(0, int(depth.max()) + 1) for depth in depths],
+                dtype=np.int32,
+            )
+            self._relation_feature_cache["random_height_depths"] = depths
+            self._relation_feature_cache["random_height_heights"] = heights
+            self._relation_feature_cache["random_height_ptr"] = node_ptr
+            self.relation_metadata_["tree_cut_heights"] = heights.tolist()
+        else:
+            depths = self._relation_feature_cache["random_height_depths"]
+            heights = self._relation_feature_cache["random_height_heights"]
+            if not np.array_equal(node_ptr, self._relation_feature_cache["random_height_ptr"]):
+                raise RuntimeError("Estimator path inventory changed after attachment.")
+        rows: list[int] = []
+        cols: list[int] = []
+        for tree_idx, (depth, height) in enumerate(zip(depths, heights)):
+            start, stop = int(node_ptr[tree_idx]), int(node_ptr[tree_idx + 1])
+            block = indicator[:, start:stop].tocsr()
+            for row in range(block.shape[0]):
+                nodes = block.indices[block.indptr[row]:block.indptr[row + 1]]
+                eligible = nodes[depth[nodes] <= height]
+                if eligible.size:
+                    selected = int(eligible[np.argmax(depth[eligible])])
+                    rows.append(row)
+                    cols.append(start + selected)
+        values = np.full(len(rows), 1.0 / np.sqrt(len(estimators)), dtype=float)
+        features = sparse.csr_matrix(
+            (values, (rows, cols)), shape=(indicator.shape[0], indicator.shape[1]),
+        )
+        if training:
+            self._relation_feature_cache[cache_key] = features
+        return features
 
     def prox_predict(self, X: Any = None) -> np.ndarray:
         """
@@ -616,7 +783,7 @@ class SparseProximityMixin:
         result = P @ y
         return np.asarray(result.todense()).ravel() if sparse.issparse(result) else np.asarray(result).ravel()
 
-    def impute(
+    def _impute(
         self,
         X: Any,
         categorical_features: Optional[Sequence[int]] = None,
@@ -805,7 +972,7 @@ class SparseProximityMixin:
                     result = np.asarray(result.todense()).ravel()
                 X_query[query_rows, m] = result
 
-    def outlier_scores(
+    def _outlier_scores(
         self,
         y: Any = None,
         scaling: Optional[Literal["normalize", "log"]] = None,
@@ -970,7 +1137,7 @@ class SparseProximityMixin:
             return pd.Series(scores, index=y_index, name="outlier_score")
         return scores
 
-    def get_prototypes(
+    def _get_prototypes(
         self,
         *,
         k: int = 10,
@@ -1170,7 +1337,7 @@ class SparseProximityMixin:
 
         return results
 
-    def local_feature_importance(
+    def _local_feature_importance(
         self,
         X: Optional[Any] = None,
         labels: Optional[Any] = None,
@@ -1479,102 +1646,10 @@ class SparseProximityMixin:
             return wrapped_importance, wrapped_closeness, wrapped_directionality
         return wrapped_importance, wrapped_closeness
 
-    def local_variable_importance(self, *args: Any, **kwargs: Any) -> Any:
+    def _local_variable_importance(self, *args: Any, **kwargs: Any) -> Any:
         """Alias for :meth:`local_feature_importance`."""
-        return self.local_feature_importance(*args, **kwargs)
+        return self._local_feature_importance(*args, **kwargs)
 
-    def plot_mds(
-        self,
-        X_test: Optional[Any] = None,
-        y: Optional[Any] = None,
-        y_test: Optional[Any] = None,
-    ) -> Any:
-        """
-        Visualize proximity matrix using metric MDS and scatterplot.
-        If X_test is provided, uses test proximities; else training.
-        Colors points by y (categorical or continuous).
-        Returns the matplotlib figure object.
-        """
-
-        # Obtain proximities and keep sparse when possible
-        if X_test is not None:
-            pr = self.prox_extend(X_test)
-            labels = y_test
-        else:
-            pr = self.get_proximities()
-            labels = y
-
-        # Ensure sparse representation until we must densify for MDS
-        if sparse.issparse(pr):
-            pr_sp = pr.tocsr()
-        else:
-            pr_sp = sparse.csr_matrix(np.asarray(pr))
-
-        # For rfgap, recompute proximities with non-zero diagonal & symm_mode
-        if self.prox_method == "rfgap":
-            orig_nzd = self.non_zero_diagonal
-            orig_sym = self.symm_mode
-            self.non_zero_diagonal = True
-            self.symm_mode = self.symm_mode or "arithmetic"
-            try:
-                pr_tmp = self.get_proximities() if X_test is None else self.prox_extend(X_test)
-                pr_sp = pr_tmp.tocsr() if sparse.issparse(pr_tmp) else sparse.csr_matrix(np.asarray(pr_tmp))
-            finally:
-                self.non_zero_diagonal = orig_nzd
-                self.symm_mode = orig_sym
-
-        # Compute sparse distance matrix: dist = sqrt(max(1 - prox, 0))
-        dist_sp = pr_sp.copy().astype(np.float64)
-        # data := 1 - data
-        np.subtract(1.0, dist_sp.data, out=dist_sp.data)
-        # clip negatives to zero then sqrt
-        dist_sp.data[dist_sp.data < 0] = 0.0
-        np.sqrt(dist_sp.data, out=dist_sp.data)
-
-        # MDS requires dense dissimilarity matrix — convert only now
-        dist = dist_sp.toarray()
-
-        # Fit MDS
-        mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42)
-        coords = mds.fit_transform(dist)
-
-        # Infer categorical vs. continuous for coloring
-        if labels is not None:
-            if pd is not None and isinstance(labels, (pd.Series, pd.DataFrame)):
-                arr = labels.values if hasattr(labels, "values") else np.asarray(labels)
-            else:
-                arr = np.asarray(labels)
-            if np.issubdtype(arr.dtype, np.integer) or (np.unique(arr).size <= 10):
-                unique = np.unique(arr)
-                cmap = plt.get_cmap("tab10") if unique.size <= 10 else plt.get_cmap("tab20")
-                colors = [cmap(i % cmap.N) for i in range(unique.size)]
-                color_dict = {v: colors[i] for i, v in enumerate(unique)}
-                color_vals = [color_dict[v] for v in arr]
-                scatter_kwargs = {"c": color_vals, "label": None}
-            else:
-                scatter_kwargs = {"c": arr, "cmap": "viridis", "label": None}
-        else:
-            scatter_kwargs = {"c": "gray", "label": None}
-
-        fig, ax = plt.subplots(figsize=(7, 6))
-        sc = ax.scatter(coords[:, 0], coords[:, 1], s=60, **scatter_kwargs)
-        ax.set_xlabel("MDS 1")
-        ax.set_ylabel("MDS 2")
-        ax.set_title("MDS of Proximities")
-        if labels is not None:
-            if np.issubdtype(arr.dtype, np.integer) or (np.unique(arr).size <= 10):
-                unique = np.unique(arr)
-                from matplotlib.lines import Line2D
-
-                handles = [Line2D([0], [0], marker='o', color='w', markerfacecolor=color_dict[v], markersize=8, label=str(v)) for v in unique]
-                ax.legend(handles=handles, title="Class")
-            else:
-                fig.colorbar(sc, ax=ax, label="y")
-        plt.tight_layout()
-        plt.show()
-        return fig
-
-        
     def _check_proximity_ready(self) -> None:
         check_is_fitted(cast(Any, self))
         if self.W_mat is None or self.leaf_matrix_ is None or self._leaf_encoding is None:
@@ -1705,7 +1780,7 @@ class SparseProximityMixin:
         inferred = {
             feature_idx
             for feature_idx in range(X_train.shape[1])
-            if not SparseProximityMixin._is_numeric_local_feature(X_train[:, feature_idx])
+            if not Proximity._is_numeric_local_feature(X_train[:, feature_idx])
         }
         if categorical_features is None:
             return sorted(inferred)
@@ -1880,7 +1955,7 @@ class SparseProximityMixin:
                 ]
                 mode_value = min(
                     mode_candidates,
-                    key=SparseProximityMixin._prototype_category_sort_key,
+                    key=Proximity._prototype_category_sort_key,
                 )
 
             modes[feature_name] = mode_value
@@ -1935,7 +2010,7 @@ class SparseProximityMixin:
         unique_nonmissing = pd.unique(combined[~pd.isna(combined)])
         if unique_nonmissing.size == 2:
             return "flip"
-        return "quantile" if SparseProximityMixin._is_numeric_local_feature(combined) else "permute"
+        return "quantile" if Proximity._is_numeric_local_feature(combined) else "permute"
 
     @staticmethod
     def _is_numeric_local_feature(values: np.ndarray) -> bool:
@@ -1961,9 +2036,9 @@ class SparseProximityMixin:
         for idx, value in enumerate(query_col):
             if pd.isna(value):
                 flipped[idx] = lo
-            elif SparseProximityMixin._scalar_values_equal(value, lo):
+            elif Proximity._scalar_values_equal(value, lo):
                 flipped[idx] = hi
-            elif SparseProximityMixin._scalar_values_equal(value, hi):
+            elif Proximity._scalar_values_equal(value, hi):
                 flipped[idx] = lo
             else:
                 flipped[idx] = lo
@@ -1988,13 +2063,13 @@ class SparseProximityMixin:
             return sampled
 
         for idx, value in enumerate(query_col):
-            if not SparseProximityMixin._scalar_values_equal(sampled[idx], value):
+            if not Proximity._scalar_values_equal(sampled[idx], value):
                 continue
 
             alternatives = [
                 candidate
                 for candidate in unique_nonmissing
-                if not SparseProximityMixin._scalar_values_equal(candidate, value)
+                if not Proximity._scalar_values_equal(candidate, value)
             ]
             if alternatives:
                 sampled[idx] = alternatives[rng.randint(0, len(alternatives))]
@@ -2361,13 +2436,27 @@ class SparseProximityMixin:
             self._diag_offset = None
             return
 
+        if self.prox_method == "conditional":
+            # Meinshausen-style conditional-distribution weights: a query has
+            # mass 1/T in each tree and training observations split that mass
+            # uniformly within the query's terminal leaf.
+            self.W_mat = self._build_W_uniform(
+                self.leaf_matrix_, self._leaf_encoding,
+            )
+            self._n_total_features = int(self._leaf_encoding.total_features)
+            self._diag_offset = None
+            return
+
         rows, cols, tree_ids = self._map_leaves_to_global(self.leaf_matrix_)
         if rows.size == 0:
             raise RuntimeError("No valid leaf mappings found while building W matrix.")
 
         total_cols = int(self._leaf_encoding.total_features)
 
-        if self.prox_method == "original":
+        if self.prox_method in {
+            "original", "collision", "survival_leaf",
+            "kerf", "path", "random_height",
+        }:
             weights = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
 
         elif self.prox_method == "oob":
@@ -2536,7 +2625,13 @@ class SparseProximityMixin:
         n_samples, n_trees = leaves.shape
         rows, cols, tree_ids = self._map_leaves_to_global(leaves)
 
-        if self.prox_method == "original":
+        if self.prox_method == "conditional":
+            vals = np.full(rows.shape[0], 1.0 / n_trees, dtype=np.float32)
+
+        elif self.prox_method in {
+            "original", "collision", "survival_leaf",
+            "kerf", "path", "random_height",
+        }:
             vals = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
 
         elif self.prox_method == "oob":
@@ -2737,7 +2832,14 @@ class SparseProximityMixin:
         estimators_samples = getattr(self, "estimators_samples_", None)
         if estimators_samples is not None:
             for t, sample_indices in enumerate(estimators_samples):
-                idx, cnt = np.unique(np.asarray(sample_indices), return_counts=True)
+                sample_indices = np.asarray(sample_indices, dtype=np.int64)
+                # SyntheticNullForest trees are fitted on observed rows followed
+                # by generated-null rows.  The indexed relation intentionally
+                # contains observed rows only.
+                sample_indices = sample_indices[
+                    (sample_indices >= 0) & (sample_indices < n_samples)
+                ]
+                idx, cnt = np.unique(sample_indices, return_counts=True)
                 in_bag_counts[idx, t] = cnt.astype(np.float32)
                 oob_mask[:, t] = 1
                 oob_mask[idx, t] = 0
@@ -2822,295 +2924,6 @@ class SparseProximityMixin:
 
         raise ValueError(f"Unknown symmetrization mode: {mode}")
 
-
-def with_sparse_proximity(base_cls: Type[TForest]) -> Type[Any]:
-    """
-    Class decorator/factory to attach `SparseProximityMixin` to an estimator class.
-
-    Can also be called with an **instance** for convenience; in that case a new
-    ``ProximityEnabled`` class is built from the instance's class and a fresh
-    instance is returned with the same parameters.
-
-    Parameters
-    ----------
-    base_cls : type or estimator instance
-        Forest-like estimator class (or instance) to extend.
-
-    Returns
-    -------
-    type or estimator instance
-        New class inheriting `(SparseProximityMixin, base_cls)`, or an instance
-        of that class when an instance was passed.
-
-    Examples
-    --------
-    >>> from sklearn.ensemble import RandomForestClassifier
-    >>> from forestgap import with_sparse_proximity
-    >>> ProxRF = with_sparse_proximity(RandomForestClassifier)
-    >>> model = ProxRF(n_estimators=200, prox_method='rfgap', bootstrap=True)
-
-    As a decorator:
-    >>> @with_sparse_proximity
-    ... class ProxExtraTrees(ExtraTreesClassifier):
-    ...     pass
-
-    With an already-constructed instance:
-    >>> model = with_sparse_proximity(RandomForestClassifier(n_estimators=200))
-    """
-
-    # If an instance was passed, wrap its class and return a new instance
-    # with the same parameters.
-    if not isinstance(base_cls, type):
-        instance = base_cls
-        cls = with_sparse_proximity(type(instance))
-        return cls(**instance.get_params())
-
-    is_rotation_forest = _is_rotation_forest_class(base_cls)
-    is_isolation_forest = _is_isolation_forest_class(base_cls)
-    is_honest_forest = _is_honest_forest_class(base_cls)
-    needs_rotation_apply_adapter = is_rotation_forest and not callable(getattr(base_cls, "apply", None))
-    needs_isolation_apply_adapter = is_isolation_forest and not callable(getattr(base_cls, "apply", None))
-
-    wrapped_base: Type[Any] = base_cls
-    if is_rotation_forest:
-        if needs_rotation_apply_adapter:
-            class RotationForestWithAdapters(_RotationForestOOBAdapter, _RotationForestApplyAdapter, base_cls):
-                pass
-        else:
-            class RotationForestWithAdapters(_RotationForestOOBAdapter, base_cls):
-                pass
-
-        RotationForestWithAdapters.__name__ = f"{base_cls.__name__}WithApplyAdapter"
-        RotationForestWithAdapters.__qualname__ = RotationForestWithAdapters.__name__
-        wrapped_base = RotationForestWithAdapters
-    elif is_isolation_forest and needs_isolation_apply_adapter:
-        class IsolationForestWithAdapters(_IsolationForestApplyAdapter, base_cls):
-            pass
-
-        IsolationForestWithAdapters.__name__ = f"{base_cls.__name__}WithApplyAdapter"
-        IsolationForestWithAdapters.__qualname__ = IsolationForestWithAdapters.__name__
-        wrapped_base = IsolationForestWithAdapters
-
-    class ProximityEnabled(SparseProximityMixin, wrapped_base):
-        def __init__(
-            self,
-            *args: Any,
-            prox_method: ProxMethod = "rfgap",
-            matrix_type: MatrixType = "sparse",
-            non_zero_diagonal: bool = False,
-            symm_mode: SymmMode = None,
-            max_normalize: bool = False,
-            **kwargs: Any,
-        ) -> None:
-            base_sig = inspect.signature(base_cls.__init__)
-            has_oob_param = "oob_score" in base_sig.parameters
-
-            # Determine wrapper-level oob_score request with sane defaults.
-            if "oob_score" in kwargs:
-                requested_oob_score = bool(kwargs["oob_score"])
-            elif has_oob_param and base_sig.parameters["oob_score"].default is not inspect._empty:
-                requested_oob_score = bool(base_sig.parameters["oob_score"].default)
-            elif is_rotation_forest:
-                requested_oob_score = True
-            else:
-                requested_oob_score = False
-
-            # Support user-passed oob_score even for classes that do not natively
-            # expose it (e.g., aeon RotationForest).
-            if not has_oob_param and "oob_score" in kwargs:
-                kwargs.pop("oob_score")
-
-            # Quietly disable incompatible bootstrap/oob combinations instead of
-            # propagating model-specific ValueError in adapter usage.
-            effective_oob_score = requested_oob_score
-            if has_oob_param:
-                bootstrap_param = base_sig.parameters.get("bootstrap")
-                bootstrap_val = kwargs.get("bootstrap", None)
-                if bootstrap_val is None and bootstrap_param is not None and bootstrap_param.default is not inspect._empty:
-                    bootstrap_val = bootstrap_param.default
-
-                max_samples_param = base_sig.parameters.get("max_samples")
-                max_samples_val = kwargs.get("max_samples", None)
-                if (
-                    max_samples_val is None
-                    and max_samples_param is not None
-                    and max_samples_param.default is not inspect._empty
-                ):
-                    max_samples_val = max_samples_param.default
-
-                if bootstrap_val is False and max_samples_val is not None:
-                    kwargs["max_samples"] = None
-
-                if requested_oob_score and bootstrap_val is False:
-                    kwargs["oob_score"] = False
-                    effective_oob_score = False
-                elif "oob_score" in kwargs:
-                    kwargs["oob_score"] = bool(kwargs["oob_score"])
-                    effective_oob_score = bool(kwargs["oob_score"])
-
-            # IsolationForest does not provide a meaningful supervised-style OOB
-            # score path for this mixin; keep it as a quiet no-op flag.
-            if is_isolation_forest and has_oob_param and "oob_score" not in kwargs:
-                kwargs["oob_score"] = False
-                effective_oob_score = False
-
-            # treeple ForestCluster (UnsupervisedRandomForest) has a buggy
-            # _set_oob_score_and_attributes; always disable the base model's
-            # oob_score and let the mixin handle OOB computation itself.
-            _is_forest_cluster = any(
-                c.__name__ == "ForestCluster" for c in base_cls.mro()
-            )
-            if _is_forest_cluster and has_oob_param:
-                kwargs["oob_score"] = False
-                effective_oob_score = False
-
-            bound = base_sig.bind_partial(self, *args, **kwargs)
-            base_cls.__init__(*bound.args, **bound.kwargs)
-            self._init_sparse_proximity(
-                prox_method=prox_method,
-                matrix_type=matrix_type,
-                non_zero_diagonal=non_zero_diagonal,
-                symm_mode=symm_mode,
-                max_normalize=max_normalize,
-            )
-            if prox_method == "rfgap" and is_honest_forest:
-                warn(
-                    "prox_method='rfgap' uses ordinary RF-GAP bootstrap semantics, "
-                    "which do not reconstruct HonestForestClassifier predictions. "
-                    "Use prox_method='honest_gap' for HonestForest prediction reconstruction.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            if is_rotation_forest:
-                self._rotation_oob_score = bool(effective_oob_score)
-            if is_isolation_forest:
-                self._isolation_oob_score = bool(requested_oob_score)
-                effective_oob_score = False
-            self.oob_score = bool(effective_oob_score)
-
-    base_sig = inspect.signature(base_cls.__init__)
-    base_params = [p for n, p in base_sig.parameters.items() if n != "self"]
-    prox_params = [
-        Parameter("prox_method", kind=Parameter.KEYWORD_ONLY, default="rfgap"),
-        Parameter("matrix_type", kind=Parameter.KEYWORD_ONLY, default="sparse"),
-        Parameter("non_zero_diagonal", kind=Parameter.KEYWORD_ONLY, default=False),
-        Parameter("symm_mode", kind=Parameter.KEYWORD_ONLY, default=None),
-        Parameter("max_normalize", kind=Parameter.KEYWORD_ONLY, default=False),
-    ]
-    if (is_rotation_forest or is_isolation_forest) and "oob_score" not in base_sig.parameters:
-        prox_params.append(Parameter("oob_score", kind=Parameter.KEYWORD_ONLY, default=True))
-    # Insert prox_params before any VAR_KEYWORD (**kwargs) parameter to maintain
-    # valid Python parameter ordering.
-    var_kw = [p for p in base_params if p.kind == Parameter.VAR_KEYWORD]
-    non_var_kw = [p for p in base_params if p.kind != Parameter.VAR_KEYWORD]
-    ordered_params = [Parameter("self", kind=Parameter.POSITIONAL_OR_KEYWORD)] + non_var_kw + prox_params + var_kw
-    init_sig = Signature(parameters=ordered_params)
-    ProximityEnabled.__init__.__signature__ = init_sig
-
-    ProximityEnabled.__name__ = f"{base_cls.__name__}WithSparseProximity"
-    ProximityEnabled.__qualname__ = ProximityEnabled.__name__
-    return ProximityEnabled
-
-
-class _RotationForestApplyAdapter:
-    # def apply(self, X):
-    #     X_proc = self._check_X(X)
-    #     X_proc = validate_data(self, X=X_proc, reset=False, accept_sparse=False)
-    #     X_proc = X_proc[:, self._useful_atts]
-    #     X_proc = (X_proc - self._min) / self._ptp
-
-    #     leaves = []
-    #     for i in range(self._n_estimators):
-    #         estimator = self.estimators_[i]
-    #         pcas = self._pcas[i]
-    #         groups = self._groups[i]
-
-    #         X_t = np.concatenate(
-    #             [pcas[j].transform(X_proc[:, group]) for j, group in enumerate(groups)],
-    #             axis=1,
-    #         )
-    #         X_t = X_t.astype(np.float32)
-    #         X_t = np.nan_to_num(
-    #             X_t,
-    #             copy=False,
-    #             nan=0.0,
-    #             posinf=float(np.finfo(np.float32).max),
-    #             neginf=float(np.finfo(np.float32).min),
-    #         )
-    #         leaves.append(estimator.apply(X_t))
-
-    #     return np.column_stack(leaves)
-
-    # CHAT Version
-    def apply(self, X):
-        """
-        Return terminal node indices for each sample and each estimator.
-
-        Returns
-        -------
-        nodes : np.ndarray, shape=(n_samples, n_estimators)
-            nodes[i, j] is the terminal node id for sample i in estimator j.
-        """
-        if not hasattr(self, "_is_fitted") or not self._is_fitted:
-            from sklearn.exceptions import NotFittedError
-            raise NotFittedError("This RotationForestClassifier instance is not fitted yet.")
-
-        # same input checks / preprocessing used in predict_proba
-        with _suppress_base_validate_data_futurewarning():
-            X = self._check_X(X)
-            X = validate_data(self, X=X, reset=False, accept_sparse=False)
-
-        # remove attributes that were dropped at fit
-        X = X[:, self._useful_atts]
-
-        # normalize using stored min/ptp from training
-        X = (X - self._min) / self._ptp
-
-        # for each estimator, build its transformed feature matrix and call .apply()
-        n_samples = X.shape[0]
-        n_estimators = self._n_estimators
-        nodes = np.empty((n_samples, n_estimators), dtype=np.int64)
-
-        # optional: use joblib to parallelize if you want speed
-        from joblib import Parallel, delayed
-
-        def _apply_est(i):
-            pcas = self._pcas[i]      # list of PCA objects used for estimator i
-            groups = self._groups[i]  # list of attribute index arrays for estimator i
-            # reconstruct transformed features for this estimator
-            X_t = np.concatenate([pcas[j].transform(X[:, grp]) for j, grp in enumerate(groups)], axis=1)
-            X_t = X_t.astype(np.float32)
-            X_t = np.nan_to_num(X_t, False, 0, np.finfo(np.float32).max, np.finfo(np.float32).min)
-            return self.estimators_[i].apply(X_t)
-
-        results = Parallel(n_jobs=self._n_jobs, prefer="threads")(
-            delayed(_apply_est)(i) for i in range(n_estimators)
-        )
-
-        # results is list of length n_estimators, each shape (n_samples,)
-        # stack as (n_samples, n_estimators)
-        nodes = np.column_stack(results)
-        return nodes
-
-
-class _IsolationForestApplyAdapter:
-    def apply(self, X: Any) -> np.ndarray:
-        X_checked = validate_data(self, X=X, reset=False, accept_sparse=True)
-
-        estimators = getattr(self, "estimators_", None)
-        if estimators is None:
-            raise RuntimeError("IsolationForest estimators_ are not initialized.")
-
-        features_per_estimator = getattr(self, "estimators_features_", None)
-        if features_per_estimator is None:
-            raise RuntimeError("IsolationForest estimators_features_ are not initialized.")
-
-        leaves: List[np.ndarray] = []
-        for est, features in zip(estimators, features_per_estimator):
-            X_sub = X_checked[:, features]
-            leaves.append(np.asarray(est.apply(X_sub)))
-
-        return np.column_stack(leaves)
 
 class _RotationForestOOBAdapter:
     def _set_rotation_forest_oob_attributes(self, X: Any, y: Optional[Any]) -> None:
@@ -3296,7 +3109,7 @@ class _RotationForestOOBAdapter:
             raise
 
         try:
-            oob_model = clone(self)
+            oob_model = clone(self.estimator)
 
             if hasattr(self, "classes_") and hasattr(oob_model, "fit_predict_proba"):
                 with _suppress_base_validate_data_futurewarning():

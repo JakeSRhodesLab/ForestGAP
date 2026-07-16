@@ -168,3 +168,26 @@ Suggested comparisons:
 - AUC when scores are available
 - proximity-based PHATE plots
 - tree depth or node count as a rough efficiency diagnostic
+
+## Composition-based relation comparison
+
+Fit each parent once and attach the same explicitly named relation. Do not
+infer OOB or RF-GAP support from the estimator family name; inspect the runtime
+capability contract first.
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+from forestgap import Proximity, capabilities_for
+
+forest = RandomForestClassifier(n_estimators=300, random_state=0).fit(X_train, y_train)
+print(capabilities_for(forest).valid_relations)
+
+original = Proximity(forest, relation="original").attach(X_train, y_train)
+P_train = original.get_proximities()
+P_test = original.prox_extend(X_test)
+```
+
+For visualization or clustering, use `original`, `kerf`, `path`, or
+`random_height`, or declare the symmetrization of a directed relation. Only
+unsymmetrized `rfgap`/`honest_gap` weights may be used for their corresponding
+prediction-identity claim.

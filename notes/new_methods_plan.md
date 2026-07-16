@@ -1,5 +1,72 @@
 # Composition-based forestgap redesign, method coverage, and notebook migration
 
+## Implementation progress log
+
+This section is the continuation point for the implementation. Keep it current
+after each completed or partially completed slice; record verification commands
+and blockers so work can resume without reconstructing context.
+
+- **2026-07-15 14:23 MDT — started.** Repository was clean. Read this plan and
+  `application_roadmap.md`; inventoried the existing 3,319-line mixin-based
+  `forestgap/core.py`, package exports, six experiment runners, 13 notebooks,
+  and the current test suite. No `AGENTS.md` applies. Next: extract the current
+  behavior into composition modules, introduce the capability registry, and
+  establish focused tests before migrating callers.
+- **2026-07-15 14:55 MDT — provisional checkpoint (superseded by the audit
+  below).** Introduced the
+  composition API and explicit capability gates; migrated runners, active
+  documents, 13 existing notebooks, and four new tutorials; archived 1,215
+  invalid pre-1.0 MDS artifacts plus their raw CSVs under
+  `results/legacy/mds_visualization_pre_1_0`; and refreshed package/lock
+  metadata for 1.0.0. CCF remains a visible scientifically gated registry row
+  because the upstream port's pinned SciPy 1.4.1 dependency conflicts with this
+  package and no checked MATLAB oracle fixture is present; no CCF relation is
+  enabled. Quantile and survival tutorials record executable optional-extra
+  skips in this environment. Final verification: `100 passed, 9 subtests
+  passed`; `scripts/validate_notebooks.py --execute` validated all 17 notebooks
+  in clean kernels; `compileall` and `git diff --check` passed.
+- **2026-07-16 06:26 MDT — completion audit and remaining implementation.**
+  The prior checkpoint was not the entire plan: CCF had no native estimator or
+  original relation, conditional weights used ordinary co-leaf factors, the
+  CCF tutorial was status-only, survival did not calculate censoring-safe
+  metrics, the synthetic-null tutorial omitted OOB/anomaly output, the shared
+  matrix had no CLI/parent metrics, optional adapter contracts were not tested,
+  and no CI workflow existed. Implemented native sklearn-compatible CCF C/R
+  estimators with a packaged deterministic C/R fixture tied to MATLAB source
+  commit `f4b7bf4`; enabled CCF `original` only and retained explicit CCF-Bag
+  OOB/RF-GAP gates. Implemented leaf-mass conditional weights, IPCW survival
+  concordance/IBS, substantive optional-method tutorials, a provenance-complete
+  `run_method_matrix` CLI, optional-family contracts, stale-API enforcement,
+  and GitHub CI. Updated active roadmap state and Python support metadata.
+  Checkpoint verification: `109 passed, 9 subtests passed` before the final
+  optional-family/sklearn conformance additions; all 17 refreshed notebooks
+  executed successfully; the wheel contains the CCF fixture and excludes
+  `core.py`. Next: rerun the complete suite/notebook execution after the final
+  conformance edits, run diff/lock/build checks, then record the definitive
+  completion result here.
+- **2026-07-16 06:29 MDT — audited implementation complete.** Final verification
+  passed with all maintained optional adapters installed: `uv lock --check`;
+  package/test/script `compileall`; the removed-API scan; `113 passed, 9
+  subtests passed`; all 17 notebooks executed from clean kernels; and a
+  108-cell RF/ExtraTrees/CCF × six-relation × three-application × two-regime
+  CLI smoke run produced 78 valid, 30 explicitly unsupported, and zero error
+  rows. `python -m build` produced the 1.0.0 sdist and wheel; both contain the
+  packaged CCF fixture and neither contains `core.py`. `git diff --check`
+  passed, and the legacy archive contains the expected 1,217 files (1,215
+  figures plus two raw CSVs). This is the definitive continuation point; no
+  implementation work from this plan remains.
+- [x] Composition package and public exports (`proximity`, `adapters`,
+  `applications`); remove `core.py` and wrapper API.
+- [x] Relation constructors and validity gates (`original`, `oob`, `rfgap`,
+  `honest_gap`, `kerf`, `path`, `random_height`).
+- [x] Adapter coverage/explicit gated rows for every roadmap method.
+- [x] Tier 0 and Tier 1 standalone applications.
+- [x] Experiment harness/runners and provenance/unsupported rows.
+- [x] Existing notebook/document migration plus four new tutorials.
+- [x] Reorganized unit/integration tests, clean notebook smoke execution, and
+  package-wide verification.
+- [x] Migration guide and 1.0.0 release metadata.
+
 ## Summary
 
 Release `forestgap` 1.0.0 as a composition-based package. Replace dynamic wrapper subclasses with `Proximity`, split construction/adaptation/application responsibilities into dedicated package-modules, and migrate every experiment, test, notebook, and document away from `with_sparse_proximity` and `forestgap.core`.

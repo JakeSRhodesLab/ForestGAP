@@ -110,10 +110,10 @@ def _ordered_raw_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df.reindex(columns=list(RAW_COLUMN_ORDER) + extra_cols)
 
 
-def _prepared_fields(prepared: Any) -> dict[str, Any]:
+def _prepared_fields(prepared: Any, prox_method: str = PROX_METHOD) -> dict[str, Any]:
     return {
         "suite_name": prepared.suite_name,
-        "prox_method": PROX_METHOD,
+        "prox_method": prox_method,
         "train_size": prepared.train_size,
         "test_size": prepared.test_size,
         "n_features": len(prepared.feature_names),
@@ -247,6 +247,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
                 for model_name in requested_model_names():
+                    prox_method = "honest_gap" if model_name == "HonestForest" else PROX_METHOD
                     if model_name not in available_model_names(task_kind):
                         rows.append(
                             unsupported_model_row(
@@ -260,7 +261,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 reason=f"{model_name} is not available for {task_kind}.",
                                 extra_fields={
                                     "suite_name": suite_name,
-                                    "prox_method": PROX_METHOD,
+                                    "prox_method": prox_method,
                                 },
                             )
                         )
@@ -283,7 +284,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         model = build_proximity_model(
                             task_kind,
                             model_name=model_name,
-                            prox_method=PROX_METHOD,
+                            prox_method=prox_method,
                             random_state=random_state,
                             n_estimators=args.n_estimators,
                             bootstrap=True,
@@ -332,7 +333,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         random_state=random_state,
                                         reason="Missing oob_decision_function_ after fitting with oob_score=True.",
                                         extra_fields={
-                                            **_prepared_fields(prepared),
+                                            **_prepared_fields(prepared, prox_method),
                                             "test_mean_abs_diff": test_metrics["mean_abs_diff"],
                                             "test_max_abs_diff": test_metrics["max_abs_diff"],
                                             "oob_valid_count": 0,
@@ -371,7 +372,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             "and oob_decision_function_."
                                         ),
                                         extra_fields={
-                                            **_prepared_fields(prepared),
+                                            **_prepared_fields(prepared, prox_method),
                                             "test_mean_abs_diff": test_metrics["mean_abs_diff"],
                                             "test_max_abs_diff": test_metrics["max_abs_diff"],
                                             "oob_valid_count": 0,
@@ -436,7 +437,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         random_state=random_state,
                                         reason="Missing oob_prediction_ after fitting with oob_score=True.",
                                         extra_fields={
-                                            **_prepared_fields(prepared),
+                                            **_prepared_fields(prepared, prox_method),
                                             "test_mean_abs_diff": test_metrics["mean_abs_diff"],
                                             "test_max_abs_diff": test_metrics["max_abs_diff"],
                                             "oob_valid_count": 0,
@@ -475,7 +476,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             "and oob_prediction_."
                                         ),
                                         extra_fields={
-                                            **_prepared_fields(prepared),
+                                            **_prepared_fields(prepared, prox_method),
                                             "test_mean_abs_diff": test_metrics["mean_abs_diff"],
                                             "test_max_abs_diff": test_metrics["max_abs_diff"],
                                             "oob_valid_count": 0,
@@ -505,7 +506,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 "status": "ok",
                                 "task_kind": task_kind,
                                 "suite_name": prepared.suite_name,
-                                "prox_method": PROX_METHOD,
+                                "prox_method": prox_method,
                                 "model_name": model_name,
                                 "random_state": random_state,
                                 "task_id": prepared.task_id,
@@ -533,10 +534,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         extra_fields: dict[str, Any] = {
                             "model_name": model_name,
                             "suite_name": suite_name,
-                            "prox_method": PROX_METHOD,
+                            "prox_method": prox_method,
                         }
                         if prepared is not None:
-                            extra_fields.update(_prepared_fields(prepared))
+                            extra_fields.update(_prepared_fields(prepared, prox_method))
                         error_row = record_exception(
                             experiment_name=EXPERIMENT_NAME,
                             task_kind=task_kind,

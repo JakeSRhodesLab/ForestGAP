@@ -1,81 +1,89 @@
-# GeneralForestProximities
+# forestgap
 
-## Outlier Detection Runner
-
-Use the wrapper script below to run outlier detection in the `generalforest` conda environment while isolating the run from user site-packages:
-
-```bash
-bash scripts/run_outlier_detection.sh --task both --dataset-limit 1 --random-states 0 --n-estimators 16 --max-rows 300
-```
-
-The script sets `PYTHONNOUSERSITE=1` automatically and forwards all CLI arguments to `experiments/run_outlier_detection.py`.
-It also clears `PYTHONPATH` before execution, preventing `~/.local/.../site-packages` from overriding conda packages.
-
-To use a different conda environment, set `GENERALFOREST_ENV`:
-
-```bash
-GENERALFOREST_ENV=myenv bash scripts/run_outlier_detection.sh --task classification
-```
-
-If you previously saw errors like `ImportError: numpy.core.multiarray failed to import` or matplotlib imports from `~/.local/lib/python3.11/site-packages`, use this wrapper instead of calling `python experiments/run_outlier_detection.py` directly.
-Sparse proximity computations for random forest-like ensembles.
+`forestgap` 1.0 builds sparse forest relations by composition and provides
+standalone applications for those relations. It never changes an estimator's
+class and rejects estimator–relation pairs whose bootstrap, OOB, honesty, or
+path contract is absent.
 
 ## Installation
 
-### Install from local clone
+Python 3.11 or newer is required.
 
 ```bash
 pip install .
 ```
 
-### Install directly from GitHub
+Optional integrations are separate extras:
 
 ```bash
-pip install "git+https://github.com/JakeSRhodesLab/GeneralForestProximities.git"
+pip install '.[aeon]'
+pip install '.[treeple]'
+pip install '.[quantile]'
+pip install '.[survival]'
+pip install '.[manifold]'
 ```
 
-### Install optional extras
-
-```bash
-pip install .[openml]
-pip install .[treeple]
-pip install .[phate]
-pip install .[umap]
-pip install .[manifold]
-```
-
-## Manifold embeddings from proximities
-
-Proximity-enabled forests can produce manifold embeddings after fitting:
+## Composition API
 
 ```python
-from forestgap import with_sparse_proximity
 from sklearn.ensemble import RandomForestClassifier
+from forestgap import Proximity, outlier_scores
 
-ProxRF = with_sparse_proximity(RandomForestClassifier)
-forest = ProxRF(
-    n_estimators=300,
-    random_state=0,
-    prox_method="rfgap",
-    non_zero_diagonal=True,
-)
+forest = RandomForestClassifier(n_estimators=300, random_state=0)
+proximity = Proximity(forest, relation="rfgap").fit(X_train, y_train)
 
-forest.fit(X, y)
-embedding = forest.embed(method="phate", n_components=2)
+P_train = proximity.get_proximities()
+P_test = proximity.prox_extend(X_test)
+scores = outlier_scores(proximity)
 ```
 
-PHATE consumes the forest proximities as precomputed affinities. t-SNE, Isomap,
-and UMAP use proximity-derived precomputed distances:
+Use `attach(X, y)` instead of `fit(X, y)` to index an already fitted parent
+forest. The unchanged parent is always available as `proximity.estimator`.
+
+Supported relation names include `original`, `oob`, `rfgap`, `honest_gap`,
+`kerf`, `path`, and `random_height`; isolation collision, quantile conditional,
+and survival-leaf relations are separately named. Call `capabilities_for` or
+inspect `proximity.capabilities_` before constructing automated study cells.
+Invalid cells raise `UnsupportedRelationError`.
+
+Native `CanonicalCorrelationForestClassifier` and
+`CanonicalCorrelationForestRegressor` estimators expose the `original`
+relation. Their deterministic MATLAB-source conformance fixture is packaged;
+CCF-Bag OOB/RF-GAP remains deliberately gated.
+
+RF-GAP, Honest-GAP, and conditional weights are directed. KeRF, path,
+random-height, original, and collision relations are symmetric kernels or
+affinities. Symmetrization must be explicit before an application requiring an
+undirected geometry.
+
+## Standalone applications
+
+The `forestgap.applications` namespace includes imputation, native and
+relation-based anomaly scoring, local importance, prototypes, visualization,
+kernel/kNN prediction, clustering, conditional quantiles, split conformal
+prediction, batch active learning, instance attribution, retrieval, and
+proximity-neighborhood feature selection.
 
 ```python
-embedding = forest.embed(
-    method="isomap",
-    n_components=2,
-    symm_mode="arithmetic",
-)
+from forestgap import embed, proximity_clustering
+
+coordinates = embed(proximity, method="isomap", symmetrize="arithmetic")
+clusters = proximity_clustering(proximity, n_clusters=3)
 ```
 
-RF-GAP proximities are asymmetric by default. Symmetrization is recommended for
-t-SNE, Isomap, and UMAP because these methods generally assume symmetric
-distances or undirected neighbor structure. PHATE can be run with the original
-asymmetric RF-GAP affinities, or with explicit symmetrization when desired.
+See [the migration guide](notes/migration_1_0.md) and the deterministic
+notebooks under `notebooks/`.
+
+## Verification
+
+```bash
+pytest -q
+python scripts/validate_notebooks.py --execute
+python -m experiments.run_method_matrix --smoke --output results/raw/method_matrix.jsonl
+```
+
+The experiment harness in `experiments/harness.py` runs declared
+`estimator × relation × application × data regime` cells, reuses fitted parent
+models and splits, and records provenance, diagnostics, runtime, peak memory,
+parent/downstream metrics, and unsupported statuses. The CI workflow also
+rejects executable imports of the removed wrapper API and builds the wheel.

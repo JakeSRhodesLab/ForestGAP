@@ -3,10 +3,10 @@ Manifold-learning applications for forest proximity matrices.
 
 The primary user-facing API is available from fitted proximity-enabled forests:
 
-    forest.embed(method="phate")
-    forest.embed(method="tsne")
-    forest.embed(method="isomap")
-    forest.embed(method="umap")
+    embed(proximity, method="phate")
+    embed(proximity, method="tsne")
+    embed(proximity, method="isomap")
+    embed(proximity, method="umap")
 """
 
 from forestgap.manifold.embedding import embed_from_forest, transform_from_forest
