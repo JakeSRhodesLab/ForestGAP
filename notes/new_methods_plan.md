@@ -69,6 +69,19 @@ and blockers so work can resume without reconstructing context.
   and without `core.py`. Next: commit this reviewed state, run the full default
   486-cell method matrix from that exact clean revision, audit every result row,
   and record the definitive run summary here.
+- **2026-07-16 07:30 MDT — full reviewed run complete.** Committed the reviewed
+  code as `41e27e4`, then ran the default 600-sample/128-tree matrix from that
+  exact clean revision. `results/raw/method_matrix.jsonl` contains all 486
+  unique estimator × relation × application × regime × seed cells: 351 valid,
+  135 explicitly unsupported, and zero errors. An independent artifact audit
+  confirmed the exact revision on every row; complete configuration, package,
+  split, timing, memory, parent-score, and relation-diagnostic provenance;
+  finite downstream metrics; expected 420 × 420 training-relation shapes; and
+  that every unsupported row is one of the five intentionally gated non-original
+  CCF relations. Aggregate per-cell wall time is 846.03 seconds and maximum
+  recorded peak allocation is 29,475,225 bytes. The review, debug, clean CI
+  reproduction, complete verification gate, and full method run are finished;
+  no work from this plan remains.
 - [x] Composition package and public exports (`proximity`, `adapters`,
   `applications`); remove `core.py` and wrapper API.
 - [x] Relation constructors and validity gates (`original`, `oob`, `rfgap`,
