@@ -254,12 +254,22 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
     paths = callable(getattr(estimator, "decision_path", None)) and family not in {
         "rotation_forest", "isolation_forest", "extended_isolation_forest"
     }
-    bootstrap = bool(getattr(estimator, "bootstrap", False))
+    rotation_oob_contract = (
+        family == "rotation_forest"
+        and inventory
+        and all(hasattr(estimator, attr) for attr in ("_pcas", "_groups", "_check_X"))
+        and (
+            callable(getattr(estimator, "_train_probas_for_estimator", None))
+            or callable(getattr(estimator, "_train_preds_for_estimator", None))
+        )
+    )
+
+    bootstrap = bool(getattr(estimator, "bootstrap", False)) or rotation_oob_contract
     samples = hasattr(estimator, "estimators_samples_")
     recoverable_sklearn_bootstrap = (
         bootstrap and inventory and all(hasattr(tree, "random_state") for tree in getattr(estimator, "estimators_", ()))
     )
-    in_bag = samples or recoverable_sklearn_bootstrap
+    in_bag = samples or recoverable_sklearn_bootstrap or rotation_oob_contract
     oob = bootstrap and in_bag
     honest = all(
         hasattr(estimator, attr)

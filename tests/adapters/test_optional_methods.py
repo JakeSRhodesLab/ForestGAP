@@ -67,7 +67,7 @@ def test_random_survival_forest_outputs_relation_and_ipcw_metrics():
     assert np.isfinite(metrics["integrated_brier_score"])
 
 
-def test_aeon_rotation_forest_declares_only_proven_relations():
+def test_aeon_rotation_forest_supports_oob_and_rfgap_when_fitted():
     pytest.importorskip("aeon")
     from aeon.classification.sklearn import RotationForestClassifier
 
@@ -77,10 +77,15 @@ def test_aeon_rotation_forest_declares_only_proven_relations():
     estimator = RotationForestClassifier(
         n_estimators=3, random_state=17, n_jobs=1,
     ).fit(X, y)
-    proximity = Proximity(estimator, relation="original").attach(X, y)
+    proximity = Proximity(estimator, relation="rfgap").attach(X, y)
     assert proximity.capabilities_.family == "rotation_forest"
-    assert set(proximity.capabilities_.valid_relations) == {"original", "kerf"}
+    assert {"original", "kerf", "oob", "rfgap"} <= set(
+        proximity.capabilities_.valid_relations
+    )
     assert proximity.get_proximities().shape == (len(X), len(X))
+    np.testing.assert_allclose(
+        proximity.prox_predict(X[:6]), estimator.predict_proba(X[:6]), atol=1e-6,
+    )
 
 
 def test_treeple_oblique_honest_and_extended_isolation_contracts():
