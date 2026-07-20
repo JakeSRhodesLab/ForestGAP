@@ -52,7 +52,7 @@ from forestgap.datasets import (
     make_sparse_oblique_hyperplane,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
     "Proximity",
     "CanonicalCorrelationForestClassifier",

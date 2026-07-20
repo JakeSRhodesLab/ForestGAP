@@ -17,7 +17,7 @@ jobs:
       - name: Install package and maintained optional adapters
         run: >-
           python -m pip install --upgrade pip build &&
-          python -m pip install -e '.[dev,aeon,treeple,quantile,survival]'
+          python -m pip install -e '.[dev,aeon,treeple,quantile,survival,boosted]'
       - name: Run static checks
         run: python -m ruff check forestgap experiments scripts tests
       - name: Run tests

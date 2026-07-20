@@ -93,7 +93,8 @@ def package_versions() -> dict[str, str | None]:
 
     packages = [
         "forestgap", "numpy", "scipy", "scikit-learn", "pandas", "aeon",
-        "treeple", "quantile-forest", "scikit-survival",
+        "treeple", "quantile-forest", "scikit-survival", "xgboost", "lightgbm",
+        "catboost",
     ]
     output: dict[str, str | None] = {}
     for package in packages:

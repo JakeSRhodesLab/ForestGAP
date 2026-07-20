@@ -15,7 +15,11 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.metrics import accuracy_score, adjusted_rand_score
 from sklearn.model_selection import train_test_split
 
@@ -34,6 +38,32 @@ except ModuleNotFoundError:  # pragma: no cover - direct script path
 
 
 EstimatorFactory = Callable[[int, int], Any]
+
+
+def _xgboost_factory(n_estimators: int, seed: int) -> Any:
+    from xgboost import XGBClassifier
+
+    return XGBClassifier(
+        n_estimators=n_estimators, max_depth=4, random_state=seed, n_jobs=1,
+    )
+
+
+def _lightgbm_factory(n_estimators: int, seed: int) -> Any:
+    from lightgbm import LGBMClassifier
+
+    return LGBMClassifier(
+        n_estimators=n_estimators, max_depth=4, random_state=seed, n_jobs=1,
+        verbosity=-1,
+    )
+
+
+def _catboost_factory(n_estimators: int, seed: int) -> Any:
+    from catboost import CatBoostClassifier
+
+    return CatBoostClassifier(
+        iterations=n_estimators, depth=4, random_seed=seed, verbose=False,
+        thread_count=1, allow_writing_files=False,
+    )
 
 
 def _csv(value: str) -> list[str]:
@@ -70,6 +100,12 @@ ESTIMATORS: dict[str, EstimatorFactory] = {
         n_estimators=n, max_depth=10, bootstrap=True, oob_score=True,
         random_state=seed,
     ),
+    "gradient_boosting": lambda n, seed: GradientBoostingClassifier(
+        n_estimators=n, max_depth=4, random_state=seed,
+    ),
+    "xgboost": _xgboost_factory,
+    "lightgbm": _lightgbm_factory,
+    "catboost": _catboost_factory,
 }
 
 

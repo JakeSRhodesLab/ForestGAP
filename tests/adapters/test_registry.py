@@ -17,7 +17,8 @@ def test_all_non_reference_roadmap_families_have_visible_rows():
         "random_forest", "extra_trees", "rotation_forest", "treeple_oblique_forest",
         "honest_forest", "isolation_forest", "extended_isolation_forest",
         "canonical_correlation_forest", "quantile_forest", "random_survival_forest",
-        "synthetic_null_urf", "boosted_trees", "causal_forest",
+        "synthetic_null_urf", "gradient_boosting", "xgboost", "lightgbm",
+        "catboost", "boosted_trees", "causal_forest",
         "generalized_random_forest", "bayesian_trees", "structured_pf_gap",
         "multiview_forest", "graph_forest", "autoencoding_forest",
     }

@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from importlib.util import find_spec
 from typing import Any, Mapping
 
+from .boosting import BOOSTED_FAMILIES, boosted_family, make_boosted_adapter
+
 
 class UnsupportedRelationError(ValueError):
     """Raised when an estimator does not satisfy a relation's validity contract."""
@@ -116,9 +118,30 @@ METHOD_REGISTRY: Mapping[str, MethodCapability] = {
         "synthetic_null_urf", "available", ("anomaly", "clustering"),
         ("original", "oob", "kerf", "path", "englund", "random_height"),
     ),
+    "gradient_boosting": MethodCapability(
+        "gradient_boosting", "available", ("classification", "regression"),
+        ("original", "kerf", "boosted", "path", "englund", "random_height"), None,
+        "OOB and RF-GAP are invalid because boosting lacks exchangeable bootstrap roles.",
+    ),
+    "xgboost": MethodCapability(
+        "xgboost", "optional", ("classification", "regression"),
+        ("original", "kerf", "boosted", "path", "englund", "random_height"), "xgboost",
+        "OOB and RF-GAP are invalid because boosting lacks exchangeable bootstrap roles.",
+    ),
+    "lightgbm": MethodCapability(
+        "lightgbm", "optional", ("classification", "regression"),
+        ("original", "kerf", "boosted", "path", "englund", "random_height"), "lightgbm",
+        "OOB and RF-GAP are invalid because boosting lacks exchangeable bootstrap roles.",
+    ),
+    "catboost": MethodCapability(
+        "catboost", "optional", ("classification", "regression"),
+        ("original", "kerf", "boosted", "path", "englund", "random_height"), "catboost",
+        "Path-derived relations additionally require grow_policy='SymmetricTree'; "
+        "OOB and RF-GAP are invalid for boosting.",
+    ),
     "boosted_trees": MethodCapability(
         "boosted_trees", "gated", ("classification", "regression"), (), None,
-        "Additive tree contributions are not bootstrap prediction weights.",
+        "This boosted family has no implemented fitted-contribution adapter; ordinary RF-GAP is invalid.",
     ),
     "causal_forest": MethodCapability(
         "causal_forest", "gated", ("causal",), (), None,
@@ -197,6 +220,9 @@ def _task_type(estimator: Any) -> str:
 def _family_for(estimator: Any) -> str:
     names = _mro_names(estimator)
     module = type(estimator).__module__
+    supported_boosted = boosted_family(estimator)
+    if supported_boosted is not None:
+        return supported_boosted
     if getattr(estimator, "_forestgap_synthetic_null", False):
         return "synthetic_null_urf"
     if any("HonestForest" in name for name in names):
@@ -217,7 +243,11 @@ def _family_for(estimator: Any) -> str:
         return "treeple_oblique_forest"
     if any("ExtraTrees" in name for name in names):
         return "extra_trees"
-    if any("GradientBoost" in name or "XGB" in name or "LGBM" in name or "CatBoost" in name for name in names):
+    if any(
+        token in name
+        for name in names
+        for token in ("GradientBoost", "XGB", "LGBM", "CatBoost", "AdaBoost")
+    ):
         return "boosted_trees"
     if any("RandomForest" in name or "ForestClassifier" in name or "ForestRegressor" in name for name in names):
         return "random_forest"
@@ -248,36 +278,49 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
             reason="No registered estimator adapter matches this estimator.",
         )
 
-    leaf_ids = callable(getattr(estimator, "apply", None)) or family in {
-        "rotation_forest", "isolation_forest", "extended_isolation_forest"
-    }
-    inventory = hasattr(estimator, "estimators_")
-    estimators = tuple(getattr(estimator, "estimators_", ()))
-    rotation_path_contract = (
-        family == "rotation_forest"
-        and inventory
-        and all(hasattr(estimator, attr) for attr in ("_pcas", "_groups", "_check_X"))
-        and len(getattr(estimator, "_pcas", ())) == len(estimators)
-        and len(getattr(estimator, "_groups", ())) == len(estimators)
-        and all(callable(getattr(tree, "decision_path", None)) for tree in estimators)
-    )
-    paths = (
-        rotation_path_contract
-        or (
-            callable(getattr(estimator, "decision_path", None))
-            and family not in {"isolation_forest", "extended_isolation_forest"}
-        )
-    )
-    node_depths = paths and (
-        (
+    boosted_adapter = None
+    if family in BOOSTED_FAMILIES:
+        try:
+            boosted_adapter = make_boosted_adapter(estimator)
+            inventory = boosted_adapter.tree_count > 0
+        except (AttributeError, RuntimeError, ValueError):
+            inventory = False
+        estimators: tuple[Any, ...] = ()
+        leaf_ids = inventory
+        paths = bool(inventory and boosted_adapter is not None and boosted_adapter.path_capable)
+        node_depths = paths
+        rotation_path_contract = False
+    else:
+        leaf_ids = callable(getattr(estimator, "apply", None)) or family in {
+            "rotation_forest", "isolation_forest", "extended_isolation_forest"
+        }
+        inventory = hasattr(estimator, "estimators_")
+        estimators = tuple(getattr(estimator, "estimators_", ()))
+        rotation_path_contract = (
             family == "rotation_forest"
-            and all(hasattr(tree, "tree_") for tree in estimators)
+            and inventory
+            and all(hasattr(estimator, attr) for attr in ("_pcas", "_groups", "_check_X"))
+            and len(getattr(estimator, "_pcas", ())) == len(estimators)
+            and len(getattr(estimator, "_groups", ())) == len(estimators)
+            and all(callable(getattr(tree, "decision_path", None)) for tree in estimators)
         )
-        or all(
-            hasattr(tree, "node_depths_") or hasattr(tree, "tree_")
-            for tree in estimators
+        paths = (
+            rotation_path_contract
+            or (
+                callable(getattr(estimator, "decision_path", None))
+                and family not in {"isolation_forest", "extended_isolation_forest"}
+            )
         )
-    )
+        node_depths = paths and (
+            (
+                family == "rotation_forest"
+                and all(hasattr(tree, "tree_") for tree in estimators)
+            )
+            or all(
+                hasattr(tree, "node_depths_") or hasattr(tree, "tree_")
+                for tree in estimators
+            )
+        )
     rotation_oob_contract = (
         family == "rotation_forest"
         and inventory
@@ -295,28 +338,40 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
         )
     )
 
-    bootstrap = bool(getattr(estimator, "bootstrap", False)) or rotation_oob_contract
+    bootstrap = (
+        False
+        if family in BOOSTED_FAMILIES
+        else bool(getattr(estimator, "bootstrap", False)) or rotation_oob_contract
+    )
     samples = hasattr(estimator, "estimators_samples_")
     recoverable_sklearn_bootstrap = (
         bootstrap and inventory and all(hasattr(tree, "random_state") for tree in estimators)
     )
-    in_bag = samples or recoverable_sklearn_bootstrap or rotation_oob_contract
+    in_bag = (
+        False
+        if family in BOOSTED_FAMILIES
+        else samples or recoverable_sklearn_bootstrap or rotation_oob_contract
+    )
     oob = bootstrap and in_bag
     honest = all(
         hasattr(estimator, attr)
         for attr in ("honest_indices_", "structure_indices_", "estimators_")
     )
-    contribution = bootstrap and in_bag and family not in {
-        "isolation_forest", "extended_isolation_forest", "quantile_forest",
-        "random_survival_forest", "synthetic_null_urf",
-    }
+    contribution = inventory if family in BOOSTED_FAMILIES else (
+        bootstrap and in_bag and family not in {
+            "isolation_forest", "extended_isolation_forest", "quantile_forest",
+            "random_survival_forest", "synthetic_null_urf",
+        }
+    )
 
     valid = set(static.valid_relations)
     if not leaf_ids or not inventory:
         valid -= {
             "original", "collision", "conditional", "survival_leaf", "kerf",
-            "path", "englund", "random_height",
+            "boosted", "path", "englund", "random_height",
         }
+    if not contribution:
+        valid.discard("boosted")
     if not paths:
         valid.discard("path")
         valid.discard("englund")
@@ -357,8 +412,26 @@ def validate_relation(estimator: Any, relation: str) -> EstimatorCapabilities:
 
     capabilities = capabilities_for(estimator)
     if relation not in capabilities.valid_relations:
-        reason = capabilities.reason or (
-            "the required leaf/path/bootstrap/honesty capability contract is absent"
-        )
+        if capabilities.family in BOOSTED_FAMILIES and relation in {"oob", "rfgap"}:
+            reason = (
+                "boosting does not provide the exchangeable bootstrap membership "
+                "and prediction-weight contract required by forest OOB/RF-GAP relations"
+            )
+        elif (
+            capabilities.family == "catboost"
+            and relation in {"path", "englund", "random_height"}
+        ):
+            try:
+                policy = make_boosted_adapter(estimator).grow_policy  # type: ignore[attr-defined]
+            except (AttributeError, RuntimeError, ValueError):
+                policy = "unknown"
+            reason = (
+                "CatBoost path-derived relations require grow_policy='SymmetricTree'; "
+                f"the fitted model uses grow_policy={policy!r}"
+            )
+        else:
+            reason = capabilities.reason or (
+                "the required leaf/path/bootstrap/honesty capability contract is absent"
+            )
         raise UnsupportedRelationError(capabilities.family, relation, reason)
     return capabilities

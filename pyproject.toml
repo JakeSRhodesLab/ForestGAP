@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forestgap"
-version = "1.0.0"
+version = "1.1.0"
 description = "Composition-based sparse relations and applications for forest estimators"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ treeple = ["treeple==0.10.3"]
 aeon = ["aeon>=1.0,<1.4"]
 quantile = ["quantile-forest"]
 survival = ["scikit-survival>=0.26,<0.27"]
+boosted = ["lightgbm>=4.3", "xgboost>=2.0", "catboost>=1.2"]
 phate = ["phate", "graphtools"]
 umap = ["umap-learn"]
 manifold = ["phate", "graphtools", "umap-learn"]

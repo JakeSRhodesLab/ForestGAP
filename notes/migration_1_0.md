@@ -40,3 +40,17 @@ attempting a best-effort bootstrap interpretation. In particular, isolation,
 boosted, Bayesian, causal, and structured forests never inherit generic RF-GAP
 semantics. Automated runners should catch that exception and record an
 `unsupported` row rather than drop the cell.
+
+## 1.1 boosted-tree additions
+
+Version 1.1 adds explicit adapters for sklearn GradientBoosting, XGBoost,
+LightGBM, and CatBoost. Use `relation="boosted"` for the normalized empirical
+leaf-contribution-variance kernel; `original` and `kerf` remain available, and
+path-derived relations are available when the backend exposes stable paths.
+CatBoost restricts those path-derived relations to `grow_policy="SymmetricTree"`.
+Optional backends are installed with `pip install '.[boosted]'`.
+
+This does not relax the RF-GAP validity gate. Booster subsampling and CatBoost
+bootstrap modes are not the exchangeable bootstrap membership/prediction-weight
+contract required by `oob` and `rfgap`, so both relations remain explicitly
+invalid for all boosted families.

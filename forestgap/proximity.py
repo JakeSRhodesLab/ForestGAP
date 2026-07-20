@@ -18,9 +18,12 @@ from sklearn.utils.validation import check_is_fitted
 import pandas as pd
 
 from forestgap.adapters import (
+    BOOSTED_FAMILIES,
+    BoostedTreeAdapter,
     EstimatorCapabilities,
     UnsupportedRelationError,
     capabilities_for,
+    make_boosted_adapter,
     validate_relation,
 )
 from forestgap.adapters.aeon import (
@@ -81,6 +84,7 @@ ProxMethod = Literal[
     "rfgap",
     "honest_gap",
     "kerf",
+    "boosted",
     "path",
     "englund",
     "random_height",
@@ -239,7 +243,8 @@ class Proximity:
     ) -> None:
         valid_relations = {
             "original", "oob", "rfgap", "honest_gap", "kerf", "path",
-            "englund", "random_height", "collision", "conditional", "survival_leaf",
+            "boosted", "englund", "random_height", "collision", "conditional",
+            "survival_leaf",
         }
         if prox_method not in valid_relations:
             raise ValueError(
@@ -270,9 +275,13 @@ class Proximity:
         self._oob_surrogate_leaf_matrix_: Optional[np.ndarray] = None
         self._y_train: Optional[np.ndarray] = None
         self._X_train: Optional[np.ndarray] = None
+        self._X_train_native: Any | None = None
         self._X_train_index_: Optional[pd.Index] = None
         self._X_train_columns_: Optional[pd.Index] = None
         self._X_train_was_dataframe_: bool = False
+        self._boosted_adapter: BoostedTreeAdapter | None = None
+        self.tree_weights_: np.ndarray | None = None
+        self.tree_weighting: str | None = None
 
     def fit(self, X: Any, y: Optional[Any] = None, **fit_kwargs: Any) -> "Proximity":
         """
@@ -312,6 +321,11 @@ class Proximity:
 
         check_is_fitted(self.estimator)
         self.capabilities_ = validate_relation(self.estimator, self.relation)
+        self._boosted_adapter = (
+            make_boosted_adapter(self.estimator)
+            if self.capabilities_.family in BOOSTED_FAMILIES
+            else None
+        )
         self._index_training_data(X, y)
         self._set_rotation_forest_oob_attributes(X, y)
         self.relation_metadata_ = self._base_relation_metadata()
@@ -331,6 +345,8 @@ class Proximity:
     def apply(self, X: Any) -> np.ndarray:
         """Return leaf IDs through the estimator-specific apply adapter."""
 
+        if self._boosted_adapter is not None:
+            return self._boosted_adapter.leaf_ids(X)
         apply_fn = getattr(self.estimator, "apply", None)
         if callable(apply_fn):
             return np.asarray(apply_fn(X))
@@ -416,6 +432,25 @@ class Proximity:
         self.leaf_matrix_ = leaves
         self._leaf_encoding = self._build_leaf_encoding(leaves)
 
+        if self.prox_method == "boosted":
+            if self._boosted_adapter is None:
+                raise RuntimeError("Boosted relation requires a fitted-contribution adapter.")
+            weights = np.asarray(
+                self._boosted_adapter.contribution_weights(
+                    self._relation_training_features(),
+                ),
+                dtype=np.float64,
+            )
+            if weights.shape != (n_trees,):
+                raise RuntimeError("Boosted tree-weight inventory does not match leaf columns.")
+            if np.any(~np.isfinite(weights)) or np.any(weights < 0):
+                raise RuntimeError("Boosted tree weights must be finite and non-negative.")
+            total_weight = float(weights.sum())
+            if total_weight <= 0:
+                raise RuntimeError("Boosted tree weights must have positive total mass.")
+            self.tree_weights_ = weights / total_weight
+            self.tree_weighting = "training_leaf_contribution_variance"
+
         self._build_W_matrix()
 
     def get_proximities(self) -> MatrixLike:
@@ -443,7 +478,7 @@ class Proximity:
             raise RuntimeError("Leaf matrix is not initialized.")
 
         if self.prox_method in {
-            "original", "oob", "collision", "survival_leaf",
+            "original", "oob", "boosted", "collision", "survival_leaf",
         }:
             Q = W.copy()
         else:
@@ -584,6 +619,16 @@ class Proximity:
             "value_max": float(np.max(values)) if values.size else 0.0,
             "row_mass_min": float(np.min(row_mass)) if row_mass.size else 0.0,
             "row_mass_max": float(np.max(row_mass)) if row_mass.size else 0.0,
+            **(
+                {
+                    "tree_weighting": self.tree_weighting,
+                    "tree_weight_sum": float(np.sum(self.tree_weights_)),
+                    "tree_weight_min": float(np.min(self.tree_weights_)),
+                    "tree_weight_max": float(np.max(self.tree_weights_)),
+                }
+                if self.relation == "boosted" and self.tree_weights_ is not None
+                else {}
+            ),
         }
 
     def _base_relation_metadata(self) -> dict[str, Any]:
@@ -599,6 +644,9 @@ class Proximity:
         }
         if self.relation == "englund":
             metadata["englund_weight"] = self.englund_weight
+        if self.relation == "boosted" and self.tree_weights_ is not None:
+            metadata["tree_weighting"] = self.tree_weighting
+            metadata["tree_weights"] = self.tree_weights_.tolist()
         oob_valid = getattr(self, "oob_valid_mask_", None)
         if self.relation in {"oob", "rfgap"} and oob_valid is not None:
             valid = np.asarray(oob_valid, dtype=bool)
@@ -617,22 +665,29 @@ class Proximity:
             random_state=self.random_state,
             englund_weight=self.englund_weight,
         )
-        if self._X_train is None:
+        training_features = self._relation_training_features()
+        if training_features is None:
             raise RuntimeError("Training features are unavailable for relation dispatch.")
-        alternate.attach(self._X_train, self._y_train)
+        alternate.attach(training_features, self._y_train)
         return alternate
 
     def _kernel_relation(self, relation: str, X_new: Any | None) -> MatrixLike:
         if relation == "kerf":
-            train_features = self._kerf_features(self._X_train, training=True)
+            train_features = self._kerf_features(
+                self._relation_training_features(), training=True,
+            )
             query_features = train_features if X_new is None else self._kerf_features(X_new, training=False)
         elif relation == "path":
-            train_features = self._path_features(self._X_train, training=True)
+            train_features = self._path_features(
+                self._relation_training_features(), training=True,
+            )
             query_features = train_features if X_new is None else self._path_features(X_new, training=False)
         elif relation == "englund":
             return self._englund_relation(X_new)
         elif relation == "random_height":
-            train_features = self._random_height_features(self._X_train, training=True)
+            train_features = self._random_height_features(
+                self._relation_training_features(), training=True,
+            )
             query_features = train_features if X_new is None else self._random_height_features(X_new, training=False)
         else:  # pragma: no cover - internal dispatch guard
             raise ValueError(f"Unknown kernel relation: {relation}")
@@ -667,11 +722,14 @@ class Proximity:
         return features
 
     def _decision_path_indicator(self, X: Any) -> tuple[sparse.csr_matrix, np.ndarray]:
-        result = (
-            rotation_forest_decision_path(self.estimator, X)
-            if _is_rotation_forest_instance(self.estimator)
-            else self.estimator.decision_path(X)
-        )
+        if self._boosted_adapter is not None:
+            result = self._boosted_adapter.decision_path(X)
+        else:
+            result = (
+                rotation_forest_decision_path(self.estimator, X)
+                if _is_rotation_forest_instance(self.estimator)
+                else self.estimator.decision_path(X)
+            )
         if not isinstance(result, tuple) or len(result) != 2:
             raise UnsupportedRelationError(
                 self.capabilities_.family if self.capabilities_ else "unknown",
@@ -681,7 +739,11 @@ class Proximity:
         indicator, node_ptr = result
         indicator = sparse.csr_matrix(indicator)
         node_ptr = np.asarray(node_ptr, dtype=np.int64)
-        n_trees = len(getattr(self.estimator, "estimators_", ()))
+        n_trees = (
+            self._boosted_adapter.tree_count
+            if self._boosted_adapter is not None
+            else len(getattr(self.estimator, "estimators_", ()))
+        )
         if (
             node_ptr.ndim != 1
             or node_ptr.shape[0] != n_trees + 1
@@ -791,9 +853,10 @@ class Proximity:
     def _englund_relation(self, X_new: Any | None) -> MatrixLike:
         """Compute the Englund–Verikas PBK over all fitted forest trees."""
 
-        if self._X_train is None:
+        training_features = self._relation_training_features()
+        if training_features is None:
             raise RuntimeError("Training features are unavailable for relation dispatch.")
-        train_paths = self._englund_paths(self._X_train, training=True)
+        train_paths = self._englund_paths(training_features, training=True)
         query_paths = train_paths if X_new is None else self._englund_paths(X_new, training=False)
         if len(query_paths) != len(train_paths):
             raise RuntimeError("Query and training forests have different tree counts.")
@@ -835,6 +898,8 @@ class Proximity:
     def _forest_node_depths(self) -> list[np.ndarray]:
         """Return node depths using the estimator's declared tree layout."""
 
+        if self._boosted_adapter is not None:
+            return self._boosted_adapter.node_depths()
         if _is_rotation_forest_instance(self.estimator):
             return rotation_forest_node_depths(self.estimator)
 
@@ -859,11 +924,11 @@ class Proximity:
         if training and cache_key in self._relation_feature_cache:
             return self._relation_feature_cache[cache_key]
         indicator, node_ptr = self._decision_path_indicator(X)
-        estimators = list(self.estimators_)
+        n_trees = int(node_ptr.size - 1)
         if training:
             rng = np.random.default_rng(self.random_state)
             depths = self._forest_node_depths()
-            if len(depths) != len(estimators):
+            if len(depths) != n_trees:
                 raise RuntimeError("Node-depth inventory does not match fitted tree inventory.")
             for tree_idx, depth in enumerate(depths):
                 expected = int(node_ptr[tree_idx + 1] - node_ptr[tree_idx])
@@ -894,7 +959,7 @@ class Proximity:
                     selected = int(eligible[np.argmax(depth[eligible])])
                     rows.append(row)
                     cols.append(start + selected)
-        values = np.full(len(rows), 1.0 / np.sqrt(len(estimators)), dtype=float)
+        values = np.full(len(rows), 1.0 / np.sqrt(n_trees), dtype=float)
         features = sparse.csr_matrix(
             (values, (rows, cols)), shape=(indicator.shape[0], indicator.shape[1]),
         )
@@ -1833,6 +1898,7 @@ class Proximity:
 
     def _store_training_features(self, X: Any) -> None:
         if sparse.issparse(X):
+            self._X_train_native = X.copy()
             self._X_train = None
             self._X_train_index_ = None
             self._X_train_columns_ = None
@@ -1840,10 +1906,29 @@ class Proximity:
             return
 
         if isinstance(X, pd.DataFrame):
+            self._X_train_native = X.copy(deep=True)
             self._X_train = X.to_numpy(copy=True)
             self._X_train_index_ = X.index.copy()
             self._X_train_columns_ = X.columns.copy()
             self._X_train_was_dataframe_ = True
+            return
+
+        if (
+            type(X).__module__.split(".", 1)[0] == "catboost"
+            and type(X).__name__ == "Pool"
+        ):
+            # Pool carries categorical/text feature metadata required by native
+            # CatBoost leaf inference.  It is immutable from this API's point
+            # of view, so retain it rather than coercing it to an object array.
+            self._X_train_native = X
+            try:
+                pool_features = np.asarray(X.get_features())
+            except Exception:
+                pool_features = None
+            self._X_train = pool_features
+            self._X_train_index_ = None
+            self._X_train_columns_ = None
+            self._X_train_was_dataframe_ = False
             return
 
         X_arr = np.array(X, copy=True)
@@ -1851,9 +1936,17 @@ class Proximity:
             X_arr = X_arr.reshape(1, -1)
 
         self._X_train = X_arr
+        self._X_train_native = X_arr
         self._X_train_index_ = None
         self._X_train_columns_ = None
         self._X_train_was_dataframe_ = False
+
+    def _relation_training_features(self) -> Any | None:
+        """Return training features in the estimator's native input format."""
+
+        if self._X_train_native is not None:
+            return self._X_train_native
+        return self._X_train
 
     def _prepare_local_feature_matrix(
         self,
@@ -2635,6 +2728,11 @@ class Proximity:
         }:
             weights = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
 
+        elif self.prox_method == "boosted":
+            if self.tree_weights_ is None:
+                raise RuntimeError("tree_weights_ must be available for relation='boosted'.")
+            weights = np.sqrt(self.tree_weights_[tree_ids]).astype(np.float32)
+
         elif self.prox_method == "oob":
             if self.oob_mask_ is None:
                 raise RuntimeError("oob_mask_ must be available for prox_method='oob'.")
@@ -2809,6 +2907,11 @@ class Proximity:
             "kerf", "path", "englund", "random_height",
         }:
             vals = np.full(rows.shape[0], 1.0 / np.sqrt(n_trees), dtype=np.float32)
+
+        elif self.prox_method == "boosted":
+            if self.tree_weights_ is None:
+                raise RuntimeError("tree_weights_ must be available for relation='boosted'.")
+            vals = np.sqrt(self.tree_weights_[tree_ids]).astype(np.float32)
 
         elif self.prox_method == "oob":
             vals = np.full(rows.shape[0], np.sqrt(n_trees) / n_trees, dtype=np.float32)

@@ -16,6 +16,16 @@ from .registry import (
     method_registry_rows,
     validate_relation,
 )
+from .boosting import (
+    BOOSTED_FAMILIES,
+    BoostedTreeAdapter,
+    CatBoostAdapter,
+    LightGBMAdapter,
+    SklearnGradientBoostingAdapter,
+    XGBoostAdapter,
+    boosted_family,
+    make_boosted_adapter,
+)
 from .synthetic_null import SyntheticNullForest
 from .ccf import (
     CCFConformance,
@@ -33,17 +43,25 @@ patch_treeple_sample_weight_signature()
 
 __all__ = [
     "METHOD_REGISTRY",
+    "BOOSTED_FAMILIES",
+    "BoostedTreeAdapter",
+    "CatBoostAdapter",
     "EstimatorCapabilities",
     "CCFConformance",
     "CanonicalCorrelationForestClassifier",
     "CanonicalCorrelationForestRegressor",
     "MethodCapability",
+    "LightGBMAdapter",
+    "SklearnGradientBoostingAdapter",
     "SyntheticNullForest",
     "UnsupportedRelationError",
+    "XGBoostAdapter",
+    "boosted_family",
     "capabilities_for",
     "censoring_safe_survival_metrics",
     "method_capabilities",
     "method_registry_rows",
+    "make_boosted_adapter",
     "load_ccf_oracle_fixture",
     "native_quantiles",
     "native_survival_outputs",

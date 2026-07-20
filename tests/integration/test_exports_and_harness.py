@@ -8,7 +8,7 @@ from experiments.harness import ExperimentCell, run_cells
 
 
 def test_removed_wrapper_surface_and_public_composition_exports():
-    assert forestgap.__version__ == "1.0.0"
+    assert forestgap.__version__ == "1.1.0"
     assert hasattr(forestgap, "Proximity")
     assert not hasattr(forestgap, "with_sparse_proximity")
     assert not hasattr(forestgap, "SparseProximityMixin")
