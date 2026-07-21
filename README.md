@@ -124,6 +124,17 @@ coordinates = embed(proximity, method="isomap", symmetrize="arithmetic")
 clusters = proximity_clustering(proximity, n_clusters=3)
 ```
 
+`proximity_clustering` supports `method="spectral"` (the default),
+`method="hdbscan"`, and `method="kmeans"`. Spectral clustering consumes the
+prepared proximity affinity directly; HDBSCAN receives its dense precomputed
+distance conversion; and K-means runs on a KernelPCA embedding of the
+precomputed affinity. HDBSCAN infers its number of clusters, so use its
+density controls directly, for example:
+
+```python
+labels = proximity_clustering(proximity, method="hdbscan", min_cluster_size=10)
+```
+
 See [the migration guide](notes/migration_1_0.md) and the deterministic
 notebooks under `notebooks/`.
 
