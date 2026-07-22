@@ -24,6 +24,7 @@ from experiments.common import (
     iter_openml_suite,
     parse_random_states,
     prepare_dataset,
+    proximity_methods_for_model,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -65,75 +66,73 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         continue
                     try:
                         prepared = prepare_dataset(
-                            task_kind,
-                            task_id=task_id,
-                            task=task,
-                            random_state=random_state,
-                            max_rows=args.max_rows,
+                            task_kind, task_id=task_id, task=task,
+                            random_state=random_state, max_rows=args.max_rows,
                             test_size=args.test_size,
                         )
                         rng = np.random.RandomState(random_state)
                         n_points = min(args.n_points, prepared.train_size)
-                        sample_idx = np.sort(rng.choice(np.arange(prepared.train_size), size=n_points, replace=False))
+                        sample_idx = np.sort(rng.choice(
+                            np.arange(prepared.train_size), size=n_points, replace=False,
+                        ))
                         X_train = prepared.X_train[sample_idx]
                         y_train = prepared.y_train[sample_idx]
                         X_train_filled, _ = rough_fill_train_test(
-                            X_train,
-                            prepared.X_test[:1],
+                            X_train, prepared.X_test[:1],
                             [idx for idx in prepared.categorical_indices if idx < X_train.shape[1]],
-                        )
-                        model = build_proximity_model(
-                            prepared.task_kind,
-                            model_name=model_name,
-                            prox_method="rfgap",
-                            random_state=random_state,
-                            n_estimators=args.n_estimators,
-                            bootstrap=True,
-                            oob_score=False,
-                            extra_kwargs={"symm_mode": "arithmetic", "non_zero_diagonal": True},
-                        )
-                        fit_start = time.perf_counter()
-                        model.fit(X_train_filled, y_train)
-                        fit_runtime_seconds = time.perf_counter() - fit_start
-                        plot_start = time.perf_counter()
-                        fig = plot_mds(model, y=y_train)
-                        out_dir = compiled_output_dir(EXPERIMENT_NAME, task_kind)
-                        filename = f"{_safe_slug(model_name)}__{_safe_slug(prepared.dataset_name)}__seed{random_state}.png"
-                        path = out_dir / filename
-                        fig.savefig(path, dpi=180, bbox_inches="tight")
-                        plt.close(fig)
-                        plot_runtime_seconds = time.perf_counter() - plot_start
-                        rows.append(
-                            {
-                                "experiment": EXPERIMENT_NAME,
-                                "status": "ok",
-                                "task_kind": task_kind,
-                                "model_name": model_name,
-                                "random_state": random_state,
-                                "task_id": prepared.task_id,
-                                "dataset_id": prepared.dataset_id,
-                                "dataset_name": prepared.dataset_name,
-                                "n_points": int(n_points),
-                                "plot_path": str(path.relative_to(Path.cwd())),
-                                "fit_runtime_seconds": float(fit_runtime_seconds),
-                                "plot_runtime_seconds": float(plot_runtime_seconds),
-                                "total_runtime_seconds": float(
-                                    fit_runtime_seconds + plot_runtime_seconds
-                                ),
-                            }
                         )
                     except Exception as exc:
                         error_row = record_exception(
-                            experiment_name=EXPERIMENT_NAME,
-                            task_kind=task_kind,
-                            random_state=random_state,
-                            dataset_name=dataset_name,
-                            dataset_id=dataset_id,
-                            task_id=task_id,
-                            error=exc,
+                            experiment_name=EXPERIMENT_NAME, task_kind=task_kind,
+                            random_state=random_state, dataset_name=dataset_name,
+                            dataset_id=dataset_id, task_id=task_id, error=exc,
                         )
                         error_row["model_name"] = model_name
                         rows.append(error_row)
+                        continue
+
+                    for prox_method in proximity_methods_for_model(model_name):
+                        try:
+                            model = build_proximity_model(
+                                prepared.task_kind, model_name=model_name,
+                                prox_method=prox_method, random_state=random_state,
+                                n_estimators=args.n_estimators, bootstrap=True,
+                                oob_score=False,
+                                extra_kwargs={"symm_mode": "arithmetic", "non_zero_diagonal": True},
+                            )
+                            fit_start = time.perf_counter()
+                            model.fit(X_train_filled, y_train)
+                            fit_runtime_seconds = time.perf_counter() - fit_start
+                            plot_start = time.perf_counter()
+                            fig = plot_mds(model, y=y_train)
+                            out_dir = compiled_output_dir(EXPERIMENT_NAME, task_kind)
+                            filename = (
+                                f"{_safe_slug(model_name)}__{prox_method}__"
+                                f"{_safe_slug(prepared.dataset_name)}__seed{random_state}.png"
+                            )
+                            path = out_dir / filename
+                            fig.savefig(path, dpi=180, bbox_inches="tight")
+                            plt.close(fig)
+                            plot_runtime_seconds = time.perf_counter() - plot_start
+                            rows.append({
+                                "experiment": EXPERIMENT_NAME, "status": "ok",
+                                "task_kind": task_kind, "model_name": model_name,
+                                "prox_method": prox_method, "random_state": random_state,
+                                "task_id": prepared.task_id, "dataset_id": prepared.dataset_id,
+                                "dataset_name": prepared.dataset_name, "n_points": int(n_points),
+                                "plot_path": str(path.relative_to(Path.cwd())),
+                                "fit_runtime_seconds": float(fit_runtime_seconds),
+                                "plot_runtime_seconds": float(plot_runtime_seconds),
+                                "total_runtime_seconds": float(fit_runtime_seconds + plot_runtime_seconds),
+                            })
+                        except Exception as exc:
+                            error_row = record_exception(
+                                experiment_name=EXPERIMENT_NAME, task_kind=task_kind,
+                                random_state=random_state, dataset_name=dataset_name,
+                                dataset_id=dataset_id, task_id=task_id, error=exc,
+                            )
+                            error_row.update({"model_name": model_name, "prox_method": prox_method})
+                            rows.append(error_row)
 
     return pd.DataFrame(rows)
 
@@ -145,7 +144,7 @@ def compile_outputs(df: pd.DataFrame) -> None:
         out_dir = compiled_output_dir(EXPERIMENT_NAME, task_kind)
         summary = aggregate_success_rows(
             task_df,
-            group_cols=("model_name",),
+            group_cols=("model_name", "prox_method"),
             metric_cols=(
                 "n_points",
                 "fit_runtime_seconds",

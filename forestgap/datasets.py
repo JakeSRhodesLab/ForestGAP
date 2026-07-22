@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -37,6 +37,66 @@ class OpenMLBenchmarkSuite:
     datasets: List[OpenMLDataset]
     description: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OpenMLTask:
+    """A typed OpenML predictive task and its normalized dataset payload.
+
+    Unlike an :class:`OpenMLDataset`, an OpenML task also fixes the target and
+    publishes the server-provided resampling dimensions.  The dimensions use
+    OpenML's zero-based ``(repeat, fold, sample)`` indexing and should be used
+    to construct outer evaluation folds rather than re-splitting the data.
+    """
+
+    task_id: int
+    dataset: OpenMLDataset
+    target_name: TargetName
+    repeats: int
+    folds: int
+    samples: int
+    task_type: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def dataset_id(self) -> int:
+        """Convenience identifier for manifest rows."""
+
+        return self.dataset.dataset_id
+
+
+@dataclass
+class OpenMLTaskFold:
+    """One official train/test split belonging to an :class:`OpenMLTask`."""
+
+    task: OpenMLTask
+    repeat: int
+    fold: int
+    sample: int
+    train_indices: np.ndarray
+    test_indices: np.ndarray
+
+    @property
+    def task_id(self) -> int:
+        return self.task.task_id
+
+    @property
+    def dataset(self) -> OpenMLDataset:
+        return self.task.dataset
+
+    @property
+    def dataset_id(self) -> int:
+        return self.task.dataset_id
+
+    @property
+    def target_name(self) -> TargetName:
+        return self.task.target_name
+
+    @property
+    def fold_id(self) -> str:
+        """Stable, human-readable identifier suitable for result manifests."""
+
+        return f"r{self.repeat}-f{self.fold}-s{self.sample}"
 
 
 @dataclass
@@ -613,6 +673,252 @@ def load_openml_dataset(
     )
 
 
+def _get_openml_task(openml: Any, task_id: int, *, download_splits: bool) -> Any:
+    """Load a task while remaining compatible with lightweight OpenML mocks."""
+
+    get_task = openml.tasks.get_task
+    try:
+        return get_task(int(task_id), download_splits=download_splits)
+    except TypeError:
+        # Older bindings and test doubles did not expose ``download_splits``.
+        return get_task(int(task_id))
+
+
+def _task_split_dimensions(task: Any) -> tuple[int, int, int]:
+    """Return OpenML ``(repeats, folds, samples)`` dimensions conservatively."""
+
+    get_dimensions = getattr(task, "get_split_dimensions", None)
+    if not callable(get_dimensions):
+        return (1, 1, 1)
+    dimensions = tuple(int(value) for value in get_dimensions())
+    if len(dimensions) != 3 or any(value < 1 for value in dimensions):
+        raise ValueError(
+            "OpenML task split dimensions must be three positive integers; "
+            f"received {dimensions!r}."
+        )
+    return dimensions
+
+
+def _task_metadata(task: Any, *, task_id: int) -> Dict[str, Any]:
+    """Capture stable task fields without depending on a binding version."""
+
+    fields = (
+        "dataset_id",
+        "target_name",
+        "task_type_id",
+        "task_type",
+        "estimation_procedure",
+        "evaluation_measure",
+        "class_labels",
+    )
+    metadata: Dict[str, Any] = {"task_id": int(task_id)}
+    for field_name in fields:
+        value = getattr(task, field_name, None)
+        if value is not None:
+            metadata[field_name] = value
+    return metadata
+
+
+def _load_openml_task_from_raw(
+    *,
+    task_id: int,
+    task: Any,
+    as_frame: bool,
+    download_data: bool,
+) -> OpenMLTask:
+    dataset_id = getattr(task, "dataset_id", None)
+    if dataset_id is None:
+        raise ValueError(f"OpenML task {task_id} does not expose a dataset_id.")
+    target_name = _normalize_target_name(getattr(task, "target_name", None))
+    dataset = load_openml_dataset(
+        dataset_id=int(dataset_id),
+        target_name=target_name,
+        as_frame=as_frame,
+        download_data=download_data,
+    )
+    repeats, folds, samples = _task_split_dimensions(task)
+    task_type = getattr(task, "task_type", None)
+    return OpenMLTask(
+        task_id=int(task_id),
+        dataset=dataset,
+        target_name=target_name,
+        repeats=repeats,
+        folds=folds,
+        samples=samples,
+        task_type=None if task_type is None else str(task_type),
+        metadata=_task_metadata(task, task_id=task_id),
+    )
+
+
+def load_openml_task(
+    *,
+    task_id: int,
+    as_frame: bool = True,
+    download_data: bool = True,
+    download_splits: bool = False,
+) -> OpenMLTask:
+    """Load one typed OpenML task, including its official split dimensions.
+
+    The data payload is normalized through :func:`load_openml_dataset`, so
+    existing suite loaders and task-based studies use exactly the same feature
+    and target semantics.  Set ``download_splits=True`` when a subsequent
+    caller will immediately materialize a fold.
+    """
+
+    openml = _require_openml()
+    resolved_task_id = int(task_id)
+    task = _get_openml_task(
+        openml, resolved_task_id, download_splits=download_splits,
+    )
+    return _load_openml_task_from_raw(
+        task_id=resolved_task_id,
+        task=task,
+        as_frame=as_frame,
+        download_data=download_data,
+    )
+
+
+def _validate_fold_indices(
+    *,
+    task: OpenMLTask,
+    repeat: int,
+    fold: int,
+    sample: int,
+    train_indices: Any,
+    test_indices: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    repeats, folds, samples = task.repeats, task.folds, task.samples
+    values = (repeat, fold, sample)
+    limits = (repeats, folds, samples)
+    labels = ("repeat", "fold", "sample")
+    for label, value, limit in zip(labels, values, limits):
+        if value < 0 or value >= limit:
+            raise ValueError(
+                f"OpenML task {task.task_id} has {label} range [0, {limit}); "
+                f"received {value}."
+            )
+
+    train = np.asarray(train_indices, dtype=np.int64).ravel()
+    test = np.asarray(test_indices, dtype=np.int64).ravel()
+    if train.size == 0 or test.size == 0:
+        raise ValueError(
+            f"OpenML task {task.task_id} fold r{repeat}-f{fold}-s{sample} "
+            "must contain non-empty train and test indices."
+        )
+    if np.unique(train).size != train.size or np.unique(test).size != test.size:
+        raise ValueError("OpenML train/test indices must be unique within each partition.")
+    if np.intersect1d(train, test).size:
+        raise ValueError("OpenML train and test indices must be disjoint.")
+    n_samples = len(task.dataset.X)
+    if train.min() < 0 or test.min() < 0 or train.max() >= n_samples or test.max() >= n_samples:
+        raise ValueError(
+            f"OpenML task {task.task_id} fold indices must lie in [0, {n_samples})."
+        )
+    return train, test
+
+
+def _load_openml_task_fold_from_raw(
+    *,
+    task_id: int,
+    raw_task: Any,
+    task: OpenMLTask,
+    repeat: int,
+    fold: int,
+    sample: int,
+) -> OpenMLTaskFold:
+    get_indices = getattr(raw_task, "get_train_test_split_indices", None)
+    if not callable(get_indices):
+        raise ValueError(
+            f"OpenML task {task_id} does not expose official train/test split indices."
+        )
+    train_indices, test_indices = get_indices(
+        repeat=int(repeat), fold=int(fold), sample=int(sample),
+    )
+    train, test = _validate_fold_indices(
+        task=task,
+        repeat=int(repeat),
+        fold=int(fold),
+        sample=int(sample),
+        train_indices=train_indices,
+        test_indices=test_indices,
+    )
+    return OpenMLTaskFold(
+        task=task,
+        repeat=int(repeat),
+        fold=int(fold),
+        sample=int(sample),
+        train_indices=train,
+        test_indices=test,
+    )
+
+
+def load_openml_task_fold(
+    *,
+    task_id: int,
+    fold: int = 0,
+    repeat: int = 0,
+    sample: int = 0,
+    as_frame: bool = True,
+    download_data: bool = True,
+) -> OpenMLTaskFold:
+    """Load one official, zero-based OpenML outer fold for a predictive task."""
+
+    openml = _require_openml()
+    resolved_task_id = int(task_id)
+    raw_task = _get_openml_task(openml, resolved_task_id, download_splits=True)
+    task = _load_openml_task_from_raw(
+        task_id=resolved_task_id,
+        task=raw_task,
+        as_frame=as_frame,
+        download_data=download_data,
+    )
+    return _load_openml_task_fold_from_raw(
+        task_id=resolved_task_id,
+        raw_task=raw_task,
+        task=task,
+        repeat=repeat,
+        fold=fold,
+        sample=sample,
+    )
+
+
+def iter_openml_task_folds(
+    *,
+    task_id: int,
+    as_frame: bool = True,
+    download_data: bool = True,
+) -> Iterator[OpenMLTaskFold]:
+    """Yield all official folds of a task in repeat/fold/sample order."""
+
+    openml = _require_openml()
+    resolved_task_id = int(task_id)
+    raw_task = _get_openml_task(openml, resolved_task_id, download_splits=True)
+    task = _load_openml_task_from_raw(
+        task_id=resolved_task_id,
+        task=raw_task,
+        as_frame=as_frame,
+        download_data=download_data,
+    )
+    for repeat in range(task.repeats):
+        for fold in range(task.folds):
+            for sample in range(task.samples):
+                yield _load_openml_task_fold_from_raw(
+                    task_id=resolved_task_id,
+                    raw_task=raw_task,
+                    task=task,
+                    repeat=repeat,
+                    fold=fold,
+                    sample=sample,
+                )
+
+
+# ``split`` is a useful synonym in callers that mirror the OpenML binding's
+# ``get_train_test_split_indices`` method.  Keep both public spellings.
+OpenMLTaskSplit = OpenMLTaskFold
+load_openml_task_split = load_openml_task_fold
+iter_openml_task_splits = iter_openml_task_folds
+
+
 def _resolve_suite_id_by_name(openml: Any, suite_name: str) -> int:
     query = str(suite_name).strip().casefold()
     suites = openml.study.list_suites(output_format="dataframe")
@@ -708,10 +1014,18 @@ def load_openml_suite(
 __all__ = [
     "OpenMLBenchmarkSuite",
     "OpenMLDataset",
+    "OpenMLTask",
+    "OpenMLTaskFold",
+    "OpenMLTaskSplit",
     "SyntheticDataset",
     "SIMULATION_DATASET_GENERATORS",
     "load_openml_dataset",
     "load_openml_suite",
+    "load_openml_task",
+    "load_openml_task_fold",
+    "load_openml_task_split",
+    "iter_openml_task_folds",
+    "iter_openml_task_splits",
     "load_simulated_dataset",
     "make_rotated_linear_boundary",
     "make_rotated_xor",

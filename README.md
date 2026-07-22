@@ -144,6 +144,7 @@ notebooks under `notebooks/`.
 pytest -q
 python scripts/validate_notebooks.py --execute
 python -m experiments.run_method_matrix --smoke --output results/raw/method_matrix.jsonl
+python -m experiments.run_protocol_matrix --smoke --task classification --output results/raw/protocol_matrix.jsonl
 ```
 
 The experiment harness in `experiments/harness.py` runs declared
@@ -151,3 +152,9 @@ The experiment harness in `experiments/harness.py` runs declared
 models and splits, and records provenance, diagnostics, runtime, peak memory,
 parent/downstream metrics, and unsupported statuses. The CI workflow also
 rejects executable imports of the removed wrapper API and builds the wheel.
+
+`experiments.run_protocol_matrix` is the official-OpenML-fold supervised
+baseline: it obtains repeat/fold/sample splits from typed OpenML tasks and
+persists their capability and provenance manifests. Its smoke mode is a
+deterministic contract check; publication runs still follow the nested-search
+requirements in `notes/experimental_designs.md`.

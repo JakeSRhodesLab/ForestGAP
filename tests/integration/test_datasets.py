@@ -7,8 +7,12 @@ import pandas as pd
 from forestgap.datasets import (
     OpenMLBenchmarkSuite,
     OpenMLDataset,
+    OpenMLTask,
+    OpenMLTaskFold,
+    iter_openml_task_folds,
     load_openml_dataset,
     load_openml_suite,
+    load_openml_task_fold,
 )
 
 
@@ -254,6 +258,72 @@ class TestOpenMLDatasetLoading(unittest.TestCase):
 
         self.assertEqual(cc18.suite_id, 99)
         self.assertEqual(ctr23.suite_id, 353)
+
+    def test_typed_openml_task_fold_preserves_official_indices(self):
+        loaded_dataset = OpenMLDataset(
+            name="study-455-toy",
+            dataset_id=4550,
+            version=1,
+            target_name="target",
+            X=pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0]}),
+            y=pd.Series([0.0, 1.0, 2.0, 3.0]),
+            feature_names=["x"],
+            categorical_indicator=[False],
+        )
+        fake_task = SimpleNamespace(
+            dataset_id=4550,
+            target_name="target",
+            task_type="Supervised Regression",
+            task_type_id=2,
+            get_split_dimensions=lambda: (1, 2, 1),
+            get_train_test_split_indices=lambda *, repeat, fold, sample: (
+                [0, 2] if fold == 0 else [1, 3],
+                [1, 3] if fold == 0 else [0, 2],
+            ),
+        )
+        fake_openml = SimpleNamespace(
+            tasks=SimpleNamespace(get_task=lambda task_id, **kwargs: fake_task),
+        )
+
+        with patch("forestgap.datasets._require_openml", return_value=fake_openml):
+            with patch("forestgap.datasets.load_openml_dataset", return_value=loaded_dataset):
+                loaded = load_openml_task_fold(task_id=361085, fold=1)
+                all_folds = list(iter_openml_task_folds(task_id=361085))
+
+        self.assertIsInstance(loaded, OpenMLTaskFold)
+        self.assertIsInstance(loaded.task, OpenMLTask)
+        self.assertEqual(loaded.task_id, 361085)
+        self.assertEqual(loaded.dataset_id, 4550)
+        self.assertEqual(loaded.fold_id, "r0-f1-s0")
+        self.assertListEqual(loaded.train_indices.tolist(), [1, 3])
+        self.assertListEqual(loaded.test_indices.tolist(), [0, 2])
+        self.assertEqual([fold.fold_id for fold in all_folds], ["r0-f0-s0", "r0-f1-s0"])
+
+    def test_typed_openml_task_fold_rejects_overlapping_indices(self):
+        loaded_dataset = OpenMLDataset(
+            name="bad-fold",
+            dataset_id=4551,
+            version=1,
+            target_name="target",
+            X=[[0.0], [1.0], [2.0]],
+            y=[0, 1, 2],
+            feature_names=["x"],
+            categorical_indicator=[False],
+        )
+        fake_task = SimpleNamespace(
+            dataset_id=4551,
+            target_name="target",
+            get_split_dimensions=lambda: (1, 1, 1),
+            get_train_test_split_indices=lambda **kwargs: ([0, 1], [1, 2]),
+        )
+        fake_openml = SimpleNamespace(
+            tasks=SimpleNamespace(get_task=lambda task_id, **kwargs: fake_task),
+        )
+
+        with patch("forestgap.datasets._require_openml", return_value=fake_openml):
+            with patch("forestgap.datasets.load_openml_dataset", return_value=loaded_dataset):
+                with self.assertRaisesRegex(ValueError, "disjoint"):
+                    load_openml_task_fold(task_id=361086)
 
 
 if __name__ == "__main__":

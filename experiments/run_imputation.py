@@ -30,8 +30,8 @@ def _remove_user_site_from_sys_path() -> None:
         and not any(os.path.normpath(path).startswith(candidate) for candidate in normalized_candidates)
     ]
 
-
-_remove_user_site_from_sys_path()
+if not any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+    _remove_user_site_from_sys_path()
 
 import pandas as pd
 
@@ -59,6 +59,7 @@ from experiments.common import (
     parse_missingness_mechanisms,
     parse_random_states,
     prepare_dataset,
+    proximity_methods_for_model,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -71,12 +72,14 @@ from experiments.common import (
 
 
 EXPERIMENT_NAME = "imputation"
-PROXIMITY_CONFIGURATIONS = (
-    ("original", "single_pass"),
-    ("oob", "single_pass"),
-    ("rfgap", "single_pass"),
-    ("rfgap", "iterative"),
-)
+def proximity_configurations(model_name: str) -> tuple[tuple[str, str], ...]:
+    """Run every relation permitted for the legacy model family both ways."""
+
+    return tuple(
+        (prox_method, variant)
+        for prox_method in proximity_methods_for_model(model_name)
+        for variant in ("single_pass", "iterative")
+    )
 
 
 def _mask_random_state(random_state: int, mechanism: str, missing_rate: float) -> int:
@@ -177,7 +180,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     for missingness_mechanism in missingness_mechanisms:
                         for missing_rate in missing_rates:
                             for model_name in requested_model_names():
-                                for prox_method, variant in PROXIMITY_CONFIGURATIONS:
+                                for prox_method, variant in proximity_configurations(model_name):
                                     for downstream_model in downstream_models:
                                         rows.append(
                                             record_exception(
@@ -235,7 +238,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
                         for model_name in requested_model_names():
                             if model_name not in available_model_names(task_kind):
-                                for prox_method, variant in PROXIMITY_CONFIGURATIONS:
+                                for prox_method, variant in proximity_configurations(model_name):
                                     for downstream_model in downstream_models:
                                         rows.append(
                                             unsupported_model_row(
@@ -261,7 +264,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         )
                                 continue
 
-                            for prox_method, variant in PROXIMITY_CONFIGURATIONS:
+                            for prox_method, variant in proximity_configurations(model_name):
                                 base_context = {
                                     "experiment": EXPERIMENT_NAME,
                                     "status": "ok",
@@ -303,6 +306,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             timing_metrics,
                                         ) = iterative_imputation(
                                             prepared,
+                                            prox_method=prox_method,
                                             random_state=random_state,
                                             n_estimators=args.n_estimators,
                                             n_iterations=args.n_iterations,

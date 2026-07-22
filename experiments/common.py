@@ -50,7 +50,13 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from forestgap import Proximity, impute, load_openml_dataset
+from forestgap import (
+    OpenMLTaskFold,
+    Proximity,
+    impute,
+    iter_openml_task_folds,
+    load_openml_dataset,
+)
 
 
 TaskKind = Literal["classification", "regression"]
@@ -70,7 +76,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
 RAW_RESULTS_DIR = RESULTS_DIR / "raw"
 CLASSIFICATION_SUITE_ID = 99
-REGRESSION_SUITE_ID = 353
+REGRESSION_SUITE_ID = 455
+REGRESSION_SUITE_NAME = "New_OpenML_Suite_2025_regression"
 REQUESTED_MODEL_ORDER: tuple[ModelKey, ...] = (
     "RandomForest",
     "RotationForest",
@@ -87,7 +94,14 @@ REQUESTED_OUTLIER_MODEL_ORDER: tuple[str, ...] = (
     "UnsupervisedRandomForest",
     "UnsupervisedObliqueRandomForest",
 )
-OUTLIER_PROX_METHODS: tuple[str, ...] = ("original", "oob", "rfgap")
+# Legacy application runners use these declarations only to construct their
+# requested cells.  The capability-aware runners in ``program.py`` remain the
+# authoritative runtime filter.  Keep directed RF-GAP/Honest-GAP out of the
+# anomaly runner: it is neither a predictive-weight application nor a declared
+# geometry symmetrisation study.
+OUTLIER_PROX_METHODS: tuple[str, ...] = (
+    "original", "oob", "rfgap", "kerf", "path", "englund", "random_height",
+)
 OUTLIER_SCORE_METHODS: tuple[str, ...] = ("breiman", "ene")
 DEFAULT_MISSINGNESS_MECHANISMS: tuple[str, ...] = ("MCAR", "MAR", "MNAR")
 DEFAULT_MISSING_RATES: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75)
@@ -96,6 +110,26 @@ DOWNSTREAM_MODEL_ORDER: dict[TaskKind, tuple[str, ...]] = {
     "regression": ("Lasso", "KNeighborsRegressor"),
 }
 LOW_SUPPORT_CATEGORY_MIN_COUNT = 5
+
+_BAGGED_PROXIMITY_METHODS: tuple[str, ...] = (
+    "original", "oob", "rfgap", "kerf", "path", "englund", "random_height",
+)
+_HONEST_PROXIMITY_METHODS: tuple[str, ...] = (
+    "original", "honest_gap", "kerf", "path", "englund", "random_height",
+)
+
+
+def proximity_methods_for_model(model_name: str) -> tuple[str, ...]:
+    """Return legacy-runner relation requests for an installed model family.
+
+    The function intentionally declares the full protocol candidate set; an
+    individual fit can still emit an unsupported status when its bootstrap/OOB
+    or optional-backend runtime contract is absent.
+    """
+
+    if model_name == "HonestForest":
+        return _HONEST_PROXIMITY_METHODS
+    return _BAGGED_PROXIMITY_METHODS
 
 
 @dataclass(frozen=True)
@@ -301,6 +335,7 @@ OUTLIER_MODEL_REGISTRY = _build_outlier_model_registry()
 @dataclass
 class PreparedDataset:
     task_kind: TaskKind
+    suite_id: int
     suite_name: str
     task_id: int
     dataset_id: int
@@ -315,6 +350,12 @@ class PreparedDataset:
     original_n_features: int
     train_size: int
     test_size: int
+    fold_id: str | None = None
+    repeat: int | None = None
+    fold: int | None = None
+    sample: int | None = None
+    train_indices: np.ndarray | None = None
+    test_indices: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -399,7 +440,7 @@ def requested_tasks(task: str) -> list[TaskKind]:
 def suite_metadata(task_kind: TaskKind) -> tuple[int, str]:
     if task_kind == "classification":
         return CLASSIFICATION_SUITE_ID, "OpenML-CC18"
-    return REGRESSION_SUITE_ID, "OpenML-CTR23"
+    return REGRESSION_SUITE_ID, REGRESSION_SUITE_NAME
 
 
 def ensure_dir(path: Path) -> Path:
@@ -607,6 +648,34 @@ def iter_openml_suite(task_kind: TaskKind, limit: Optional[int] = None) -> Itera
         yield int(task_id), openml.tasks.get_task(int(task_id))
 
 
+def iter_openml_suite_folds(
+    task_kind: TaskKind,
+    limit: Optional[int] = None,
+) -> Iterator[OpenMLTaskFold]:
+    """Yield every official OpenML outer fold for a declared benchmark suite.
+
+    This is the study-program iterator.  The older :func:`iter_openml_suite`
+    remains available for backwards-compatible exploratory scripts, while new
+    benchmark runners must consume this iterator and pass its values to
+    :func:`prepare_dataset`.
+    """
+
+    try:
+        openml = import_module("openml")
+    except ImportError as exc:
+        raise ImportError(
+            "OpenML experiment suites require the optional 'openml' extra; "
+            "install forestgap[openml] before running full-data experiments."
+        ) from exc
+    suite_id, _ = suite_metadata(task_kind)
+    suite = openml.study.get_suite(suite_id)
+    task_ids = list(getattr(suite, "tasks", []))
+    if limit is not None:
+        task_ids = task_ids[:limit]
+    for task_id in task_ids:
+        yield from iter_openml_task_folds(task_id=int(task_id), as_frame=True)
+
+
 def _coerce_frame(X: Any, feature_names: Sequence[str]) -> pd.DataFrame:
     if isinstance(X, pd.DataFrame):
         return X.copy()
@@ -636,7 +705,7 @@ def _categorical_columns(X: pd.DataFrame, categorical_indicator: Sequence[bool])
         if str(column) not in columns
         and (
             pd.api.types.is_object_dtype(X[column])
-            or pd.api.types.is_categorical_dtype(X[column])
+            or isinstance(X[column].dtype, pd.CategoricalDtype)
             or pd.api.types.is_bool_dtype(X[column])
         )
     ]
@@ -697,6 +766,97 @@ def _apply_feature_cap(
     )
 
 
+def _prepare_official_fold_dataset(
+    task_kind: TaskKind,
+    *,
+    suite_id: int,
+    suite_name: str,
+    task_id: int,
+    official_fold: OpenMLTaskFold,
+    X_df: pd.DataFrame,
+    y_series: pd.Series,
+    categorical_indicator: Sequence[bool],
+    feature_cap: Optional[int],
+    max_rows: Optional[int],
+) -> PreparedDataset:
+    """Prepare an OpenML outer fold without changing its train/test boundary."""
+
+    if max_rows is not None:
+        raise ValueError(
+            "max_rows cannot be used with official OpenML folds because it would "
+            "change the declared outer evaluation protocol."
+        )
+    if int(task_id) != official_fold.task_id:
+        raise ValueError(
+            f"Official fold task_id={official_fold.task_id} does not match task_id={task_id}."
+        )
+
+    train_indices = np.asarray(official_fold.train_indices, dtype=np.int64)
+    test_indices = np.asarray(official_fold.test_indices, dtype=np.int64)
+    # The task/fold loader validates bounds and disjointness.  Slice first so
+    # target filtering and feature processing cannot leak test-row statistics.
+    X_train_df = X_df.iloc[train_indices].reset_index(drop=True)
+    X_test_df = X_df.iloc[test_indices].reset_index(drop=True)
+    y_train_raw = y_series.iloc[train_indices].reset_index(drop=True)
+    y_test_raw = y_series.iloc[test_indices].reset_index(drop=True)
+
+    if task_kind == "classification":
+        categories = pd.Index(pd.Series(y_train_raw, dtype="object").dropna().unique())
+        if categories.size < 2:
+            raise ValueError("Need at least two training classes in an official outer fold.")
+        y_train = pd.Categorical(y_train_raw, categories=categories).codes.astype(np.int64)
+        y_test = pd.Categorical(y_test_raw, categories=categories).codes.astype(np.int64)
+        if np.any(y_train < 0) or np.any(y_test < 0):
+            raise ValueError(
+                "Official OpenML classification folds must have observed target values "
+                "and no test-only classes."
+            )
+    else:
+        y_train = pd.to_numeric(y_train_raw, errors="coerce").to_numpy(dtype=np.float64)
+        y_test = pd.to_numeric(y_test_raw, errors="coerce").to_numpy(dtype=np.float64)
+        if not np.isfinite(y_train).all() or not np.isfinite(y_test).all():
+            raise ValueError("Official OpenML regression folds must have finite targets.")
+
+    categorical_columns = _categorical_columns(X_train_df, categorical_indicator)
+    X_train, X_test, feature_names, categorical_indices = _encode_split_features(
+        X_train_df,
+        X_test_df,
+        categorical_columns,
+    )
+    X_train, X_test, feature_names, categorical_indices = _apply_feature_cap(
+        X_train,
+        X_test,
+        feature_names,
+        categorical_indices,
+        feature_cap,
+    )
+    dataset = official_fold.dataset
+    return PreparedDataset(
+        task_kind=task_kind,
+        suite_id=suite_id,
+        suite_name=suite_name,
+        task_id=int(task_id),
+        dataset_id=int(dataset.dataset_id),
+        dataset_name=str(dataset.name),
+        feature_names=feature_names,
+        categorical_indices=categorical_indices,
+        X_train=X_train,
+        X_test=X_test,
+        y_train=np.asarray(y_train),
+        y_test=np.asarray(y_test),
+        original_n_samples=int(len(X_df)),
+        original_n_features=int(X_df.shape[1]),
+        train_size=int(X_train.shape[0]),
+        test_size=int(X_test.shape[0]),
+        fold_id=official_fold.fold_id,
+        repeat=official_fold.repeat,
+        fold=official_fold.fold,
+        sample=official_fold.sample,
+        train_indices=train_indices.copy(),
+        test_indices=test_indices.copy(),
+    )
+
+
 def prepare_dataset(
     task_kind: TaskKind,
     *,
@@ -706,15 +866,33 @@ def prepare_dataset(
     max_rows: Optional[int],
     test_size: float,
     feature_cap: Optional[int] = None,
+    official_fold: OpenMLTaskFold | None = None,
 ) -> PreparedDataset:
     suite_id, suite_name = suite_metadata(task_kind)
-    dataset = load_openml_dataset(
-        dataset_id=int(task.dataset_id),
-        target_name=getattr(task, "target_name", None),
-        as_frame=True,
-    )
+    if official_fold is not None:
+        dataset = official_fold.dataset
+    else:
+        dataset = load_openml_dataset(
+            dataset_id=int(task.dataset_id),
+            target_name=getattr(task, "target_name", None),
+            as_frame=True,
+        )
     X_df = _coerce_frame(dataset.X, dataset.feature_names)
     y_series = _coerce_target(dataset.y)
+
+    if official_fold is not None:
+        return _prepare_official_fold_dataset(
+            task_kind,
+            suite_id=suite_id,
+            suite_name=suite_name,
+            task_id=task_id,
+            official_fold=official_fold,
+            X_df=X_df,
+            y_series=y_series,
+            categorical_indicator=dataset.categorical_indicator,
+            feature_cap=feature_cap,
+            max_rows=max_rows,
+        )
 
     if task_kind == "classification":
         y_series = y_series.astype("category")
@@ -781,6 +959,7 @@ def prepare_dataset(
 
     return PreparedDataset(
         task_kind=task_kind,
+        suite_id=suite_id,
         suite_name=suite_name,
         task_id=int(task_id),
         dataset_id=int(dataset.dataset_id),
@@ -1475,6 +1654,7 @@ def iterative_imputation(
     prepared: PreparedDataset,
     *,
     model_name: ModelKey,
+    prox_method: str,
     random_state: int,
     n_estimators: int,
     n_iterations: int,
@@ -1492,7 +1672,7 @@ def iterative_imputation(
         model = build_proximity_model(
             prepared.task_kind,
             model_name=model_name,
-            prox_method="rfgap",
+            prox_method=prox_method,
             random_state=random_state,
             n_estimators=n_estimators,
             bootstrap=True,

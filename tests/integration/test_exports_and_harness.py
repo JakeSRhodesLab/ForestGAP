@@ -97,3 +97,52 @@ def test_harness_error_rows_keep_timing_memory_and_relation_diagnostics():
     assert row["application_runtime_seconds"] is not None
     assert row["peak_memory_bytes"] > 0
     assert row["relation_diagnostics"] is not None
+
+
+def test_harness_manifest_is_complete_for_ok_unsupported_excluded_and_error_rows():
+    X, y = make_classification(n_samples=48, n_features=5, random_state=47)
+
+    def fail(proximity, cell):
+        raise RuntimeError("expected downstream failure")
+
+    common = dict(
+        estimator="rf",
+        application="manifest",
+        data_regime="synthetic",
+        estimator_factory=lambda: RandomForestClassifier(
+            n_estimators=6, bootstrap=False, random_state=48,
+        ),
+        X_train=X,
+        y_train=y,
+        suite_id=99,
+        task_id=7,
+        fold_id="r0-f1-s0",
+        repeat=0,
+        fold=1,
+        sample=0,
+        relation_settings={"englund_weight": 1.0},
+        parent_search_trial={"trial_id": 3},
+        relation_search_trial={"trial_id": 4},
+        preprocessing={"scaler": "train_only"},
+        artifact_hashes={"dataset": "abc"},
+    )
+    rows = run_cells([
+        ExperimentCell(relation="englund", application_fn=lambda p, c: {"score": 1.0}, **common),
+        ExperimentCell(relation="rfgap", application_fn=lambda p, c: {}, **common),
+        ExperimentCell(
+            relation="none", application_fn=lambda p, c: {}, declared_status="excluded",
+            declared_reason="deferred by protocol", **common,
+        ),
+        ExperimentCell(relation="original", application_fn=fail, **common),
+    ])
+    assert [row["status"] for row in rows] == ["ok", "unsupported", "excluded", "error"]
+    required = {
+        "suite_id", "task_id", "fold_id", "repeat", "fold", "sample",
+        "capability_snapshot", "relation_settings", "search_trial", "preprocessing",
+        "artifact_hashes", "metrics", "manifest", "manifest_hash", "versions",
+        "status", "reason", "runtime_seconds", "peak_memory_bytes",
+    }
+    assert all(required <= set(row) for row in rows)
+    assert rows[0]["capability_snapshot"]["family"] == "random_forest"
+    assert rows[2]["reason"] == "deferred by protocol"
+    assert rows[3]["error_type"] == "RuntimeError"

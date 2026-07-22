@@ -30,6 +30,7 @@ from experiments.common import (
     parse_csv_floats,
     parse_random_states,
     prepare_dataset,
+    proximity_methods_for_model,
     raw_output_path,
     record_exception,
     requested_outlier_model_names,
@@ -45,6 +46,12 @@ EXPERIMENT_NAME = "outlier_detection"
 NATIVE_PROX_METHOD = "not_applicable"
 NATIVE_LABEL_MODE = "not_applicable"
 NATIVE_SCORE_METHOD = "score_samples"
+# Keep RF-GAP in this runner's bagged-supervised comparison set even if a
+# shared legacy candidate declaration is narrowed for another outlier workflow.
+SUPERVISED_OUTLIER_PROX_METHODS = tuple(dict.fromkeys((*OUTLIER_PROX_METHODS, "rfgap")))
+HONEST_OUTLIER_PROX_METHODS = tuple(
+    dict.fromkeys((*proximity_methods_for_model("HonestForest"), "honest_gap"))
+)
 UNSUPERVISED_OUTLIER_MODELS = {
     "IsolationForest",
     "ExtendedIsolationForest",
@@ -272,7 +279,11 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             prox_methods = (
                                 ("collision",)
                                 if model_name in {"IsolationForest", "ExtendedIsolationForest"}
-                                else OUTLIER_PROX_METHODS
+                                else (
+                                    HONEST_OUTLIER_PROX_METHODS
+                                    if model_name == "HonestForest"
+                                    else SUPERVISED_OUTLIER_PROX_METHODS
+                                )
                             )
                             for prox_method in prox_methods:
                                 model, spec, fit_metadata = build_outlier_model(

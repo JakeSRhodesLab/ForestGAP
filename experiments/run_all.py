@@ -48,7 +48,7 @@ def main() -> None:
         if args.max_rows is not None:
             cmd.extend(["--max-rows", str(args.max_rows)])
         start = time.perf_counter()
-        completed = subprocess.run(cmd, check=True)
+        completed = subprocess.run(cmd, check=False)
         runtime_seconds = time.perf_counter() - start
         process_rows.append(
             {
@@ -59,6 +59,7 @@ def main() -> None:
                 "max_rows": "" if args.max_rows is None else str(args.max_rows),
                 "test_size": str(args.test_size),
                 "return_code": str(completed.returncode),
+                "status": "ok" if completed.returncode == 0 else "error",
                 "runtime_seconds": f"{runtime_seconds:.6f}",
             }
         )

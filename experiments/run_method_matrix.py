@@ -30,11 +30,14 @@ from forestgap import (
     retrieve_neighbors,
     retrieval_metrics,
 )
+from forestgap.manifold.proximity import prepare_proximity_affinity
 
 try:  # module execution and direct script execution
     from experiments.harness import ExperimentCell, run_cells
+    from experiments.program import capability_aware_cells
 except ModuleNotFoundError:  # pragma: no cover - direct script path
     from harness import ExperimentCell, run_cells
+    from program import capability_aware_cells
 
 
 EstimatorFactory = Callable[[int, int], Any]
@@ -62,7 +65,7 @@ def _catboost_factory(n_estimators: int, seed: int) -> Any:
 
     return CatBoostClassifier(
         iterations=n_estimators, depth=4, random_seed=seed, verbose=False,
-        thread_count=1, allow_writing_files=False,
+        thread_count=1, allow_writing_files=False, grow_policy="SymmetricTree",
     )
 
 
@@ -108,6 +111,17 @@ ESTIMATORS: dict[str, EstimatorFactory] = {
     "catboost": _catboost_factory,
 }
 
+ESTIMATOR_FAMILIES: dict[str, str] = {
+    "random_forest": "random_forest",
+    "extra_trees": "extra_trees",
+    "ccf": "canonical_correlation_forest",
+    "ccf_bag": "canonical_correlation_forest",
+    "gradient_boosting": "gradient_boosting",
+    "xgboost": "xgboost",
+    "lightgbm": "lightgbm",
+    "catboost": "catboost",
+}
+
 
 def _prediction(proximity: Any, cell: ExperimentCell) -> dict[str, float]:
     predicted = knn_predict(
@@ -118,12 +132,24 @@ def _prediction(proximity: Any, cell: ExperimentCell) -> dict[str, float]:
 
 
 def _clustering(proximity: Any, cell: ExperimentCell) -> dict[str, float]:
+    affinity = prepare_proximity_affinity(
+        proximity.get_proximities(), symmetrize="auto", diagonal="one",
+    )
+    dense = affinity.toarray() if hasattr(affinity, "toarray") else np.asarray(affinity)
+    degrees = np.clip(np.asarray(dense.sum(axis=1), dtype=float), 1e-12, None)
+    normalized = dense / np.sqrt(np.outer(degrees, degrees))
+    eigenvalues = np.linalg.eigvalsh(np.eye(len(normalized)) - normalized)
+    max_clusters = min(8, max(2, len(eigenvalues) - 1))
+    gaps = np.diff(eigenvalues[:max_clusters])
+    n_clusters = int(np.argmax(gaps) + 1) if gaps.size else 2
+    n_clusters = max(2, min(n_clusters, max_clusters))
     labels = proximity_clustering(
-        proximity, n_clusters=len(np.unique(cell.y_train)),
+        proximity, n_clusters=n_clusters,
         method="agglomerative", random_state=cell.seed,
     )
     return {
-        "downstream_adjusted_rand": float(adjusted_rand_score(cell.y_train, labels))
+        "downstream_adjusted_rand": float(adjusted_rand_score(cell.y_train, labels)),
+        "selected_n_clusters": float(n_clusters),
     }
 
 
@@ -146,15 +172,24 @@ APPLICATIONS: dict[str, Callable[[Any, ExperimentCell], dict[str, float]]] = {
 def build_cells(
     *,
     estimators: Iterable[str],
-    relations: Iterable[str],
+    relations: Iterable[str] | None,
     applications: Iterable[str],
     data_regimes: Iterable[str],
     seeds: Iterable[int],
     n_samples: int,
     n_estimators: int,
 ) -> list[ExperimentCell]:
-    """Declare the full matrix while preserving shared parent/split identity."""
+    """Declare cells from fitted runtime capabilities.
 
+    Passing ``relations=None`` selects each fitted parent's valid relations.
+    An explicit relation list retains invalid requests as declared unsupported
+    rows, which is useful for audit tables and backwards-compatible smoke
+    comparisons.
+    """
+
+    estimator_names = tuple(estimators)
+    application_names = tuple(applications)
+    requested_relations = None if relations is None else tuple(relations)
     cells: list[ExperimentCell] = []
     for seed in seeds:
         for regime in data_regimes:
@@ -168,33 +203,35 @@ def build_cells(
                 {"regime": regime, "seed": seed, "train": train_ids.tolist(), "test": test_ids.tolist()},
                 separators=(",", ":"),
             )
-            for estimator_name in estimators:
+            for estimator_name in estimator_names:
                 if estimator_name not in ESTIMATORS:
                     raise ValueError(f"unknown estimator {estimator_name!r}")
                 factory = ESTIMATORS[estimator_name]
-                for relation in relations:
-                    for application in applications:
-                        if application not in APPLICATIONS:
-                            raise ValueError(f"unknown application {application!r}")
-                        cells.append(ExperimentCell(
-                            estimator=estimator_name,
-                            relation=relation,
-                            application=application,
-                            data_regime=regime,
-                            estimator_factory=lambda f=factory, s=seed: f(n_estimators, s),
-                            application_fn=APPLICATIONS[application],
-                            X_train=X_train,
-                            y_train=y_train,
-                            X_evaluate=X_test,
-                            y_evaluate=y_test,
-                            seed=seed,
-                            split_id=split_id,
-                            configuration={
-                                "n_samples": n_samples,
-                                "n_estimators": n_estimators,
-                                "test_fraction": 0.3,
-                            },
-                        ))
+                for application in application_names:
+                    if application not in APPLICATIONS:
+                        raise ValueError(f"unknown application {application!r}")
+                    cells.extend(capability_aware_cells(
+                        family=ESTIMATOR_FAMILIES[estimator_name],
+                        estimator=estimator_name,
+                        estimator_factory=lambda f=factory, s=seed: f(n_estimators, s),
+                        application=application,
+                        application_fn=APPLICATIONS[application],
+                        X_train=X_train,
+                        y_train=y_train,
+                        data_regime=regime,
+                        requested_relations=requested_relations,
+                        X_evaluate=X_test,
+                        y_evaluate=y_test,
+                        seed=seed,
+                        split_id=split_id,
+                        relation_settings={"matrix_type": "sparse"},
+                        configuration={
+                            "n_samples": n_samples,
+                            "n_estimators": n_estimators,
+                            "test_fraction": 0.3,
+                            "capability_generation": "fitted_runtime_snapshot",
+                        },
+                    ))
     return cells
 
 
@@ -210,8 +247,14 @@ def write_rows(rows: list[dict[str, Any]], output: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--estimators", default="random_forest,extra_trees,ccf,ccf_bag")
-    parser.add_argument("--relations", default="original,oob,rfgap,kerf,path,englund,random_height")
+    parser.add_argument(
+        "--estimators", default="all",
+        help="Comma-separated estimator keys, or 'all' for every installed matrix family.",
+    )
+    parser.add_argument(
+        "--relations", default="auto",
+        help="Comma-separated relations, or 'auto' to use each fitted runtime capability snapshot.",
+    )
     parser.add_argument("--applications", default="prediction,clustering,retrieval")
     parser.add_argument("--data-regimes", default="axis_aligned,rotated_oblique,correlated_oblique")
     parser.add_argument("--seeds", default="0,1,2")
@@ -226,9 +269,19 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
     args = build_parser().parse_args(argv)
     n_samples = 90 if args.smoke else args.n_samples
     n_estimators = 8 if args.smoke else args.n_estimators
+    estimator_names = (
+        list(ESTIMATORS)
+        if args.estimators.strip().casefold() == "all"
+        else _csv(args.estimators)
+    )
+    relation_names = (
+        None
+        if args.relations.strip().casefold() == "auto"
+        else _csv(args.relations)
+    )
     cells = build_cells(
-        estimators=_csv(args.estimators),
-        relations=_csv(args.relations),
+        estimators=estimator_names,
+        relations=relation_names,
         applications=_csv(args.applications),
         data_regimes=_csv(args.data_regimes),
         seeds=[int(seed) for seed in _csv(args.seeds)],
@@ -237,7 +290,10 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
     )
     rows = run_cells(cells)
     write_rows(rows, args.output)
-    counts = {status: sum(row["status"] == status for row in rows) for status in ("ok", "unsupported", "error")}
+    status_order = ["ok", "unsupported", "error"]
+    if any(row["status"] == "excluded" for row in rows):
+        status_order.append("excluded")
+    counts = {status: sum(row["status"] == status for row in rows) for status in status_order}
     print(json.dumps({"output": str(args.output), "cells": len(rows), "status": counts}, sort_keys=True))
     return rows
 

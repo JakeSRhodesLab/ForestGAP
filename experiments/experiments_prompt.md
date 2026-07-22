@@ -1,5 +1,11 @@
 # Experiment Prompts
 
+> **Historical prompt archive.** These prompts record earlier implementation
+> requests and are not the experiment specification. All experiment runners
+> must follow [`notes/experimental_designs.md`](../notes/experimental_designs.md),
+> including its OpenML 99/455 official-fold protocol and its exclusion of
+> quantile/conformal and alignment experiment tracks.
+
 
 ## CLI Setup
 codex --model gpt-5.4 --config model_reasoning_effort='"high"' --yolo

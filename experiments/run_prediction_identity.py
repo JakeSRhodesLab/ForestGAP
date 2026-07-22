@@ -31,8 +31,8 @@ def _remove_user_site_from_sys_path() -> None:
         and not any(os.path.normpath(path).startswith(candidate) for candidate in normalized_candidates)
     ]
 
-
-_remove_user_site_from_sys_path()
+if not any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+    _remove_user_site_from_sys_path()
 
 import numpy as np
 import pandas as pd

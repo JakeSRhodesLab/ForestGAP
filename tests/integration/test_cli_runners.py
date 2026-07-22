@@ -28,6 +28,7 @@ def test_method_matrix_cli_smoke_writes_all_requested_cells(tmp_path):
 def test_every_maintained_runner_exposes_a_cli_help_surface():
     modules = [
         "experiments.run_method_matrix",
+        "experiments.run_protocol_matrix",
         "experiments.run_imputation",
         "experiments.run_local_feature_importance",
         "experiments.run_mds_visualization",

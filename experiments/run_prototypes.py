@@ -3,9 +3,11 @@ from __future__ import annotations
 import sys as _sys
 import site as _site
 
-_user_site = _site.getusersitepackages()
-_sys.path = [p for p in _sys.path if not p.startswith(_user_site)]
-del _sys, _site, _user_site
+if not any(argument in {"-h", "--help"} for argument in _sys.argv[1:]):
+    _user_site = _site.getusersitepackages()
+    _sys.path = [path for path in _sys.path if not path.startswith(_user_site)]
+    del _user_site
+del _sys, _site
 
 import argparse
 from dataclasses import dataclass
@@ -37,6 +39,7 @@ from experiments.common import (
     iter_openml_suite,
     parse_random_states,
     prepare_dataset,
+    proximity_methods_for_model,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -44,12 +47,12 @@ from experiments.common import (
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
+    suite_metadata,
     unsupported_model_row,
 )
 
 
 EXPERIMENT_NAME = "prototypes"
-PROX_METHODS: tuple[str, ...] = ("original", "oob", "rfgap")
 SYNTHETIC_SUITE_NAME = "synthetic"
 
 
@@ -244,6 +247,7 @@ def _build_synthetic_scenarios(
 
         prepared = PreparedDataset(
             task_kind="classification",
+            suite_id=-1,
             suite_name=SYNTHETIC_SUITE_NAME,
             task_id=int(spec["task_id"]),
             dataset_id=int(spec["dataset_id"]),
@@ -938,7 +942,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                     prepared = synthetic.prepared
                     for model_name in requested_model_names():
                         if model_name not in available_model_names(task_kind):
-                            for prox_method in PROX_METHODS:
+                            for prox_method in proximity_methods_for_model(model_name):
                                 rows.append(
                                     unsupported_model_row(
                                         experiment_name=EXPERIMENT_NAME,
@@ -960,7 +964,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                 )
                             continue
 
-                        for prox_method in PROX_METHODS:
+                        for prox_method in proximity_methods_for_model(model_name):
                             try:
                                 case_rows, case_details = _evaluate_case(
                                     prepared=prepared,
@@ -1002,7 +1006,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             for random_state in random_states:
                 if task_kind == "regression":
                     for model_name in requested_model_names():
-                        for prox_method in PROX_METHODS:
+                        for prox_method in proximity_methods_for_model(model_name):
                             rows.append(
                                 unsupported_model_row(
                                     experiment_name=EXPERIMENT_NAME,
@@ -1014,7 +1018,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                     random_state=random_state,
                                     reason="the standalone get_prototypes application is classification-only",
                                     extra_fields={
-                                        "suite_name": "OpenML-CTR23",
+                                        "suite_name": suite_metadata(task_kind)[1],
                                         "prox_method": prox_method,
                                         "prototype_source": "learned",
                                         "k": int(args.k),
@@ -1052,7 +1056,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
 
                 for model_name in requested_model_names():
                     if model_name not in available_model_names(task_kind):
-                        for prox_method in PROX_METHODS:
+                        for prox_method in proximity_methods_for_model(model_name):
                             rows.append(
                                 unsupported_model_row(
                                     experiment_name=EXPERIMENT_NAME,
@@ -1074,7 +1078,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                             )
                         continue
 
-                    for prox_method in PROX_METHODS:
+                    for prox_method in proximity_methods_for_model(model_name):
                         try:
                             case_rows, case_details = _evaluate_case(
                                 prepared=prepared,

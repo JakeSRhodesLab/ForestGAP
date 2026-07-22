@@ -1,4 +1,4 @@
-"""Proximity-neighborhood feature selection primitives."""
+"""Label-free feature selection from a fitted proximity neighborhood graph."""
 
 from __future__ import annotations
 
@@ -11,7 +11,16 @@ from forestgap.proximity import Proximity
 
 
 def neighborhood_feature_scores(proximity: Proximity, X: Any) -> np.ndarray:
-    """Score features by global variance explained by local neighbor agreement."""
+    """Score columns by how well proximity-weighted neighbors reconstruct them.
+
+    After excluding self-relations, each row is reconstructed from its
+    row-normalized relation weights. The returned score for feature ``r`` is
+    ``1 - Var(X[:, r] - local_mean[:, r]) / Var(X[:, r])``: high values denote
+    locally stable features, while negative values denote poor reconstruction.
+    ``X`` must contain the training rows in the same order as ``proximity``;
+    directed relations use their outgoing row weights. Constant columns score
+    zero.
+    """
 
     features = np.asarray(X, dtype=float)
     relation = proximity.get_proximities()
@@ -27,7 +36,13 @@ def neighborhood_feature_scores(proximity: Proximity, X: Any) -> np.ndarray:
 
 
 def select_features(proximity: Proximity, X: Any, *, k: int) -> np.ndarray:
-    """Return indices of the top-k proximity-stable features."""
+    """Return indices of the ``k`` highest-scoring proximity-stable features.
+
+    This is a label-free ranking convenience over
+    :func:`neighborhood_feature_scores`; ``k`` is clipped to ``[1, n_features]``.
+    Perform selection within each training fold when evaluating a downstream
+    model.
+    """
 
     scores = neighborhood_feature_scores(proximity, X)
     k = min(max(1, int(k)), scores.size)

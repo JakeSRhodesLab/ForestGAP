@@ -30,8 +30,8 @@ def _remove_user_site_from_sys_path() -> None:
         and not any(os.path.normpath(path).startswith(candidate) for candidate in normalized_candidates)
     ]
 
-
-_remove_user_site_from_sys_path()
+if not any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+    _remove_user_site_from_sys_path()
 
 import numpy as np
 import pandas as pd
@@ -50,6 +50,7 @@ from experiments.common import (
     iter_openml_suite,
     parse_random_states,
     prepare_dataset,
+    proximity_methods_for_model,
     raw_output_path,
     record_exception,
     requested_tasks,
@@ -81,6 +82,7 @@ def _probability_drop(
 
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    prox_method = getattr(args, "_prox_method", "original")
 
     for task_kind in requested_tasks(args.task):
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
@@ -88,6 +90,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
                 for model_name in requested_model_names():
+                    if prox_method not in proximity_methods_for_model(model_name):
+                        continue
                     if task_kind == "regression":
                         rows.append(
                             unsupported_model_row(
@@ -153,11 +157,11 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         model = build_proximity_model(
                             prepared.task_kind,
                             model_name=model_name,
-                            prox_method="original",
+                            prox_method=prox_method,
                             random_state=random_state,
                             n_estimators=args.n_estimators,
-                            bootstrap=False,
-                            oob_score=False,
+                            bootstrap=prox_method in {"oob", "rfgap"},
+                            oob_score=prox_method == "rfgap",
                         )
                         fit_start = time.perf_counter()
                         model.fit(X_train_filled, prepared.y_train)
@@ -209,6 +213,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 "status": "ok",
                                 "task_kind": task_kind,
                                 "model_name": model_name,
+                                "prox_method": prox_method,
                                 "random_state": random_state,
                                 "task_id": prepared.task_id,
                                 "dataset_id": prepared.dataset_id,
@@ -243,6 +248,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             error=exc,
                         )
                         error_row["model_name"] = model_name
+                        error_row["prox_method"] = prox_method
                         rows.append(error_row)
 
     return pd.DataFrame(rows)
@@ -269,7 +275,7 @@ def compile_outputs(df: pd.DataFrame) -> None:
         )
         summary = aggregate_success_rows(
             task_df,
-            group_cols=("model_name",),
+            group_cols=("model_name", "prox_method"),
             metric_cols=metric_cols,
         )
         save_dataframe(summary, out_dir / "summary.csv")
@@ -296,5 +302,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    frame = run(build_parser().parse_args())
+    parsed_args = build_parser().parse_args()
+    frames = []
+    for relation in (
+        "original", "oob", "rfgap", "honest_gap", "kerf", "path",
+        "englund", "random_height",
+    ):
+        parsed_args._prox_method = relation
+        frames.append(run(parsed_args))
+    frame = pd.concat(frames, ignore_index=True)
     compile_outputs(frame)
