@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 import numpy as np
 
 from forestgap import Proximity, UnsupportedRelationError, capabilities_for
+from experiments.common import log_progress
 
 
 Application = Callable[[Proximity, "ExperimentCell"], Mapping[str, Any]]
@@ -273,6 +274,8 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
     application.
     """
 
+    cell_list = list(cells)
+    total_cells = len(cell_list)
     revision = code_revision()
     versions = package_versions()
     fitted: dict[
@@ -280,7 +283,12 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
         tuple[Any, float, int, dict[str, Any], dict[str, Any]],
     ] = {}
     rows: list[dict[str, Any]] = []
-    for cell in cells:
+    for index, cell in enumerate(cell_list, start=1):
+        cell_label = (
+            f"estimator={cell.estimator} relation={cell.relation} "
+            f"application={cell.application} regime={cell.data_regime} seed={cell.seed}"
+        )
+        log_progress(f"[{index}/{total_cells}] starting cell {cell_label}")
         digest = split_hash(cell)
         base = _manifest_fields(
             cell, digest=digest, revision=revision, versions=versions,
@@ -307,6 +315,10 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 fit_reused=False,
                 reason=cell.declared_reason or "cell excluded by the declared study policy",
             ))
+            log_progress(
+                f"[{index}/{total_cells}] finished cell {cell_label} "
+                f"status={cell.declared_status}"
+            )
             continue
         if base["invalid_relation_settings"]:
             reason = "Unsupported relation setting(s): " + ", ".join(
@@ -328,6 +340,10 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 reason=reason,
                 error_type="ValueError",
             ))
+            log_progress(
+                f"[{index}/{total_cells}] finished cell {cell_label} status=error "
+                f"reason=unsupported relation settings"
+            )
             continue
         parent_key = (
             cell.estimator,
@@ -349,6 +365,7 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
         try:
             fit_reused = parent_key in fitted
             if parent_key not in fitted:
+                log_progress(f"[{index}/{total_cells}] fitting parent for {cell_label}")
                 estimator = cell.estimator_factory()
                 estimator_config = (
                     estimator.get_params(deep=False)
@@ -385,6 +402,7 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 score = getattr(estimator, "score", None)
                 if callable(score):
                     parent_score = float(score(cell.X_evaluate, cell.y_evaluate))
+            log_progress(f"[{index}/{total_cells}] building relation for {cell_label}")
             relation_start = time.perf_counter()
             phase = "relation"
             phase_start = relation_start
@@ -403,6 +421,7 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
             phase = None
             phase_start = None
             relation_diagnostics = _json(proximity.diagnostics(relation_matrix))
+            log_progress(f"[{index}/{total_cells}] running application for {cell_label}")
             application_start = time.perf_counter()
             phase = "application"
             phase_start = application_start
@@ -429,6 +448,11 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 fit_reused=fit_reused,
                 metrics=metrics,
             ))
+            cell_runtime = time.perf_counter() - cell_start
+            log_progress(
+                f"[{index}/{total_cells}] finished cell {cell_label} "
+                f"status=ok reused={fit_reused} runtime={cell_runtime:.2f}s"
+            )
         except UnsupportedRelationError as exc:
             if tracemalloc.is_tracing():
                 _, phase_peak = tracemalloc.get_traced_memory()
@@ -458,6 +482,11 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 reason=str(exc),
                 error_type=type(exc).__name__,
             ))
+            cell_runtime = time.perf_counter() - cell_start
+            log_progress(
+                f"[{index}/{total_cells}] finished cell {cell_label} "
+                f"status=unsupported runtime={cell_runtime:.2f}s"
+            )
         except Exception as exc:  # experiment failures are data, not dropped cells
             if tracemalloc.is_tracing():
                 _, phase_peak = tracemalloc.get_traced_memory()
@@ -487,6 +516,11 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 reason=str(exc),
                 error_type=type(exc).__name__,
             ))
+            cell_runtime = time.perf_counter() - cell_start
+            log_progress(
+                f"[{index}/{total_cells}] finished cell {cell_label} "
+                f"status=error runtime={cell_runtime:.2f}s type={type(exc).__name__}"
+            )
     return rows
 
 

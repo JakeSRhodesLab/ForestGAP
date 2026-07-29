@@ -25,6 +25,7 @@ from experiments.common import (
     parse_random_states,
     prepare_dataset,
     proximity_methods_for_model,
+    log_progress,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -45,11 +46,20 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
     for task_kind in ("classification", "regression"):
+        log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
+                    f"task_id={task_id} random_state={random_state}"
+                )
                 for model_name in requested_model_names():
+                    log_progress(
+                        f"[{EXPERIMENT_NAME}] dataset={dataset_name} "
+                        f"model={model_name} random_state={random_state}"
+                    )
                     if model_name not in available_model_names(task_kind):
                         rows.append(
                             unsupported_model_row(
@@ -92,6 +102,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         continue
 
                     for prox_method in proximity_methods_for_model(model_name):
+                        log_progress(
+                            f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
+                            f"dataset={dataset_name}"
+                        )
                         try:
                             model = build_proximity_model(
                                 prepared.task_kind, model_name=model_name,

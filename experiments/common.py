@@ -631,6 +631,14 @@ def safe_mean(values: Sequence[float]) -> float:
     return float(np.nanmean(arr))
 
 
+_PROGRESS_ORIGIN = time.perf_counter()
+
+
+def log_progress(message: str) -> None:
+    elapsed_seconds = time.perf_counter() - _PROGRESS_ORIGIN
+    print(f"[+{elapsed_seconds:8.1f}s] {message}", flush=True)
+
+
 def iter_openml_suite(task_kind: TaskKind, limit: Optional[int] = None) -> Iterator[tuple[int, Any]]:
     try:
         openml = import_module("openml")

@@ -57,6 +57,7 @@ from experiments.common import (
     iter_openml_suite,
     parse_random_states,
     rough_fill_train_test,
+    log_progress,
     unsupported_model_row,
 )
 
@@ -241,13 +242,22 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
 
     for task_kind in requested_tasks(args.task):
+        log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         _, suite_name = suite_metadata(task_kind)
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
+                    f"task_id={task_id} random_state={random_state}"
+                )
                 for model_name in requested_model_names():
                     prox_method = "honest_gap" if model_name == "HonestForest" else PROX_METHOD
+                    log_progress(
+                        f"[{EXPERIMENT_NAME}] dataset={dataset_name} "
+                        f"model={model_name} prox_method={prox_method}"
+                    )
                     if model_name not in available_model_names(task_kind):
                         rows.append(
                             unsupported_model_row(

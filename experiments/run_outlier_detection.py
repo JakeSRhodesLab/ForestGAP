@@ -31,6 +31,7 @@ from experiments.common import (
     parse_random_states,
     prepare_dataset,
     proximity_methods_for_model,
+    log_progress,
     raw_output_path,
     record_exception,
     requested_outlier_model_names,
@@ -202,10 +203,15 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     outlier_fractions = requested_outlier_fractions(args)
 
     for task_kind in requested_tasks(args.task):
+        log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
+                    f"task_id={task_id} random_state={random_state}"
+                )
                 try:
                     prepared = prepare_dataset(
                         task_kind,
@@ -239,6 +245,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     continue
 
                 for outlier_fraction in outlier_fractions:
+                    log_progress(
+                        f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
+                        f"outlier_fraction={float(outlier_fraction):.3f}"
+                    )
                     X_corrupt, corruption_labels = corrupt_dataset(
                         X_train_filled,
                         prepared.categorical_indices,
@@ -248,6 +258,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     outlier_count = int(corruption_labels.sum())
 
                     for model_name in requested_outlier_model_names():
+                        log_progress(
+                            f"[{EXPERIMENT_NAME}] model={model_name} "
+                            f"outlier_fraction={float(outlier_fraction):.3f}"
+                        )
                         spec = outlier_model_spec(task_kind, model_name)
                         if spec is None:
                             rows.append(
@@ -286,6 +300,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 )
                             )
                             for prox_method in prox_methods:
+                                log_progress(
+                                    f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
+                                    f"outlier_fraction={float(outlier_fraction):.3f}"
+                                )
                                 model, spec, fit_metadata = build_outlier_model(
                                     task_kind,
                                     model_name=model_name,

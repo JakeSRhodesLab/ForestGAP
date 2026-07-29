@@ -51,6 +51,7 @@ from experiments.common import (
     parse_random_states,
     prepare_dataset,
     proximity_methods_for_model,
+    log_progress,
     raw_output_path,
     record_exception,
     requested_tasks,
@@ -85,11 +86,20 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     prox_method = getattr(args, "_prox_method", "original")
 
     for task_kind in requested_tasks(args.task):
+        log_progress(f"[{EXPERIMENT_NAME}] prox_method={prox_method} task_kind={task_kind}")
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] dataset={dataset_name} task_id={task_id} "
+                    f"random_state={random_state} prox_method={prox_method}"
+                )
                 for model_name in requested_model_names():
+                    log_progress(
+                        f"[{EXPERIMENT_NAME}] model={model_name} "
+                        f"prox_method={prox_method} dataset={dataset_name}"
+                    )
                     if prox_method not in proximity_methods_for_model(model_name):
                         continue
                     if task_kind == "regression":
@@ -308,6 +318,7 @@ if __name__ == "__main__":
         "original", "oob", "rfgap", "honest_gap", "kerf", "path",
         "englund", "random_height",
     ):
+        log_progress(f"[{EXPERIMENT_NAME}] starting relation={relation}")
         parsed_args._prox_method = relation
         frames.append(run(parsed_args))
     frame = pd.concat(frames, ignore_index=True)

@@ -40,6 +40,7 @@ from experiments.common import (
     parse_random_states,
     prepare_dataset,
     proximity_methods_for_model,
+    log_progress,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -933,13 +934,19 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     random_states = parse_random_states(args.random_states)
 
     for task_kind in requested_tasks(args.task):
+        log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         if task_kind == "classification" and not args.skip_synthetic:
+            log_progress(f"[{EXPERIMENT_NAME}] starting synthetic track")
             for random_state in random_states:
                 for synthetic in _build_synthetic_scenarios(
                     random_state=random_state,
                     test_size=args.test_size,
                 ):
                     prepared = synthetic.prepared
+                    log_progress(
+                        f"[{EXPERIMENT_NAME}] synthetic dataset={prepared.dataset_name} "
+                        f"random_state={random_state}"
+                    )
                     for model_name in requested_model_names():
                         if model_name not in available_model_names(task_kind):
                             for prox_method in proximity_methods_for_model(model_name):
@@ -965,6 +972,10 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                             continue
 
                         for prox_method in proximity_methods_for_model(model_name):
+                            log_progress(
+                                f"[{EXPERIMENT_NAME}] synthetic dataset={prepared.dataset_name} "
+                                f"model={model_name} prox_method={prox_method}"
+                            )
                             try:
                                 case_rows, case_details = _evaluate_case(
                                     prepared=prepared,
@@ -1000,10 +1011,15 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         if args.skip_openml:
             continue
 
+        log_progress(f"[{EXPERIMENT_NAME}] starting OpenML track")
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in random_states:
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
+                    f"task_id={task_id} random_state={random_state}"
+                )
                 if task_kind == "regression":
                     for model_name in requested_model_names():
                         for prox_method in proximity_methods_for_model(model_name):
@@ -1079,6 +1095,10 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                         continue
 
                     for prox_method in proximity_methods_for_model(model_name):
+                        log_progress(
+                            f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
+                            f"model={model_name} prox_method={prox_method}"
+                        )
                         try:
                             case_rows, case_details = _evaluate_case(
                                 prepared=prepared,

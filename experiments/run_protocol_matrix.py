@@ -39,6 +39,7 @@ from experiments.common import (
     prepare_dataset,
     rough_fill_train_test,
     requested_tasks,
+    log_progress,
 )
 from experiments.harness import ExperimentCell, run_cells
 from experiments.program import capability_aware_cells, default_trial_manifests
@@ -133,10 +134,15 @@ def build_cells(
     model_names = tuple(models)
     requested_relations = None if relations is None else tuple(relations)
     for task_kind in task_kinds:
+        log_progress(f"[protocol_matrix] task_kind={task_kind}")
         folds = iter_openml_suite_folds(task_kind, dataset_limit)
         for fold_number, official_fold in enumerate(folds):
             if fold_limit is not None and fold_number >= fold_limit:
                 break
+            log_progress(
+                f"[protocol_matrix] task_kind={task_kind} task_id={official_fold.task_id} "
+                f"fold_id={official_fold.fold_id}"
+            )
             prepared = prepare_dataset(
                 task_kind,  # type: ignore[arg-type]
                 task_id=official_fold.task_id,
@@ -153,6 +159,10 @@ def build_cells(
             )
             for seed in seeds:
                 for model_name in model_names:
+                    log_progress(
+                        f"[protocol_matrix] task_kind={task_kind} task_id={prepared.task_id} "
+                        f"fold_id={prepared.fold_id} model={model_name} seed={seed}"
+                    )
                     try:
                         family, factory, search_family = MODELS[model_name]
                     except KeyError as exc:
@@ -252,7 +262,8 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
     smoke_dataset_limit = 1 if args.smoke and args.dataset_limit is None else args.dataset_limit
     smoke_fold_limit = 1 if args.smoke and args.fold_limit is None else args.fold_limit
     n_estimators = 8 if args.smoke else args.n_estimators
-    rows = run_cells(build_cells(
+    log_progress("[protocol_matrix] building cells")
+    cells = build_cells(
         task_kinds=requested_tasks(args.task),
         models=_csv(args.models),
         relations=None if args.relations.strip().casefold() == "auto" else _csv(args.relations),
@@ -260,10 +271,13 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
         dataset_limit=smoke_dataset_limit,
         fold_limit=smoke_fold_limit,
         n_estimators=n_estimators,
-    ))
+    )
+    log_progress(f"[protocol_matrix] running {len(cells)} cells")
+    rows = run_cells(cells)
     _write_rows(rows, args.output)
     statuses = ("ok", "unsupported", "excluded", "error")
     counts = {status: sum(row["status"] == status for row in rows) for status in statuses}
+    log_progress(f"[protocol_matrix] wrote {args.output}")
     print(json.dumps({"cells": len(rows), "output": str(args.output), "status": counts}, sort_keys=True))
     return rows
 

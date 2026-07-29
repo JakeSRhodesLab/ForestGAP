@@ -60,6 +60,7 @@ from experiments.common import (
     parse_random_states,
     prepare_dataset,
     proximity_methods_for_model,
+    log_progress,
     raw_output_path,
     record_exception,
     requested_model_names,
@@ -162,11 +163,16 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     missing_rates = [float(args.missing_rate)] if args.missing_rate is not None else parse_missing_rates(args.missing_rates)
 
     for task_kind in requested_tasks(args.task):
+        log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         downstream_models = downstream_model_names(task_kind)
         for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in random_states:
+                log_progress(
+                    f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
+                    f"task_id={task_id} random_state={random_state}"
+                )
                 try:
                     prepared = prepare_dataset(
                         task_kind,
@@ -221,6 +227,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
                 for missingness_mechanism in missingness_mechanisms:
                     for missing_rate in missing_rates:
+                        log_progress(
+                            f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
+                            f"missingness={missingness_mechanism} rate={float(missing_rate):.3f}"
+                        )
                         mask_result = induced_missing_masks(
                             prepared.X_train,
                             prepared.X_test,
@@ -237,6 +247,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         X_test_masked = apply_missing_mask(prepared.X_test, mask_result.test_mask)
 
                         for model_name in requested_model_names():
+                            log_progress(
+                                f"[{EXPERIMENT_NAME}] model={model_name} "
+                                f"missingness={missingness_mechanism} rate={float(missing_rate):.3f}"
+                            )
                             if model_name not in available_model_names(task_kind):
                                 for prox_method, variant in proximity_configurations(model_name):
                                     for downstream_model in downstream_models:
@@ -265,6 +279,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 continue
 
                             for prox_method, variant in proximity_configurations(model_name):
+                                log_progress(
+                                    f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
+                                    f"variant={variant}"
+                                )
                                 base_context = {
                                     "experiment": EXPERIMENT_NAME,
                                     "status": "ok",

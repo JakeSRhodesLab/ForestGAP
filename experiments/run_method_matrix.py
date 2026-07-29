@@ -35,9 +35,11 @@ from forestgap.manifold.proximity import prepare_proximity_affinity
 try:  # module execution and direct script execution
     from experiments.harness import ExperimentCell, run_cells
     from experiments.program import capability_aware_cells
+    from experiments.common import log_progress
 except ModuleNotFoundError:  # pragma: no cover - direct script path
     from harness import ExperimentCell, run_cells
     from program import capability_aware_cells
+    from common import log_progress
 
 
 EstimatorFactory = Callable[[int, int], Any]
@@ -192,7 +194,9 @@ def build_cells(
     requested_relations = None if relations is None else tuple(relations)
     cells: list[ExperimentCell] = []
     for seed in seeds:
+        log_progress(f"[method_matrix] seed={seed}")
         for regime in data_regimes:
+            log_progress(f"[method_matrix] seed={seed} regime={regime}")
             X, y = _dataset(regime, n_samples, seed)
             train_ids, test_ids = train_test_split(
                 np.arange(n_samples), test_size=0.3, stratify=y, random_state=seed,
@@ -208,6 +212,10 @@ def build_cells(
                     raise ValueError(f"unknown estimator {estimator_name!r}")
                 factory = ESTIMATORS[estimator_name]
                 for application in application_names:
+                    log_progress(
+                        f"[method_matrix] seed={seed} regime={regime} "
+                        f"estimator={estimator_name} application={application}"
+                    )
                     if application not in APPLICATIONS:
                         raise ValueError(f"unknown application {application!r}")
                     cells.extend(capability_aware_cells(
@@ -279,6 +287,7 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
         if args.relations.strip().casefold() == "auto"
         else _csv(args.relations)
     )
+    log_progress("[method_matrix] building cells")
     cells = build_cells(
         estimators=estimator_names,
         relations=relation_names,
@@ -288,12 +297,14 @@ def main(argv: list[str] | None = None) -> list[dict[str, Any]]:
         n_samples=n_samples,
         n_estimators=n_estimators,
     )
+    log_progress(f"[method_matrix] running {len(cells)} cells")
     rows = run_cells(cells)
     write_rows(rows, args.output)
     status_order = ["ok", "unsupported", "error"]
     if any(row["status"] == "excluded" for row in rows):
         status_order.append("excluded")
     counts = {status: sum(row["status"] == status for row in rows) for status in status_order}
+    log_progress(f"[method_matrix] wrote {args.output}")
     print(json.dumps({"output": str(args.output), "cells": len(rows), "status": counts}, sort_keys=True))
     return rows
 
