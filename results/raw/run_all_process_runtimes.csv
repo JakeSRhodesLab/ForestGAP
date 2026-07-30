@@ -1,7 +1,3 @@
 script_name,task,random_states,dataset_limit,max_rows,test_size,return_code,status,runtime_seconds
-run_prediction_identity.py,both,"0,1,2",,,0.3,1,error,5.335268
-run_imputation.py,both,"0,1,2",,,0.3,1,error,1.438686
-run_outlier_detection.py,both,"0,1,2",,,0.3,1,error,1.152624
-run_prototypes.py,both,"0,1,2",,,0.3,1,error,1.061733
-run_local_feature_importance.py,both,"0,1,2",,,0.3,1,error,1.183595
-run_mds_visualization.py,both,"0,1,2",,,0.3,1,error,1.548032
+run_local_feature_importance.py,both,"0,1,2",,,0.3,1,error,16864.574854
+run_mds_visualization.py,both,"0,1,2",,,0.3,0,ok,33292.956810
