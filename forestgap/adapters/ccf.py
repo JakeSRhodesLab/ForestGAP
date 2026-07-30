@@ -23,7 +23,15 @@ from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.metrics import r2_score
 from sklearn.utils import check_random_state
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_array, check_is_fitted, validate_data
+from sklearn.utils.validation import check_array, check_is_fitted
+
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    # sklearn < 1.6: validate_data is not a standalone function;
+    # fall back to the estimator's _validate_data method.
+    def validate_data(estimator, **kwargs):
+        return estimator._validate_data(**kwargs)
 
 
 @dataclass(frozen=True)
