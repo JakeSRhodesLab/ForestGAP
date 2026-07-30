@@ -7,7 +7,9 @@ import shutil
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
+from typing import Any, TextIO
 
 
 SCRIPTS = [
@@ -39,6 +41,7 @@ def _child_env(thread_count: int) -> dict[str, str]:
         env[env_name] = thread_count
     env["FORESTGAP_N_JOBS"] = thread_count
     env.setdefault("PYTHONNOUSERSITE", "1")
+    env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 
@@ -57,7 +60,7 @@ def _python_command() -> list[str]:
         env=probe_env,
     )
     if probe.returncode == 0:
-        return [sys.executable]
+        return [sys.executable, "-u"]
 
     conda = shutil.which("conda")
     if conda is None:
@@ -68,7 +71,33 @@ def _python_command() -> list[str]:
         )
 
     env_name = os.environ.get("GENERALFOREST_ENV", "generalforest")
-    return [conda, "run", "--no-capture-output", "-n", env_name, "python"]
+    return [conda, "run", "--no-capture-output", "-n", env_name, "python", "-u"]
+
+
+def _emit_terminal(lock: Any, message: str) -> None:
+    with lock:
+        sys.stdout.write(message)
+        if not message.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _tee_process_output(
+    proc: subprocess.Popen[str],
+    log_handle: TextIO,
+    *,
+    prefix: str,
+    terminal_lock: Any,
+) -> None:
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            log_handle.write(line)
+            log_handle.flush()
+            cleaned_line = line.rstrip("\r\n")
+            _emit_terminal(terminal_lock, f"{prefix} {cleaned_line}")
+    finally:
+        proc.stdout.close()
 
 
 def _write_process_rows(path: Path, rows: list[dict[str, str]]) -> None:
@@ -102,6 +131,7 @@ def main() -> None:
     python_command = _python_command()
     raw_path = raw_dir / "run_all_process_runtimes.csv"
     running: dict[str, dict[str, object]] = {}
+    terminal_lock = threading.Lock()
     common_args = [
         "--task",
         args.task,
@@ -124,23 +154,37 @@ def main() -> None:
             proc = subprocess.Popen(
                 cmd,
                 env=_child_env(child_thread_count),
-                stdout=log_handle,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
             )
         except Exception:
             log_handle.close()
             raise
+        reader_thread = threading.Thread(
+            target=_tee_process_output,
+            args=(proc, log_handle),
+            kwargs={
+                "prefix": f"[{index}/{len(SCRIPTS)}:{Path(script).stem}]",
+                "terminal_lock": terminal_lock,
+            },
+            daemon=True,
+        )
+        reader_thread.start()
         running[script] = {
             "index": index,
             "proc": proc,
             "start": start,
             "log_handle": log_handle,
             "log_path": log_path,
+            "reader_thread": reader_thread,
         }
-        print(
+        _emit_terminal(
+            terminal_lock,
             f"[{index}/{len(SCRIPTS)}] started {script} with {child_thread_count} threads "
             f"log={log_path}",
-            flush=True,
         )
 
     last_status_report = time.perf_counter()
@@ -154,6 +198,9 @@ def main() -> None:
                 continue
             completed_scripts.append(script)
             runtime_seconds = time.perf_counter() - float(info["start"])
+            reader_thread = info["reader_thread"]
+            assert isinstance(reader_thread, threading.Thread)
+            reader_thread.join()
             log_handle = info["log_handle"]
             assert hasattr(log_handle, "close")
             log_handle.close()
@@ -171,10 +218,10 @@ def main() -> None:
             process_rows.append(row)
             process_rows.sort(key=lambda item: SCRIPTS.index(item["script_name"]))
             _write_process_rows(raw_path, process_rows)
-            print(
+            _emit_terminal(
+                terminal_lock,
                 f"[{info['index']}/{len(SCRIPTS)}] finished {script} "
                 f"rc={return_code} runtime={runtime_seconds:.2f}s log={info['log_path']}",
-                flush=True,
             )
             had_failure = had_failure or return_code != 0
         for script in completed_scripts:
@@ -183,10 +230,10 @@ def main() -> None:
             active_scripts = ", ".join(
                 f"{info['index']}:{script}" for script, info in running.items()
             )
-            print(
+            _emit_terminal(
+                terminal_lock,
                 f"{len(running)} scripts still running with {child_thread_count} threads each: "
                 f"{active_scripts}",
-                flush=True,
             )
             last_status_report = time.perf_counter()
         if running:
