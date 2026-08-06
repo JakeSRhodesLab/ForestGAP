@@ -55,6 +55,10 @@ from experiments.common import (
     raw_output_path,
     record_exception,
     requested_tasks,
+    run_module_parallel,
+    selected_model_names,
+    selected_task_ids,
+    setup_selected,
     requested_model_names,
     rough_fill_train_test,
     save_dataframe,
@@ -87,15 +91,21 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] prox_method={prox_method} task_kind={task_kind}")
-        for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
+        for task_id, task in iter_openml_suite(
+            task_kind,
+            args.dataset_limit,
+            task_ids=selected_task_ids(args, task_kind),
+        ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                if not setup_selected(args, task_kind, task_id, random_state):
+                    continue
                 log_progress(
                     f"[{EXPERIMENT_NAME}] dataset={dataset_name} task_id={task_id} "
                     f"random_state={random_state} prox_method={prox_method}"
                 )
-                for model_name in requested_model_names():
+                for model_name in selected_model_names(args, requested_model_names()):
                     log_progress(
                         f"[{EXPERIMENT_NAME}] model={model_name} "
                         f"prox_method={prox_method} dataset={dataset_name}"
@@ -264,6 +274,18 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def run_all_relations(args: argparse.Namespace) -> pd.DataFrame:
+    frames = []
+    for relation in (
+        "original", "oob", "rfgap", "honest_gap", "kerf", "path",
+        "englund", "random_height",
+    ):
+        log_progress(f"[{EXPERIMENT_NAME}] starting relation={relation}")
+        args._prox_method = relation
+        frames.append(run(args))
+    return pd.concat(frames, ignore_index=True)
+
+
 def compile_outputs(df: pd.DataFrame) -> None:
     if df.empty or "task_kind" not in df.columns:
         return
@@ -313,13 +335,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     parsed_args = build_parser().parse_args()
-    frames = []
-    for relation in (
-        "original", "oob", "rfgap", "honest_gap", "kerf", "path",
-        "englund", "random_height",
-    ):
-        log_progress(f"[{EXPERIMENT_NAME}] starting relation={relation}")
-        parsed_args._prox_method = relation
-        frames.append(run(parsed_args))
-    frame = pd.concat(frames, ignore_index=True)
+    frame = run_module_parallel(
+        "experiments.run_local_feature_importance",
+        parsed_args,
+        runner_name="run_all_relations",
+        model_names=requested_model_names(),
+    )
     compile_outputs(frame)

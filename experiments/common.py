@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from hashlib import sha256
 import inspect
 from importlib import import_module
 import json
 import math
 import os
+import random
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 import time
 import traceback
-from typing import Any, Iterator, Literal, Optional, Sequence
+from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
 
-for env_name in (
+THREAD_ENV_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
     "VECLIB_MAXIMUM_THREADS",
-):
-    os.environ.setdefault(env_name, str(os.cpu_count() or 1))
+)
+for env_name in THREAD_ENV_VARS:
+    os.environ[env_name] = "1"
+
 
 import matplotlib
 
@@ -429,12 +435,296 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default=0.3,
         help="Held-out test fraction.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of independent experiment worker processes. The default "
+            "(0) uses every CPU allowed by the process affinity mask. Models "
+            "and native numerical libraries use one thread inside each worker."
+        ),
+    )
 
 
 def requested_tasks(task: str) -> list[TaskKind]:
     if task == "both":
         return ["classification", "regression"]
     return [task]  # type: ignore[list-item]
+
+
+def available_worker_count() -> int:
+    """Return CPUs actually available to this process, respecting affinity."""
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def resolve_worker_count(requested: int | None) -> int:
+    """Resolve the CLI worker count, where zero selects all available CPUs."""
+
+    if requested is None or requested == 0:
+        return available_worker_count()
+    if requested < 0:
+        raise ValueError("--workers must be zero or a positive integer")
+    return requested
+
+
+def selected_task_ids(args: argparse.Namespace, task_kind: TaskKind) -> list[int] | None:
+    """Return a worker's task IDs, or ``None`` outside parallel execution."""
+
+    task_ids = getattr(args, "_parallel_task_ids", None)
+    if task_ids is None:
+        return None
+    return [int(task_id) for task_id in task_ids.get(task_kind, ())]
+
+
+def setup_selected(
+    args: argparse.Namespace,
+    task_kind: TaskKind,
+    task_id: int,
+    random_state: int,
+) -> bool:
+    """Whether a dataset/seed setup belongs to the current worker task."""
+
+    selected = getattr(args, "_parallel_setups", None)
+    if selected is None:
+        return True
+    prefix = (str(task_kind), int(task_id), int(random_state))
+    return any(tuple(item[:3]) == prefix for item in selected)
+
+
+def selected_model_names(
+    args: argparse.Namespace,
+    model_names: Iterable[str],
+) -> tuple[str, ...]:
+    """Restrict requested models to the current worker's parent-fit group."""
+
+    selected = getattr(args, "_parallel_models", None)
+    if selected is None:
+        return tuple(model_names)
+    selected_set = set(selected)
+    return tuple(model_name for model_name in model_names if model_name in selected_set)
+
+
+def extra_setup_selected(args: argparse.Namespace, key: Sequence[Any]) -> bool:
+    """Whether a non-OpenML setup (for example a synthetic case) is selected."""
+
+    selected = getattr(args, "_parallel_extra_items", None)
+    if selected is None:
+        return True
+    return tuple(key) in selected
+
+
+_RESULT_SORT_COLUMNS: tuple[str, ...] = (
+    "task_kind",
+    "suite_name",
+    "task_id",
+    "dataset_id",
+    "dataset_name",
+    "random_state",
+    "model_name",
+    "prox_method",
+    "missingness_mechanism",
+    "missing_rate",
+    "variant",
+    "downstream_model",
+    "outlier_fraction",
+    "score_source",
+    "score_method",
+    "label_mode",
+    "prototype_source",
+    "baseline_repeat",
+    "class_label",
+    "prototype_number",
+    "status",
+)
+
+
+def stable_result_order(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort asynchronous worker results by scientific configuration."""
+
+    if df.empty:
+        return df.reset_index(drop=True)
+    df = df.convert_dtypes()
+    columns = [column for column in _RESULT_SORT_COLUMNS if column in df.columns]
+    if not columns:
+        return df.reset_index(drop=True)
+    return df.sort_values(
+        columns,
+        kind="mergesort",
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+_THREADPOOL_LIMITER: Any = None
+
+
+def configure_single_threaded_worker() -> None:
+    """Reserve parallelism for experiment setups rather than model internals."""
+
+    global _THREADPOOL_LIMITER
+    for env_name in THREAD_ENV_VARS:
+        os.environ[env_name] = "1"
+    os.environ["FORESTGAP_N_JOBS"] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+
+        _THREADPOOL_LIMITER = threadpool_limits(limits=1)
+    except ImportError:  # pragma: no cover - installed with scikit-learn
+        _THREADPOOL_LIMITER = None
+
+
+def _openml_task_ids(task_kind: TaskKind, limit: int | None) -> list[int]:
+    try:
+        openml = import_module("openml")
+    except ImportError as exc:
+        raise ImportError(
+            "OpenML experiment suites require the optional 'openml' extra; "
+            "install forestgap[openml] before running full-data experiments."
+        ) from exc
+    suite_id, _ = suite_metadata(task_kind)
+    suite = openml.study.get_suite(suite_id)
+    task_ids = [int(task_id) for task_id in getattr(suite, "tasks", ())]
+    return task_ids if limit is None else task_ids[:limit]
+
+
+def _run_module_work_item(
+    module_name: str,
+    runner_name: str,
+    args_values: dict[str, Any],
+) -> Any:
+    configure_single_threaded_worker()
+    args = argparse.Namespace(**args_values)
+    args._parallel_setups = frozenset(
+        tuple(item) for item in getattr(args, "_parallel_setups", ())
+    )
+    args._parallel_models = frozenset(getattr(args, "_parallel_models", ()))
+    args._parallel_extra_items = frozenset(
+        tuple(item) for item in getattr(args, "_parallel_extra_items", ())
+    )
+    seed_material = [
+        *sorted(args._parallel_setups, key=repr),
+        *sorted(args._parallel_extra_items, key=repr),
+    ]
+    seed_digest = sha256(json.dumps(seed_material, default=repr).encode()).digest()
+    setup_seed = int.from_bytes(seed_digest[:4], byteorder="little", signed=False)
+    np.random.seed(setup_seed)
+    random.seed(setup_seed)
+    runner = getattr(import_module(module_name), runner_name)
+    return runner(args)
+
+
+def _combine_parallel_results(results: Sequence[Any]) -> Any:
+    if not results:
+        return pd.DataFrame()
+    first = results[0]
+    if isinstance(first, tuple):
+        return tuple(
+            stable_result_order(pd.concat(
+                [result[index] for result in results],
+                ignore_index=True,
+            ))
+            for index in range(len(first))
+        )
+    return stable_result_order(pd.concat(results, ignore_index=True))
+
+
+def run_module_parallel(
+    module_name: str,
+    args: argparse.Namespace,
+    *,
+    runner_name: str = "run",
+    model_names: Iterable[str],
+    include_openml: bool = True,
+    extra_items: Iterable[Sequence[Any]] = (),
+) -> Any:
+    """Run experimental setup groups in a dynamic process pool.
+
+    Each work item owns one dataset/seed/model parent-fit group. Worker
+    processes force estimator, OpenMP, and BLAS thread counts to one. Results
+    are returned to the parent, combined, and sorted deterministically before
+    any aggregate CSV is written.
+    """
+
+    workers = resolve_worker_count(getattr(args, "workers", 0))
+    models = tuple(model_names)
+    task_ids_by_kind: dict[TaskKind, list[int]] = {}
+    if include_openml:
+        for task_kind in requested_tasks(args.task):
+            task_ids_by_kind[task_kind] = _openml_task_ids(
+                task_kind,
+                getattr(args, "dataset_limit", None),
+            )
+
+    random_states = parse_random_states(args.random_states)
+    work_items: list[tuple[str, tuple[Any, ...]]] = []
+    for task_kind, task_ids in task_ids_by_kind.items():
+        for task_id in task_ids:
+            for random_state in random_states:
+                for model_name in models:
+                    work_items.append((
+                        "openml",
+                        (task_kind, int(task_id), int(random_state), model_name),
+                    ))
+    work_items.extend(("extra", tuple(item)) for item in extra_items)
+
+    if not work_items:
+        configure_single_threaded_worker()
+        result = getattr(import_module(module_name), runner_name)(args)
+        if isinstance(result, tuple):
+            return tuple(stable_result_order(frame) for frame in result)
+        return stable_result_order(result)
+
+    worker_count = min(workers, len(work_items))
+    log_progress(
+        f"[parallel] dispatching {len(work_items)} setup groups to "
+        f"{worker_count} single-threaded workers"
+    )
+    base_values = vars(args).copy()
+    work_values = []
+    for item_kind, item in work_items:
+        values = base_values.copy()
+        values["workers"] = 1
+        if item_kind == "openml":
+            task_kind, task_id, random_state, model_name = item
+            values["_parallel_task_ids"] = {
+                kind: ([task_id] if kind == task_kind else [])
+                for kind in requested_tasks(args.task)
+            }
+            values["_parallel_setups"] = [
+                (task_kind, task_id, random_state, model_name),
+            ]
+            values["_parallel_models"] = [model_name]
+            values["_parallel_extra_items"] = []
+        else:
+            values["_parallel_task_ids"] = {
+                kind: [] for kind in requested_tasks(args.task)
+            }
+            values["_parallel_setups"] = []
+            values["_parallel_models"] = [item[-1]] if item else []
+            values["_parallel_extra_items"] = [item]
+        work_values.append(values)
+
+    if worker_count == 1:
+        results = [
+            _run_module_work_item(module_name, runner_name, values)
+            for values in work_values
+        ]
+    else:
+        futures = []
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            for values in work_values:
+                futures.append(executor.submit(
+                    _run_module_work_item,
+                    module_name,
+                    runner_name,
+                    values,
+                ))
+            results = [future.result() for future in futures]
+    return _combine_parallel_results(results)
 
 
 def suite_metadata(task_kind: TaskKind) -> tuple[int, str]:
@@ -639,7 +929,12 @@ def log_progress(message: str) -> None:
     print(f"[+{elapsed_seconds:8.1f}s] {message}", flush=True)
 
 
-def iter_openml_suite(task_kind: TaskKind, limit: Optional[int] = None) -> Iterator[tuple[int, Any]]:
+def iter_openml_suite(
+    task_kind: TaskKind,
+    limit: Optional[int] = None,
+    *,
+    task_ids: Sequence[int] | None = None,
+) -> Iterator[tuple[int, Any]]:
     try:
         openml = import_module("openml")
     except ImportError as exc:
@@ -647,12 +942,15 @@ def iter_openml_suite(task_kind: TaskKind, limit: Optional[int] = None) -> Itera
             "OpenML experiment suites require the optional 'openml' extra; "
             "install forestgap[openml] before running full-data experiments."
         ) from exc
-    suite_id, _ = suite_metadata(task_kind)
-    suite = openml.study.get_suite(suite_id)
-    task_ids = list(getattr(suite, "tasks", []))
-    if limit is not None:
-        task_ids = task_ids[:limit]
-    for task_id in task_ids:
+    if task_ids is None:
+        suite_id, _ = suite_metadata(task_kind)
+        suite = openml.study.get_suite(suite_id)
+        selected_ids = list(getattr(suite, "tasks", []))
+        if limit is not None:
+            selected_ids = selected_ids[:limit]
+    else:
+        selected_ids = list(task_ids)
+    for task_id in selected_ids:
         yield int(task_id), openml.tasks.get_task(int(task_id))
 
 
@@ -1047,7 +1345,7 @@ def build_proximity_model(
     }
     signature = inspect.signature(base_cls.__init__)
     if "n_jobs" in signature.parameters:
-        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "-1"))
+        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "1"))
     if "bootstrap" in signature.parameters:
         kwargs["bootstrap"] = bootstrap
     if "oob_score" in signature.parameters:
@@ -1060,7 +1358,13 @@ def build_proximity_model(
             else:
                 kwargs[key] = value
     estimator = base_cls(**kwargs)
-    return Proximity(estimator, relation=prox_method, matrix_type="sparse", **proximity_kwargs)
+    return Proximity(
+        estimator,
+        relation=prox_method,
+        matrix_type="sparse",
+        random_state=random_state,
+        **proximity_kwargs,
+    )
 
 
 def build_outlier_model(
@@ -1084,7 +1388,7 @@ def build_outlier_model(
         "random_state": random_state,
     }
     if "n_jobs" in signature.parameters:
-        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "-1"))
+        kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "1"))
 
     if spec.model_family == "supervised_forest":
         if "bootstrap" in signature.parameters:
@@ -1110,7 +1414,16 @@ def build_outlier_model(
             spec.supports_native_scores and spec.native_scores_share_fit_across_prox_methods
         ),
     }
-    return Proximity(base_cls(**kwargs), relation=prox_method, matrix_type="sparse"), spec, fit_metadata
+    return (
+        Proximity(
+            base_cls(**kwargs),
+            relation=prox_method,
+            matrix_type="sparse",
+            random_state=random_state,
+        ),
+        spec,
+        fit_metadata,
+    )
 
 
 def fit_outlier_model(model: Any, spec: OutlierModelSpec, X: np.ndarray, y: np.ndarray) -> Any:

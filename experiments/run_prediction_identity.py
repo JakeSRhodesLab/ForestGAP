@@ -50,9 +50,13 @@ from experiments.common import (
     prepare_dataset,
     raw_output_path,
     record_exception,
+    run_module_parallel,
     save_dataframe,
     requested_tasks,
     save_plot_dataframe,
+    selected_model_names,
+    selected_task_ids,
+    setup_selected,
     suite_metadata,
     iter_openml_suite,
     parse_random_states,
@@ -244,15 +248,21 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         _, suite_name = suite_metadata(task_kind)
-        for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
+        for task_id, task in iter_openml_suite(
+            task_kind,
+            args.dataset_limit,
+            task_ids=selected_task_ids(args, task_kind),
+        ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                if not setup_selected(args, task_kind, task_id, random_state):
+                    continue
                 log_progress(
                     f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
                     f"task_id={task_id} random_state={random_state}"
                 )
-                for model_name in requested_model_names():
+                for model_name in selected_model_names(args, requested_model_names()):
                     prox_method = "honest_gap" if model_name == "HonestForest" else PROX_METHOD
                     log_progress(
                         f"[{EXPERIMENT_NAME}] dataset={dataset_name} "
@@ -639,5 +649,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    frame = run(build_parser().parse_args())
+    parsed_args = build_parser().parse_args()
+    frame = run_module_parallel(
+        "experiments.run_prediction_identity",
+        parsed_args,
+        model_names=requested_model_names(),
+    )
     compile_outputs(frame)

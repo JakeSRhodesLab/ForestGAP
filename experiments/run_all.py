@@ -31,15 +31,17 @@ THREAD_ENV_VARS = (
 
 
 def _available_threads() -> int:
-    return max(1, os.cpu_count() or 1)
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
 
 
-def _child_env(thread_count: int) -> dict[str, str]:
+def _child_env() -> dict[str, str]:
     env = os.environ.copy()
-    thread_count = str(max(1, thread_count))
     for env_name in THREAD_ENV_VARS:
-        env[env_name] = thread_count
-    env["FORESTGAP_N_JOBS"] = thread_count
+        env[env_name] = "1"
+    env["FORESTGAP_N_JOBS"] = "1"
     env.setdefault("PYTHONNOUSERSITE", "1")
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
@@ -116,6 +118,7 @@ def main() -> None:
     parser.add_argument("--dataset-limit", type=int, default=None)
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--test-size", type=float, default=0.3)
+    parser.add_argument("--workers", type=int, default=0)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -126,8 +129,10 @@ def main() -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     process_rows: list[dict[str, str]] = []
     had_failure = False
-    total_threads = _available_threads()
-    child_thread_count = max(1, total_threads // len(SCRIPTS))
+    if args.workers < 0:
+        parser.error("--workers must be zero or a positive integer")
+    total_workers = args.workers or _available_threads()
+    child_worker_count = max(1, total_workers)
     python_command = _python_command()
     raw_path = raw_dir / "run_all_process_runtimes.csv"
     running: dict[str, dict[str, object]] = {}
@@ -139,6 +144,8 @@ def main() -> None:
         args.random_states,
         "--test-size",
         str(args.test_size),
+        "--workers",
+        str(child_worker_count),
     ]
     if args.dataset_limit is not None:
         common_args.extend(["--dataset-limit", str(args.dataset_limit)])
@@ -153,7 +160,7 @@ def main() -> None:
         try:
             proc = subprocess.Popen(
                 cmd,
-                env=_child_env(child_thread_count),
+                env=_child_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -183,10 +190,13 @@ def main() -> None:
         }
         _emit_terminal(
             terminal_lock,
-            f"[{index}/{len(SCRIPTS)}] started {script} with {child_thread_count} threads "
+            f"[{index}/{len(SCRIPTS)}] started {script} with {child_worker_count} setup workers "
             f"log={log_path}",
         )
 
+        reader_thread.join()
+        proc.wait()
+        running[script]["end"] = time.perf_counter()
     last_status_report = time.perf_counter()
     while running:
         completed_scripts: list[str] = []
@@ -197,7 +207,7 @@ def main() -> None:
             if return_code is None:
                 continue
             completed_scripts.append(script)
-            runtime_seconds = time.perf_counter() - float(info["start"])
+            runtime_seconds = float(info["end"]) - float(info["start"])
             reader_thread = info["reader_thread"]
             assert isinstance(reader_thread, threading.Thread)
             reader_thread.join()
@@ -232,7 +242,7 @@ def main() -> None:
             )
             _emit_terminal(
                 terminal_lock,
-                f"{len(running)} scripts still running with {child_thread_count} threads each: "
+                f"{len(running)} scripts still running with {child_worker_count} setup workers: "
                 f"{active_scripts}",
             )
             last_status_report = time.perf_counter()

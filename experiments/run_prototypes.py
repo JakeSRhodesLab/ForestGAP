@@ -45,6 +45,11 @@ from experiments.common import (
     record_exception,
     requested_model_names,
     requested_tasks,
+    extra_setup_selected,
+    run_module_parallel,
+    selected_model_names,
+    selected_task_ids,
+    setup_selected,
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
@@ -935,7 +940,11 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
-        if task_kind == "classification" and not args.skip_synthetic:
+        if (
+            task_kind == "classification"
+            and not args.skip_synthetic
+            and getattr(args, "_parallel_extra_items", None) != frozenset()
+        ):
             log_progress(f"[{EXPERIMENT_NAME}] starting synthetic track")
             for random_state in random_states:
                 for synthetic in _build_synthetic_scenarios(
@@ -947,7 +956,12 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                         f"[{EXPERIMENT_NAME}] synthetic dataset={prepared.dataset_name} "
                         f"random_state={random_state}"
                     )
-                    for model_name in requested_model_names():
+                    for model_name in selected_model_names(args, requested_model_names()):
+                        if not extra_setup_selected(
+                            args,
+                            (task_kind, random_state, prepared.dataset_name, model_name),
+                        ):
+                            continue
                         if model_name not in available_model_names(task_kind):
                             for prox_method in proximity_methods_for_model(model_name):
                                 rows.append(
@@ -1012,16 +1026,22 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
             continue
 
         log_progress(f"[{EXPERIMENT_NAME}] starting OpenML track")
-        for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
+        for task_id, task in iter_openml_suite(
+            task_kind,
+            args.dataset_limit,
+            task_ids=selected_task_ids(args, task_kind),
+        ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in random_states:
+                if not setup_selected(args, task_kind, task_id, random_state):
+                    continue
                 log_progress(
                     f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
                     f"task_id={task_id} random_state={random_state}"
                 )
                 if task_kind == "regression":
-                    for model_name in requested_model_names():
+                    for model_name in selected_model_names(args, requested_model_names()):
                         for prox_method in proximity_methods_for_model(model_name):
                             rows.append(
                                 unsupported_model_row(
@@ -1070,7 +1090,7 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                     )
                     continue
 
-                for model_name in requested_model_names():
+                for model_name in selected_model_names(args, requested_model_names()):
                     if model_name not in available_model_names(task_kind):
                         for prox_method in proximity_methods_for_model(model_name):
                             rows.append(
@@ -1415,5 +1435,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    summary_frame, detail_frame = run(build_parser().parse_args())
+    parsed_args = build_parser().parse_args()
+    synthetic_items = []
+    if "classification" in requested_tasks(parsed_args.task) and not parsed_args.skip_synthetic:
+        synthetic_items = [
+            ("classification", random_state, spec["dataset_name"], model_name)
+            for random_state in parse_random_states(parsed_args.random_states)
+            for spec in _mode_specs()
+            for model_name in requested_model_names()
+        ]
+    summary_frame, detail_frame = run_module_parallel(
+        "experiments.run_prototypes",
+        parsed_args,
+        model_names=requested_model_names(),
+        include_openml=not parsed_args.skip_openml,
+        extra_items=synthetic_items,
+    )
     compile_outputs(summary_frame, detail_frame)

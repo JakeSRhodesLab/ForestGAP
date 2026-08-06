@@ -65,6 +65,10 @@ from experiments.common import (
     record_exception,
     requested_model_names,
     requested_tasks,
+    run_module_parallel,
+    selected_model_names,
+    selected_task_ids,
+    setup_selected,
     rough_fill_train_test,
     save_dataframe,
     save_lineplot_dataframe,
@@ -165,10 +169,16 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         downstream_models = downstream_model_names(task_kind)
-        for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
+        for task_id, task in iter_openml_suite(
+            task_kind,
+            args.dataset_limit,
+            task_ids=selected_task_ids(args, task_kind),
+        ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in random_states:
+                if not setup_selected(args, task_kind, task_id, random_state):
+                    continue
                 log_progress(
                     f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
                     f"task_id={task_id} random_state={random_state}"
@@ -185,7 +195,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                 except Exception as exc:
                     for missingness_mechanism in missingness_mechanisms:
                         for missing_rate in missing_rates:
-                            for model_name in requested_model_names():
+                            for model_name in selected_model_names(args, requested_model_names()):
                                 for prox_method, variant in proximity_configurations(model_name):
                                     for downstream_model in downstream_models:
                                         rows.append(
@@ -246,7 +256,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         X_train_masked = apply_missing_mask(prepared.X_train, mask_result.train_mask)
                         X_test_masked = apply_missing_mask(prepared.X_test, mask_result.test_mask)
 
-                        for model_name in requested_model_names():
+                        for model_name in selected_model_names(args, requested_model_names()):
                             log_progress(
                                 f"[{EXPERIMENT_NAME}] model={model_name} "
                                 f"missingness={missingness_mechanism} rate={float(missing_rate):.3f}"
@@ -632,5 +642,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    frame = run(build_parser().parse_args())
+    parsed_args = build_parser().parse_args()
+    frame = run_module_parallel(
+        "experiments.run_imputation",
+        parsed_args,
+        model_names=requested_model_names(),
+    )
     compile_outputs(frame)

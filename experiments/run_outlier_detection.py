@@ -36,6 +36,10 @@ from experiments.common import (
     record_exception,
     requested_outlier_model_names,
     requested_tasks,
+    run_module_parallel,
+    selected_model_names,
+    selected_task_ids,
+    setup_selected,
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
@@ -204,10 +208,16 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
-        for task_id, task in iter_openml_suite(task_kind, args.dataset_limit):
+        for task_id, task in iter_openml_suite(
+            task_kind,
+            args.dataset_limit,
+            task_ids=selected_task_ids(args, task_kind),
+        ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
             for random_state in parse_random_states(args.random_states):
+                if not setup_selected(args, task_kind, task_id, random_state):
+                    continue
                 log_progress(
                     f"[{EXPERIMENT_NAME}] task_kind={task_kind} dataset={dataset_name} "
                     f"task_id={task_id} random_state={random_state}"
@@ -227,7 +237,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         prepared.categorical_indices,
                     )
                 except Exception as exc:
-                    for model_name in requested_outlier_model_names():
+                    for model_name in selected_model_names(args, requested_outlier_model_names()):
                         error_row = record_exception(
                             experiment_name=EXPERIMENT_NAME,
                             task_kind=task_kind,
@@ -257,7 +267,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     )
                     outlier_count = int(corruption_labels.sum())
 
-                    for model_name in requested_outlier_model_names():
+                    for model_name in selected_model_names(args, requested_outlier_model_names()):
                         log_progress(
                             f"[{EXPERIMENT_NAME}] model={model_name} "
                             f"outlier_fraction={float(outlier_fraction):.3f}"
@@ -530,5 +540,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    frame = run(build_parser().parse_args())
+    parsed_args = build_parser().parse_args()
+    frame = run_module_parallel(
+        "experiments.run_outlier_detection",
+        parsed_args,
+        model_names=requested_outlier_model_names(),
+    )
     compile_outputs(frame)
