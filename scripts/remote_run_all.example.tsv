@@ -1,0 +1,5 @@
+# Minimal two-host `run_all.py` fan-out. Each job writes a different task-kind
+# result partition and uses its JOB_ID to isolate only run_all's own logs/CSV.
+# Change dataset-limit/random-states for a full run after the smoke test works.
+run-all-classification	python experiments/run_all.py --task classification --dataset-limit 1 --random-states 0 --workers "$HOST_WORKERS" --run-label "$JOB_ID"
+run-all-regression	python experiments/run_all.py --task regression --dataset-limit 1 --random-states 0 --workers "$HOST_WORKERS" --run-label "$JOB_ID"

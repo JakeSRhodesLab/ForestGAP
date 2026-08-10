@@ -1,0 +1,19 @@
+# One passwordless SSH target per line: ssh-target [slots] [workers-per-slot].
+# Use user@host when the remote login account differs from the controller user.
+# Keep slots at one for full-machine experiment jobs. If slots is greater than
+# one, lower workers-per-slot so slots * workers-per-slot fits the host's CPU
+# allocation. With no worker value, the dispatcher uses floor(CPUs / slots).
+stat-f01 1
+stat-f02 1
+stat-f03 1
+stat-f04 1
+stat-f05 1
+stat-f06 1
+stat-f07 1
+stat-f08 1
+stat-f09 1
+stat-f10 1
+stat-f11 1
+stat-f12 1
+stat-f13 1
+stat-f14 1

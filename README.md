@@ -158,3 +158,84 @@ baseline: it obtains repeat/fold/sample splits from typed OpenML tasks and
 persists their capability and provenance manifests. Its smoke mode is a
 deterministic contract check; publication runs still follow the nested-search
 requirements in `notes/experimental_designs.md`.
+
+## Remote Experiment Dispatch
+
+`scripts/dispatch_remote_jobs.sh` distributes independent, trusted shell
+commands across passwordless SSH hosts with a shared checkout and its local
+`uv` environment. It preflights the Git revision, `uv` project import,
+CPU capacity, and writable artifact directory on every selected host before it
+starts work. Status, logs, host checks, and the queue are recorded under
+`results/remote_runs/<run-id>/`.
+
+The dispatcher runs `uv run --no-sync --project <repo-root> ...`, using the
+checked-out `.venv` without mutating it. By default it resolves `uv` on the
+controller and uses that same path remotely; pass `--uv-bin /path/to/uv` when
+the remote hosts use another path.
+
+The dispatcher keeps normal SSH host-key verification. On first connection to
+a trusted host, enroll its key interactively with `ssh stat-f01` or pass the
+explicit `--accept-new-host-keys` option; changed keys are still rejected.
+Before dispatching, passwordless authentication must work without a prompt:
+
+```bash
+ssh -o BatchMode=yes stat-f01 true
+```
+
+Configure an SSH key or an SSH config alias if this command fails. A host file
+may use `user@host` when the remote login account differs from the controller.
+When a selected target is the controller's own hostname, the dispatcher runs
+that lane locally and does not require SSH authentication to itself.
+
+The job manifest format is `job_id<TAB>command`. Start by copying or editing
+`scripts/remote_hosts.example.txt` and `scripts/remote_jobs.example.tsv`, then
+run:
+
+```bash
+scripts/dispatch_remote_jobs.sh \
+	--hosts scripts/remote_hosts.example.txt \
+	--jobs scripts/remote_jobs.example.tsv \
+	--preflight-only
+```
+
+`scripts/run_remote_experiments.example.sh` generates six independent jobs for
+the application runners. For example, this sends a small classification slice
+to the first two listed hosts:
+
+```bash
+REMOTE_MAX_HOSTS=2 scripts/run_remote_experiments.example.sh \
+	-- --task classification --dataset-limit 1 --random-states 0
+```
+
+Every dispatched command receives `JOB_ID`, `RUN_ID`, `RUN_DIR`, `JOB_DIR`,
+`HOST_NAME`, and `HOST_WORKERS`. The example uses `HOST_WORKERS` for each
+runner's local `--workers` value; its existing process pool then runs
+single-threaded model workers. Do not include a competing `--workers` argument
+when using that example launcher.
+
+Jobs must not concurrently write the same output path. The six current
+application runners use distinct result directories and are safe to fan out;
+splitting a single application runner across hosts needs shard-specific raw
+outputs followed by one explicit merge and compilation step. `run_all.py` is
+not the fan-out entry point because it waits for each top-level runner before
+starting the next.
+
+### Minimal `run_all.py` Example
+
+Send `run_all.py` directly by repeating `--command`; a TSV manifest is not
+required. Classification and regression write separate application-result
+paths, while `--run-label "$JOB_ID"` keeps `run_all.py`'s own runtime CSV and
+child logs separate. With two passwordless hosts configured, run:
+
+```bash
+scripts/dispatch_remote_jobs.sh \
+	--hosts stat-f01,stat-f02 \
+	--max-hosts 2 \
+	--command 'python experiments/run_all.py --task classification --workers "$HOST_WORKERS" --run-label "$JOB_ID"' \
+	--command 'python experiments/run_all.py --task regression --workers "$HOST_WORKERS" --run-label "$JOB_ID"'
+```
+
+To smoke-test first, append `--dataset-limit 1 --random-states 0` inside each
+command. Do not dispatch two `run_all.py` jobs for the same task kind until the
+individual experiment runners gain shard-specific raw outputs and an explicit
+merge step.

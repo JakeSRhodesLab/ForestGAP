@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import shutil
 from pathlib import Path
 import subprocess
@@ -119,13 +120,24 @@ def main() -> None:
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--run-label",
+        default=None,
+        help="Append a label to launcher-only logs and runtime output names.",
+    )
     args = parser.parse_args()
+    if args.run_label is not None and re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]*",
+        args.run_label,
+    ) is None:
+        parser.error("--run-label must contain only letters, digits, dots, underscores, and hyphens")
 
     root = Path(__file__).resolve().parent
     results_dir = root.parent / "results"
     raw_dir = results_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    log_dir = raw_dir / "run_all_logs"
+    output_suffix = f"_{args.run_label}" if args.run_label else ""
+    log_dir = raw_dir / f"run_all_logs{output_suffix}"
     log_dir.mkdir(parents=True, exist_ok=True)
     process_rows: list[dict[str, str]] = []
     had_failure = False
@@ -134,7 +146,7 @@ def main() -> None:
     total_workers = args.workers or _available_threads()
     child_worker_count = max(1, total_workers)
     python_command = _python_command()
-    raw_path = raw_dir / "run_all_process_runtimes.csv"
+    raw_path = raw_dir / f"run_all_process_runtimes{output_suffix}.csv"
     running: dict[str, dict[str, object]] = {}
     terminal_lock = threading.Lock()
     common_args = [

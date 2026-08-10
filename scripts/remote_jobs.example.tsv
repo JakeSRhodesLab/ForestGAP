@@ -1,0 +1,4 @@
+# Each non-comment line is job_id<TAB>trusted shell command.
+# Commands run from the shared repository root inside its local uv environment.
+python-version	python --version
+forestgap-import	python -c 'import forestgap; print(forestgap.__file__)'
