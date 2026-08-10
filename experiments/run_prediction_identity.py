@@ -46,6 +46,7 @@ from experiments.common import (
     aggregate_success_rows,
     build_proximity_model,
     compiled_output_dir,
+    proximity_methods_for_model,
     requested_model_names,
     prepare_dataset,
     raw_output_path,
@@ -279,6 +280,27 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 task_id=task_id,
                                 random_state=random_state,
                                 reason=f"{model_name} is not available for {task_kind}.",
+                                extra_fields={
+                                    "suite_name": suite_name,
+                                    "prox_method": prox_method,
+                                },
+                            )
+                        )
+                        continue
+                    if prox_method not in proximity_methods_for_model(model_name):
+                        rows.append(
+                            unsupported_model_row(
+                                experiment_name=EXPERIMENT_NAME,
+                                task_kind=task_kind,
+                                model_name=model_name,
+                                dataset_name=dataset_name,
+                                dataset_id=dataset_id,
+                                task_id=task_id,
+                                random_state=random_state,
+                                reason=(
+                                    f"{prox_method} is not a valid prediction-identity "
+                                    f"relation for {model_name}."
+                                ),
                                 extra_fields={
                                     "suite_name": suite_name,
                                     "prox_method": prox_method,

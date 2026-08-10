@@ -13,7 +13,6 @@ if __package__ is None or __package__ == "":
 
 from forestgap import outlier_scores
 from experiments.common import (
-    OUTLIER_PROX_METHODS,
     OUTLIER_SCORE_METHODS,
     add_common_arguments,
     aggregate_success_rows,
@@ -51,17 +50,12 @@ EXPERIMENT_NAME = "outlier_detection"
 NATIVE_PROX_METHOD = "not_applicable"
 NATIVE_LABEL_MODE = "not_applicable"
 NATIVE_SCORE_METHOD = "score_samples"
-# Keep RF-GAP in this runner's bagged-supervised comparison set even if a
-# shared legacy candidate declaration is narrowed for another outlier workflow.
-SUPERVISED_OUTLIER_PROX_METHODS = tuple(dict.fromkeys((*OUTLIER_PROX_METHODS, "rfgap")))
-HONEST_OUTLIER_PROX_METHODS = tuple(
-    dict.fromkeys((*proximity_methods_for_model("HonestForest"), "honest_gap"))
-)
 UNSUPERVISED_OUTLIER_MODELS = {
     "IsolationForest",
     "ExtendedIsolationForest",
     "UnsupervisedRandomForest",
     "UnsupervisedObliqueRandomForest",
+    "SyntheticNullForest",
 }
 
 
@@ -303,11 +297,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             prox_methods = (
                                 ("collision",)
                                 if model_name in {"IsolationForest", "ExtendedIsolationForest"}
-                                else (
-                                    HONEST_OUTLIER_PROX_METHODS
-                                    if model_name == "HonestForest"
-                                    else SUPERVISED_OUTLIER_PROX_METHODS
-                                )
+                                else proximity_methods_for_model(model_name)
                             )
                             for prox_method in prox_methods:
                                 log_progress(

@@ -39,6 +39,8 @@ from scipy.stats import spearmanr
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     ExtraTreesRegressor,
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
     IsolationForest,
     RandomForestClassifier,
     RandomForestRegressor,
@@ -57,8 +59,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from forestgap import (
+    CanonicalCorrelationForestClassifier,
+    CanonicalCorrelationForestRegressor,
     OpenMLTaskFold,
     Proximity,
+    SyntheticNullForest,
     impute,
     iter_openml_task_folds,
     load_openml_dataset,
@@ -74,6 +79,12 @@ ModelKey = Literal[
     "ObliqueRandomForest",
     "PatchObliqueRandomForest",
     "ExtraObliqueRandomForest",
+    "CanonicalCorrelationForest",
+    "CanonicalCorrelationForestBag",
+    "GradientBoosting",
+    "XGBoost",
+    "LightGBM",
+    "CatBoost",
 ]
 OutlierModelFamily = Literal["supervised_forest", "unsupervised_model"]
 OutlierLabelMode = Literal["supervised", "unsupervised", "not_applicable"]
@@ -91,7 +102,13 @@ REQUESTED_MODEL_ORDER: tuple[ModelKey, ...] = (
     "ObliqueRandomForest",
     "PatchObliqueRandomForest",
     "ExtraObliqueRandomForest",
+    "CanonicalCorrelationForest",
+    "CanonicalCorrelationForestBag",
     "ExtraTrees",
+    "GradientBoosting",
+    "XGBoost",
+    "LightGBM",
+    "CatBoost",
 )
 REQUESTED_OUTLIER_MODEL_ORDER: tuple[str, ...] = (
     *REQUESTED_MODEL_ORDER,
@@ -99,14 +116,7 @@ REQUESTED_OUTLIER_MODEL_ORDER: tuple[str, ...] = (
     "ExtendedIsolationForest",
     "UnsupervisedRandomForest",
     "UnsupervisedObliqueRandomForest",
-)
-# Legacy application runners use these declarations only to construct their
-# requested cells.  The capability-aware runners in ``program.py`` remain the
-# authoritative runtime filter.  Keep directed RF-GAP/Honest-GAP out of the
-# anomaly runner: it is neither a predictive-weight application nor a declared
-# geometry symmetrisation study.
-OUTLIER_PROX_METHODS: tuple[str, ...] = (
-    "original", "oob", "rfgap", "kerf", "path", "englund", "random_height",
+    "SyntheticNullForest",
 )
 OUTLIER_SCORE_METHODS: tuple[str, ...] = ("breiman", "ene")
 DEFAULT_MISSINGNESS_MECHANISMS: tuple[str, ...] = ("MCAR", "MAR", "MNAR")
@@ -123,6 +133,16 @@ _BAGGED_PROXIMITY_METHODS: tuple[str, ...] = (
 _HONEST_PROXIMITY_METHODS: tuple[str, ...] = (
     "original", "honest_gap", "kerf", "path", "englund", "random_height",
 )
+_NON_BAGGED_PROXIMITY_METHODS: tuple[str, ...] = (
+    "original", "kerf", "path", "englund", "random_height",
+)
+_BOOSTED_PROXIMITY_METHODS: tuple[str, ...] = (
+    "original", "kerf", "boosted", "path", "englund", "random_height",
+)
+_SYNTHETIC_NULL_PROXIMITY_METHODS: tuple[str, ...] = (
+    "original", "oob", "kerf", "path", "englund", "random_height",
+)
+_BOOSTED_MODEL_NAMES = frozenset({"GradientBoosting", "XGBoost", "LightGBM", "CatBoost"})
 
 
 def proximity_methods_for_model(model_name: str) -> tuple[str, ...]:
@@ -135,6 +155,14 @@ def proximity_methods_for_model(model_name: str) -> tuple[str, ...]:
 
     if model_name == "HonestForest":
         return _HONEST_PROXIMITY_METHODS
+    if model_name == "CanonicalCorrelationForest":
+        return _NON_BAGGED_PROXIMITY_METHODS
+    if model_name in _BOOSTED_MODEL_NAMES:
+        return _BOOSTED_PROXIMITY_METHODS
+    if model_name == "SyntheticNullForest":
+        return _SYNTHETIC_NULL_PROXIMITY_METHODS
+    if model_name in {"IsolationForest", "ExtendedIsolationForest"}:
+        return ("collision",)
     return _BAGGED_PROXIMITY_METHODS
 
 
@@ -143,6 +171,7 @@ class ModelSpec:
     key: ModelKey
     estimator_cls: type[Any]
     task_kind: TaskKind
+    fixed_kwargs: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -156,6 +185,7 @@ class OutlierModelSpec:
     supports_native_scores: bool
     native_score_method: Optional[str] = None
     native_scores_share_fit_across_prox_methods: bool = False
+    fixed_kwargs: tuple[tuple[str, Any], ...] = ()
 
 
 def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
@@ -180,6 +210,40 @@ def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
             estimator_cls=ExtraTreesRegressor,
             task_kind="regression",
         ),
+        ("classification", "CanonicalCorrelationForest"): ModelSpec(
+            key="CanonicalCorrelationForest",
+            estimator_cls=CanonicalCorrelationForestClassifier,
+            task_kind="classification",
+            fixed_kwargs=(("bootstrap", False), ("oob_score", False)),
+        ),
+        ("regression", "CanonicalCorrelationForest"): ModelSpec(
+            key="CanonicalCorrelationForest",
+            estimator_cls=CanonicalCorrelationForestRegressor,
+            task_kind="regression",
+            fixed_kwargs=(("bootstrap", False), ("oob_score", False)),
+        ),
+        ("classification", "CanonicalCorrelationForestBag"): ModelSpec(
+            key="CanonicalCorrelationForestBag",
+            estimator_cls=CanonicalCorrelationForestClassifier,
+            task_kind="classification",
+            fixed_kwargs=(("bootstrap", True),),
+        ),
+        ("regression", "CanonicalCorrelationForestBag"): ModelSpec(
+            key="CanonicalCorrelationForestBag",
+            estimator_cls=CanonicalCorrelationForestRegressor,
+            task_kind="regression",
+            fixed_kwargs=(("bootstrap", True),),
+        ),
+        ("classification", "GradientBoosting"): ModelSpec(
+            key="GradientBoosting",
+            estimator_cls=GradientBoostingClassifier,
+            task_kind="classification",
+        ),
+        ("regression", "GradientBoosting"): ModelSpec(
+            key="GradientBoosting",
+            estimator_cls=GradientBoostingRegressor,
+            task_kind="regression",
+        ),
     }
 
     def register_optional(
@@ -187,6 +251,8 @@ def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
         key: ModelKey,
         module_name: str,
         class_name: str,
+        *,
+        fixed_kwargs: tuple[tuple[str, Any], ...] = (),
     ) -> None:
         try:
             module = __import__(module_name, fromlist=[class_name])
@@ -197,6 +263,7 @@ def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
             key=key,
             estimator_cls=estimator_cls,
             task_kind=task_kind,
+            fixed_kwargs=fixed_kwargs,
         )
 
     register_optional(
@@ -253,6 +320,36 @@ def _build_model_registry() -> dict[tuple[TaskKind, ModelKey], ModelSpec]:
         "treeple",
         "ExtraObliqueRandomForestRegressor",
     )
+    register_optional(
+        "classification", "XGBoost", "xgboost", "XGBClassifier",
+        fixed_kwargs=(("n_jobs", 1),),
+    )
+    register_optional(
+        "regression", "XGBoost", "xgboost", "XGBRegressor",
+        fixed_kwargs=(("n_jobs", 1),),
+    )
+    register_optional(
+        "classification", "LightGBM", "lightgbm", "LGBMClassifier",
+        fixed_kwargs=(("n_jobs", 1), ("verbosity", -1)),
+    )
+    register_optional(
+        "regression", "LightGBM", "lightgbm", "LGBMRegressor",
+        fixed_kwargs=(("n_jobs", 1), ("verbosity", -1)),
+    )
+    catboost_kwargs: tuple[tuple[str, Any], ...] = (
+        ("allow_writing_files", False),
+        ("verbose", False),
+        ("grow_policy", "SymmetricTree"),
+        ("thread_count", 1),
+    )
+    register_optional(
+        "classification", "CatBoost", "catboost", "CatBoostClassifier",
+        fixed_kwargs=catboost_kwargs,
+    )
+    register_optional(
+        "regression", "CatBoost", "catboost", "CatBoostRegressor",
+        fixed_kwargs=catboost_kwargs,
+    )
 
     return registry
 
@@ -277,11 +374,23 @@ def _build_outlier_model_registry() -> dict[tuple[TaskKind, str], OutlierModelSp
                 fit_mode="fit_xy",
                 supports_label_aware_scores=(typed_task_kind == "classification"),
                 supports_native_scores=False,
+                fixed_kwargs=spec.fixed_kwargs,
             )
 
         registry[(typed_task_kind, "IsolationForest")] = OutlierModelSpec(
             key="IsolationForest",
             estimator_cls=IsolationForest,
+            task_kind=typed_task_kind,
+            model_family="unsupervised_model",
+            fit_mode="fit_x",
+            supports_label_aware_scores=False,
+            supports_native_scores=True,
+            native_score_method="score_samples",
+            native_scores_share_fit_across_prox_methods=True,
+        )
+        registry[(typed_task_kind, "SyntheticNullForest")] = OutlierModelSpec(
+            key="SyntheticNullForest",
+            estimator_cls=SyntheticNullForest,
             task_kind=typed_task_kind,
             model_family="unsupervised_model",
             fit_mode="fit_x",
@@ -1357,6 +1466,7 @@ def build_proximity_model(
                 proximity_kwargs[key] = value
             else:
                 kwargs[key] = value
+    kwargs.update(dict(spec.fixed_kwargs))
     estimator = base_cls(**kwargs)
     return Proximity(
         estimator,
@@ -1390,7 +1500,16 @@ def build_outlier_model(
     if "n_jobs" in signature.parameters:
         kwargs["n_jobs"] = int(os.environ.get("FORESTGAP_N_JOBS", "1"))
 
-    if spec.model_family == "supervised_forest":
+    if model_name == "SyntheticNullForest":
+        forest = RandomForestClassifier(
+            n_estimators=n_estimators,
+            bootstrap=True,
+            oob_score=False,
+            random_state=random_state,
+            n_jobs=int(os.environ.get("FORESTGAP_N_JOBS", "1")),
+        )
+        kwargs = {"estimator": forest, "random_state": random_state}
+    elif spec.model_family == "supervised_forest":
         if "bootstrap" in signature.parameters:
             kwargs["bootstrap"] = True
         if "oob_score" in signature.parameters:
@@ -1406,10 +1525,13 @@ def build_outlier_model(
 
     if extra_kwargs:
         kwargs.update(extra_kwargs)
+    kwargs.update(dict(spec.fixed_kwargs))
 
     fit_metadata = {
         "fit_mode": spec.fit_mode,
-        "fit_bootstrap": bool(kwargs.get("bootstrap", False)),
+        "fit_bootstrap": bool(
+            model_name == "SyntheticNullForest" or kwargs.get("bootstrap", False)
+        ),
         "native_score_shared_across_prox_methods": (
             spec.supports_native_scores and spec.native_scores_share_fit_across_prox_methods
         ),
