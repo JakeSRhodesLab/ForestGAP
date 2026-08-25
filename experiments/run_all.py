@@ -14,12 +14,12 @@ from typing import Any, TextIO
 
 
 SCRIPTS = [
-    # "run_prediction_identity.py",
-    # "run_imputation.py",
-    # "run_outlier_detection.py",
+    "run_prediction_identity.py",
+    "run_imputation.py",
+    "run_outlier_detection.py",
     "run_prototypes.py",
-    # "run_local_feature_importance.py",
-    # "run_mds_visualization.py",
+    "run_local_feature_importance.py",
+    "run_mds_visualization.py"
 ]
 
 THREAD_ENV_VARS = (
