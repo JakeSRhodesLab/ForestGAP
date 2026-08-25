@@ -775,6 +775,9 @@ def _comparison_label(df: pd.DataFrame, include_downstream: bool) -> pd.Series:
 
 
 def compile_outputs(df: pd.DataFrame) -> None:
+    if df.empty or "task_kind" not in df.columns:
+        return
+
     for task_kind in sorted(df["task_kind"].dropna().unique()):
         task_df = df[df["task_kind"] == task_kind].copy()
         save_dataframe(task_df, raw_output_path(EXPERIMENT_NAME, task_kind))

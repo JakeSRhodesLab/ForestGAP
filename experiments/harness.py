@@ -56,8 +56,9 @@ class ExperimentCell:
     artifact_hashes: Mapping[str, str] | None = None
     capability_snapshot: Mapping[str, Any] | None = None
     protocol_version: str = "forestgap-experiment-program/1.1"
-    declared_status: Literal["unsupported", "excluded"] | None = None
+    declared_status: Literal["unsupported", "excluded", "error"] | None = None
     declared_reason: str | None = None
+    declared_error_type: str | None = None
 
 
 def _array_digest(value: Any) -> bytes:
@@ -314,6 +315,7 @@ def run_cells(cells: Iterable[ExperimentCell]) -> list[dict[str, Any]]:
                 relation_diagnostics=None,
                 fit_reused=False,
                 reason=cell.declared_reason or "cell excluded by the declared study policy",
+                error_type=cell.declared_error_type,
             ))
             log_progress(
                 f"[{index}/{total_cells}] finished cell {cell_label} "

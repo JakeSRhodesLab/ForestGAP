@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.datasets import make_classification
 
 from experiments.common import (
+    _parallel_resource_key,
     available_model_names,
     build_outlier_model,
     build_proximity_model,
@@ -172,3 +173,27 @@ def test_parallel_result_order_is_deterministic():
     ordered = stable_result_order(frame)
 
     assert ordered["value"].tolist() == [1, 2]
+
+
+def test_parallel_resource_keys_serialize_models_and_seeds_per_dataset():
+    first = _parallel_resource_key(
+        "openml", ("classification", 6, 0, "RandomForest"),
+    )
+    same_dataset = _parallel_resource_key(
+        "openml", ("classification", 6, 2, "ExtraObliqueRandomForest"),
+    )
+    other_dataset = _parallel_resource_key(
+        "openml", ("classification", 3, 0, "RandomForest"),
+    )
+
+    assert first == same_dataset
+    assert first != other_dataset
+
+    synthetic_first = _parallel_resource_key(
+        "extra",
+        ("classification", 0, "synthetic_case", "RandomForest"),
+    )
+    synthetic_other_model = _parallel_resource_key(
+        "extra",
+        ("classification", 0, "synthetic_case", "ExtraTrees"),
+    )

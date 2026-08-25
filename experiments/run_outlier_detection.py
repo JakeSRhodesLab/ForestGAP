@@ -587,6 +587,9 @@ def save_metric_plot(df: pd.DataFrame, *, metric: str, title: str, path: Path) -
 
 
 def compile_outputs(df: pd.DataFrame) -> None:
+    if df.empty or "task_kind" not in df.columns:
+        return
+
     metric_cols = (
         "roc_auc",
         "average_precision",

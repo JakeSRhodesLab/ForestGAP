@@ -40,6 +40,7 @@ from experiments.common import (
     rough_fill_train_test,
     requested_tasks,
     log_progress,
+    suite_metadata,
 )
 from experiments.harness import ExperimentCell, run_cells
 from experiments.program import capability_aware_cells, default_trial_manifests
@@ -118,6 +119,48 @@ def _prediction_metrics(proximity: Any, cell: ExperimentCell) -> dict[str, float
     }
 
 
+def _preparation_error_cell(
+    *,
+    task_kind: str,
+    official_fold: Any,
+    model_name: str,
+    seed: int,
+    n_estimators: int,
+    error: Exception,
+) -> ExperimentCell:
+    """Represent an official-fold preparation failure without dropping the cell."""
+
+    task_id = int(getattr(official_fold, "task_id", -1))
+    fold_id = str(getattr(official_fold, "fold_id", "unavailable"))
+    suite_id, _ = suite_metadata(task_kind)  # type: ignore[arg-type]
+    return ExperimentCell(
+        estimator=model_name,
+        relation="setup",
+        application="prediction",
+        data_regime="openml_official_fold",
+        estimator_factory=lambda: None,
+        application_fn=lambda _proximity, _cell: {},
+        X_train=np.empty((0, 0), dtype=float),
+        y_train=np.empty(0, dtype=float),
+        seed=seed,
+        split_id=f"suite-{suite_id}:task-{task_id}:{fold_id}",
+        suite_id=suite_id,
+        task_id=task_id,
+        fold_id=fold_id,
+        repeat=getattr(official_fold, "repeat", None),
+        fold=getattr(official_fold, "fold", None),
+        sample=getattr(official_fold, "sample", None),
+        configuration={
+            "task_kind": task_kind,
+            "n_estimators": n_estimators,
+            "stage": "dataset_preparation",
+        },
+        declared_status="error",
+        declared_reason=f"{type(error).__name__}: {error}",
+        declared_error_type=type(error).__name__,
+    )
+
+
 def build_cells(
     *,
     task_kinds: Iterable[str],
@@ -132,6 +175,7 @@ def build_cells(
 
     cells: list[ExperimentCell] = []
     model_names = tuple(models)
+    seed_values = tuple(seeds)
     requested_relations = None if relations is None else tuple(relations)
     for task_kind in task_kinds:
         log_progress(f"[protocol_matrix] task_kind={task_kind}")
@@ -143,21 +187,40 @@ def build_cells(
                 f"[protocol_matrix] task_kind={task_kind} task_id={official_fold.task_id} "
                 f"fold_id={official_fold.fold_id}"
             )
-            prepared = prepare_dataset(
-                task_kind,  # type: ignore[arg-type]
-                task_id=official_fold.task_id,
-                task=None,
-                random_state=0,
-                max_rows=None,
-                test_size=0.3,
-                official_fold=official_fold,
-            )
-            prepared.X_train, prepared.X_test = rough_fill_train_test(
-                prepared.X_train,
-                prepared.X_test,
-                prepared.categorical_indices,
-            )
-            for seed in seeds:
+            try:
+                prepared = prepare_dataset(
+                    task_kind,  # type: ignore[arg-type]
+                    task_id=official_fold.task_id,
+                    task=None,
+                    random_state=0,
+                    max_rows=None,
+                    test_size=0.3,
+                    official_fold=official_fold,
+                )
+                prepared.X_train, prepared.X_test = rough_fill_train_test(
+                    prepared.X_train,
+                    prepared.X_test,
+                    prepared.categorical_indices,
+                )
+            except Exception as exc:
+                log_progress(
+                    f"[protocol_matrix] preparation failed for task_id={official_fold.task_id} "
+                    f"fold_id={official_fold.fold_id}: {type(exc).__name__}: {exc}"
+                )
+                cells.extend(
+                    _preparation_error_cell(
+                        task_kind=task_kind,
+                        official_fold=official_fold,
+                        model_name=model_name,
+                        seed=seed,
+                        n_estimators=n_estimators,
+                        error=exc,
+                    )
+                    for seed in seed_values
+                    for model_name in model_names
+                )
+                continue
+            for seed in seed_values:
                 for model_name in model_names:
                     log_progress(
                         f"[protocol_matrix] task_kind={task_kind} task_id={prepared.task_id} "

@@ -1263,7 +1263,10 @@ def run_module_parallel(
     Each work item owns one dataset/seed/model parent-fit group. Worker
     processes force estimator, OpenMP, and BLAS thread counts to one. Results
     are returned to the parent, combined, and sorted deterministically before
-    any aggregate CSV is written.
+    any aggregate CSV is written. If the operating system terminates a worker
+    (for example, under memory pressure), unfinished groups are requeued and
+    the pool is retried with fewer workers. This preserves the completed
+    checkpoint bundles instead of abandoning an entire long-running study.
     """
 
     workers = resolve_worker_count(getattr(args, "workers", 0))
@@ -1328,25 +1331,39 @@ def run_module_parallel(
         f"group per dataset is active"
     )
 
-    if worker_count == 1:
-        results = [
-            _run_module_work_item(module_name, runner_name, values)
-            for queue in work_queues.values()
-            for values in queue
-        ]
-    else:
-        ready_keys = deque(work_queues)
-        in_flight: dict[Any, tuple[Any, ...]] = {}
-        results = []
-        failures: list[BaseException] = []
-        completed_count = 0
-        pool_failure: Optional[BrokenProcessPool] = None
+    ready_keys = deque(work_queues)
+    results: list[Any] = []
+    failures: list[BaseException] = []
+    completed_count = 0
+    active_worker_count = worker_count
+
+    while ready_keys:
+        if active_worker_count == 1:
+            while ready_keys:
+                resource_key = ready_keys.popleft()
+                values = work_queues[resource_key].popleft()
+                try:
+                    results.append(_run_module_work_item(
+                        module_name,
+                        runner_name,
+                        values,
+                    ))
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    completed_count += 1
+                if work_queues[resource_key]:
+                    ready_keys.append(resource_key)
+            break
+
+        in_flight: dict[Any, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+        pool_failure: BrokenProcessPool | None = None
         process_refs: list[Any] = []
-        executor = ProcessPoolExecutor(max_workers=worker_count)
+        executor = ProcessPoolExecutor(max_workers=active_worker_count)
 
         def submit_ready() -> None:
             nonlocal pool_failure
-            while ready_keys and len(in_flight) < worker_count:
+            while ready_keys and len(in_flight) < active_worker_count:
                 resource_key = ready_keys.popleft()
                 values = work_queues[resource_key].popleft()
                 try:
@@ -1361,17 +1378,19 @@ def run_module_parallel(
                     ready_keys.appendleft(resource_key)
                     pool_failure = exc
                     return
-                in_flight[future] = resource_key
+                in_flight[future] = (resource_key, values)
 
         try:
             submit_ready()
             while in_flight and pool_failure is None:
                 done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
                 for future in done:
-                    resource_key = in_flight.pop(future)
+                    resource_key, values = in_flight.pop(future)
                     try:
                         results.append(future.result())
                     except BrokenProcessPool as exc:
+                        work_queues[resource_key].appendleft(values)
+                        ready_keys.appendleft(resource_key)
                         pool_failure = exc
                         break
                     except BaseException as exc:
@@ -1379,11 +1398,10 @@ def run_module_parallel(
                         completed_count += 1
                     else:
                         completed_count += 1
-                    if work_queues[resource_key]:
+                    if pool_failure is None and work_queues[resource_key]:
                         ready_keys.append(resource_key)
-                if pool_failure is not None:
-                    break
-                submit_ready()
+                if pool_failure is None:
+                    submit_ready()
         finally:
             processes = getattr(executor, "_processes", None)
             if processes:
@@ -1393,37 +1411,40 @@ def run_module_parallel(
                 cancel_futures=pool_failure is not None,
             )
 
-        if pool_failure is not None:
-            lost_count = len(work_items) - completed_count
-            abnormal = [
-                process for process in process_refs
-                if getattr(process, "exitcode", 0) not in (None, 0)
-            ]
-            exit_summary = ", ".join(
-                _format_process_exit(process) for process in abnormal[:8]
-            )
-            exit_detail = (
-                f" Worker exits: {exit_summary}."
-                if exit_summary
-                else " No nonzero worker exit code was available."
-            )
-            raise RuntimeError(
-                f"Process pool with {worker_count} OS worker processes broke "
-                f"after {completed_count}/{len(work_items)} work items returned; "
-                f"{lost_count} running or queued work items were lost. "
-                "The lost-item count is not a worker-process count."
-                f"{exit_detail}"
-            ) from pool_failure
+        if pool_failure is None:
+            continue
 
-        if failures:
-            summary = "; ".join(
-                f"{type(exc).__name__}: {exc}" for exc in failures[:3]
-            )
-            raise RuntimeError(
-                f"{len(failures)} experiment work item(s) failed in a pool of "
-                f"{worker_count} OS worker processes after all remaining work "
-                f"was drained: {summary}"
-            ) from failures[0]
+        scheduled_keys = set(ready_keys)
+        for resource_key, values in in_flight.values():
+            work_queues[resource_key].appendleft(values)
+            if resource_key not in scheduled_keys:
+                ready_keys.appendleft(resource_key)
+                scheduled_keys.add(resource_key)
+
+        abnormal = [
+            process for process in process_refs
+            if getattr(process, "exitcode", 0) not in (None, 0)
+        ]
+        exit_summary = ", ".join(
+            _format_process_exit(process) for process in abnormal[:4]
+        )
+        next_worker_count = max(1, active_worker_count // 2)
+        exit_detail = f" Worker exits: {exit_summary}." if exit_summary else ""
+        log_progress(
+            f"[parallel] worker pool failed after {completed_count}/{len(work_items)} "
+            f"groups; retrying {len(ready_keys)} unfinished resource groups with "
+            f"{next_worker_count} worker(s).{exit_detail}"
+        )
+        active_worker_count = next_worker_count
+
+    if failures:
+        summary = "; ".join(
+            f"{type(exc).__name__}: {exc}" for exc in failures[:3]
+        )
+        raise RuntimeError(
+            f"{len(failures)} experiment work item(s) failed after all remaining "
+            f"work was drained: {summary}"
+        ) from failures[0]
     return _combine_parallel_results(results)
 
 
