@@ -44,17 +44,21 @@ from experiments.common import (
     add_common_arguments,
     available_model_names,
     aggregate_success_rows,
+    build_checkpoint_manifest,
     build_proximity_model,
+    checkpoint_store,
     compiled_output_dir,
     proximity_methods_for_model,
     requested_model_names,
     prepare_dataset,
+    prepared_dataset_hash,
     raw_output_path,
     record_exception,
     run_module_parallel,
     save_dataframe,
     requested_tasks,
     save_plot_dataframe,
+    seed_checkpoint_unit,
     selected_model_names,
     selected_task_ids,
     setup_selected,
@@ -64,6 +68,7 @@ from experiments.common import (
     rough_fill_train_test,
     log_progress,
     unsupported_model_row,
+    unavailable_data_hash,
 )
 
 
@@ -109,6 +114,48 @@ RAW_COLUMN_ORDER = (
     "error_message",
     "traceback",
 )
+
+
+def _checkpoint_unit(
+    *,
+    task_kind: str,
+    task_id: int,
+    dataset_id: int,
+    random_state: int,
+    model_name: str,
+    prox_method: str,
+) -> dict[str, Any]:
+    return {
+        "task_kind": task_kind,
+        "task_id": int(task_id),
+        "dataset_id": int(dataset_id),
+        "random_state": int(random_state),
+        "model_name": model_name,
+        "prox_method": prox_method,
+    }
+
+
+def _checkpoint_config(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "max_rows": getattr(args, "max_rows", None),
+        "test_size": getattr(args, "test_size", 0.3),
+        "n_estimators": getattr(args, "n_estimators", 128),
+        "bootstrap": True,
+        "oob_score": True,
+    }
+
+
+def _cached_rows(store: Any, manifest: Any, args: argparse.Namespace) -> list[dict[str, Any]] | None:
+    if not getattr(args, "resume", True):
+        return None
+    cached = store.load(manifest)
+    if cached is None or not cached.summary_rows:
+        return None
+    return cached.summary_rows
+
+
+def _save_row(store: Any, manifest: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    return store.save(manifest, [row]).summary_rows
 
 
 def _ordered_raw_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -245,6 +292,11 @@ def _regression_identity_metrics(
 
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    store = checkpoint_store(
+        EXPERIMENT_NAME,
+        root=getattr(args, "_checkpoint_root", None),
+    )
+    scientific_config = _checkpoint_config(args)
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
@@ -269,46 +321,59 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         f"[{EXPERIMENT_NAME}] dataset={dataset_name} "
                         f"model={model_name} prox_method={prox_method}"
                     )
+                    unit = _checkpoint_unit(
+                        task_kind=task_kind,
+                        task_id=task_id,
+                        dataset_id=dataset_id,
+                        random_state=random_state,
+                        model_name=model_name,
+                        prox_method=prox_method,
+                    )
+
+                    unsupported_reason: str | None = None
                     if model_name not in available_model_names(task_kind):
-                        rows.append(
-                            unsupported_model_row(
-                                experiment_name=EXPERIMENT_NAME,
-                                task_kind=task_kind,
-                                model_name=model_name,
-                                dataset_name=dataset_name,
-                                dataset_id=dataset_id,
-                                task_id=task_id,
-                                random_state=random_state,
-                                reason=f"{model_name} is not available for {task_kind}.",
-                                extra_fields={
-                                    "suite_name": suite_name,
-                                    "prox_method": prox_method,
-                                },
-                            )
+                        unsupported_reason = f"{model_name} is not available for {task_kind}."
+                    elif prox_method not in proximity_methods_for_model(model_name):
+                        unsupported_reason = (
+                            f"{prox_method} is not a valid prediction-identity "
+                            f"relation for {model_name}."
                         )
-                        continue
-                    if prox_method not in proximity_methods_for_model(model_name):
-                        rows.append(
-                            unsupported_model_row(
-                                experiment_name=EXPERIMENT_NAME,
+
+                    if unsupported_reason is not None:
+                        manifest = build_checkpoint_manifest(
+                            experiment=EXPERIMENT_NAME,
+                            runner_file=__file__,
+                            unit=unit,
+                            scientific_config=scientific_config,
+                            data_hash=unavailable_data_hash(
                                 task_kind=task_kind,
-                                model_name=model_name,
-                                dataset_name=dataset_name,
-                                dataset_id=dataset_id,
                                 task_id=task_id,
-                                random_state=random_state,
-                                reason=(
-                                    f"{prox_method} is not a valid prediction-identity "
-                                    f"relation for {model_name}."
-                                ),
-                                extra_fields={
-                                    "suite_name": suite_name,
-                                    "prox_method": prox_method,
-                                },
-                            )
+                                dataset_id=dataset_id,
+                            ),
                         )
+                        cached_rows = _cached_rows(store, manifest, args)
+                        if cached_rows is not None:
+                            rows.extend(cached_rows)
+                            continue
+                        seed_checkpoint_unit(manifest)
+                        unsupported_row = unsupported_model_row(
+                            experiment_name=EXPERIMENT_NAME,
+                            task_kind=task_kind,
+                            model_name=model_name,
+                            dataset_name=dataset_name,
+                            dataset_id=dataset_id,
+                            task_id=task_id,
+                            random_state=random_state,
+                            reason=unsupported_reason,
+                            extra_fields={
+                                "suite_name": suite_name,
+                                "prox_method": prox_method,
+                            },
+                        )
+                        rows.extend(_save_row(store, manifest, unsupported_row))
                         continue
                     prepared: Any = None
+                    manifest: Any = None
                     try:
                         prepared = prepare_dataset(
                             task_kind,
@@ -318,6 +383,18 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             max_rows=args.max_rows,
                             test_size=args.test_size,
                         )
+                        manifest = build_checkpoint_manifest(
+                            experiment=EXPERIMENT_NAME,
+                            runner_file=__file__,
+                            unit=unit,
+                            scientific_config=scientific_config,
+                            data_hash=prepared_dataset_hash(prepared),
+                        )
+                        cached_rows = _cached_rows(store, manifest, args)
+                        if cached_rows is not None:
+                            rows.extend(cached_rows)
+                            continue
+                        seed_checkpoint_unit(manifest)
                         X_train_filled, X_test_filled = rough_fill_train_test(
                             prepared.X_train,
                             prepared.X_test,
@@ -364,31 +441,33 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 prox_oob_runtime_seconds=prox_oob_runtime_seconds,
                             )
                             if forest_oob_raw is None:
-                                rows.append(
-                                    unsupported_model_row(
-                                        experiment_name=EXPERIMENT_NAME,
-                                        task_kind=task_kind,
-                                        model_name=model_name,
-                                        dataset_name=prepared.dataset_name,
-                                        dataset_id=prepared.dataset_id,
-                                        task_id=prepared.task_id,
-                                        random_state=random_state,
-                                        reason="Missing oob_decision_function_ after fitting with oob_score=True.",
-                                        extra_fields={
-                                            **_prepared_fields(prepared, prox_method),
-                                            "test_mean_abs_diff": test_metrics["mean_abs_diff"],
-                                            "test_max_abs_diff": test_metrics["max_abs_diff"],
-                                            "oob_valid_count": 0,
-                                            "oob_total_count": int(prepared.train_size),
-                                            "oob_valid_fraction": 0.0,
-                                            "oob_missing_count": int(prepared.train_size),
-                                            "oob_missing_fraction": 1.0,
-                                            "oob_comparison_status": "missing_native_oob",
-                                            **task_metrics,
-                                            **runtime_fields,
-                                        },
-                                    )
+                                unsupported_row = unsupported_model_row(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    model_name=model_name,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    random_state=random_state,
+                                    reason=(
+                                        "Missing oob_decision_function_ after fitting "
+                                        "with oob_score=True."
+                                    ),
+                                    extra_fields={
+                                        **_prepared_fields(prepared, prox_method),
+                                        "test_mean_abs_diff": test_metrics["mean_abs_diff"],
+                                        "test_max_abs_diff": test_metrics["max_abs_diff"],
+                                        "oob_valid_count": 0,
+                                        "oob_total_count": int(prepared.train_size),
+                                        "oob_valid_fraction": 0.0,
+                                        "oob_missing_count": int(prepared.train_size),
+                                        "oob_missing_fraction": 1.0,
+                                        "oob_comparison_status": "missing_native_oob",
+                                        **task_metrics,
+                                        **runtime_fields,
+                                    },
                                 )
+                                rows.extend(_save_row(store, manifest, unsupported_row))
                                 continue
                             forest_oob = np.asarray(forest_oob_raw, dtype=np.float64)
                             oob_valid_mask = _classification_oob_valid_mask(
@@ -400,34 +479,33 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             oob_missing_count = int(prepared.train_size - oob_valid_count)
                             oob_missing_fraction = float(oob_missing_count / max(1, prepared.train_size))
                             if oob_valid_count == 0:
-                                rows.append(
-                                    unsupported_model_row(
-                                        experiment_name=EXPERIMENT_NAME,
-                                        task_kind=task_kind,
-                                        model_name=model_name,
-                                        dataset_name=prepared.dataset_name,
-                                        dataset_id=prepared.dataset_id,
-                                        task_id=prepared.task_id,
-                                        random_state=random_state,
-                                        reason=(
-                                            "No supported finite overlap between prox_predict() "
-                                            "and oob_decision_function_."
-                                        ),
-                                        extra_fields={
-                                            **_prepared_fields(prepared, prox_method),
-                                            "test_mean_abs_diff": test_metrics["mean_abs_diff"],
-                                            "test_max_abs_diff": test_metrics["max_abs_diff"],
-                                            "oob_valid_count": 0,
-                                            "oob_total_count": int(prepared.train_size),
-                                            "oob_valid_fraction": 0.0,
-                                            "oob_missing_count": int(prepared.train_size),
-                                            "oob_missing_fraction": 1.0,
-                                            "oob_comparison_status": "no_valid_oob_rows",
-                                            **task_metrics,
-                                            **runtime_fields,
-                                        },
-                                    )
+                                unsupported_row = unsupported_model_row(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    model_name=model_name,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    random_state=random_state,
+                                    reason=(
+                                        "No supported finite overlap between prox_predict() "
+                                        "and oob_decision_function_."
+                                    ),
+                                    extra_fields={
+                                        **_prepared_fields(prepared, prox_method),
+                                        "test_mean_abs_diff": test_metrics["mean_abs_diff"],
+                                        "test_max_abs_diff": test_metrics["max_abs_diff"],
+                                        "oob_valid_count": 0,
+                                        "oob_total_count": int(prepared.train_size),
+                                        "oob_valid_fraction": 0.0,
+                                        "oob_missing_count": int(prepared.train_size),
+                                        "oob_missing_fraction": 1.0,
+                                        "oob_comparison_status": "no_valid_oob_rows",
+                                        **task_metrics,
+                                        **runtime_fields,
+                                    },
                                 )
+                                rows.extend(_save_row(store, manifest, unsupported_row))
                                 continue
                             oob_metrics = _classification_identity_metrics(
                                 prox_oob[oob_valid_mask],
@@ -468,31 +546,33 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 prox_oob_runtime_seconds=prox_oob_runtime_seconds,
                             )
                             if forest_oob_raw is None:
-                                rows.append(
-                                    unsupported_model_row(
-                                        experiment_name=EXPERIMENT_NAME,
-                                        task_kind=task_kind,
-                                        model_name=model_name,
-                                        dataset_name=prepared.dataset_name,
-                                        dataset_id=prepared.dataset_id,
-                                        task_id=prepared.task_id,
-                                        random_state=random_state,
-                                        reason="Missing oob_prediction_ after fitting with oob_score=True.",
-                                        extra_fields={
-                                            **_prepared_fields(prepared, prox_method),
-                                            "test_mean_abs_diff": test_metrics["mean_abs_diff"],
-                                            "test_max_abs_diff": test_metrics["max_abs_diff"],
-                                            "oob_valid_count": 0,
-                                            "oob_total_count": int(prepared.train_size),
-                                            "oob_valid_fraction": 0.0,
-                                            "oob_missing_count": int(prepared.train_size),
-                                            "oob_missing_fraction": 1.0,
-                                            "oob_comparison_status": "missing_native_oob",
-                                            **task_metrics,
-                                            **runtime_fields,
-                                        },
-                                    )
+                                unsupported_row = unsupported_model_row(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    model_name=model_name,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    random_state=random_state,
+                                    reason=(
+                                        "Missing oob_prediction_ after fitting with "
+                                        "oob_score=True."
+                                    ),
+                                    extra_fields={
+                                        **_prepared_fields(prepared, prox_method),
+                                        "test_mean_abs_diff": test_metrics["mean_abs_diff"],
+                                        "test_max_abs_diff": test_metrics["max_abs_diff"],
+                                        "oob_valid_count": 0,
+                                        "oob_total_count": int(prepared.train_size),
+                                        "oob_valid_fraction": 0.0,
+                                        "oob_missing_count": int(prepared.train_size),
+                                        "oob_missing_fraction": 1.0,
+                                        "oob_comparison_status": "missing_native_oob",
+                                        **task_metrics,
+                                        **runtime_fields,
+                                    },
                                 )
+                                rows.extend(_save_row(store, manifest, unsupported_row))
                                 continue
                             forest_oob = np.asarray(forest_oob_raw, dtype=np.float64).ravel()
                             oob_valid_mask = _regression_oob_valid_mask(
@@ -504,34 +584,33 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             oob_missing_count = int(prepared.train_size - oob_valid_count)
                             oob_missing_fraction = float(oob_missing_count / max(1, prepared.train_size))
                             if oob_valid_count == 0:
-                                rows.append(
-                                    unsupported_model_row(
-                                        experiment_name=EXPERIMENT_NAME,
-                                        task_kind=task_kind,
-                                        model_name=model_name,
-                                        dataset_name=prepared.dataset_name,
-                                        dataset_id=prepared.dataset_id,
-                                        task_id=prepared.task_id,
-                                        random_state=random_state,
-                                        reason=(
-                                            "No supported finite overlap between prox_predict() "
-                                            "and oob_prediction_."
-                                        ),
-                                        extra_fields={
-                                            **_prepared_fields(prepared, prox_method),
-                                            "test_mean_abs_diff": test_metrics["mean_abs_diff"],
-                                            "test_max_abs_diff": test_metrics["max_abs_diff"],
-                                            "oob_valid_count": 0,
-                                            "oob_total_count": int(prepared.train_size),
-                                            "oob_valid_fraction": 0.0,
-                                            "oob_missing_count": int(prepared.train_size),
-                                            "oob_missing_fraction": 1.0,
-                                            "oob_comparison_status": "no_valid_oob_rows",
-                                            **task_metrics,
-                                            **runtime_fields,
-                                        },
-                                    )
+                                unsupported_row = unsupported_model_row(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    model_name=model_name,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    random_state=random_state,
+                                    reason=(
+                                        "No supported finite overlap between prox_predict() "
+                                        "and oob_prediction_."
+                                    ),
+                                    extra_fields={
+                                        **_prepared_fields(prepared, prox_method),
+                                        "test_mean_abs_diff": test_metrics["mean_abs_diff"],
+                                        "test_max_abs_diff": test_metrics["max_abs_diff"],
+                                        "oob_valid_count": 0,
+                                        "oob_total_count": int(prepared.train_size),
+                                        "oob_valid_fraction": 0.0,
+                                        "oob_missing_count": int(prepared.train_size),
+                                        "oob_missing_fraction": 1.0,
+                                        "oob_comparison_status": "no_valid_oob_rows",
+                                        **task_metrics,
+                                        **runtime_fields,
+                                    },
                                 )
+                                rows.extend(_save_row(store, manifest, unsupported_row))
                                 continue
                             oob_metrics = _regression_identity_metrics(
                                 prox_oob[oob_valid_mask],
@@ -542,37 +621,51 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 "all_oob_rows" if oob_valid_count == prepared.train_size else "partial_oob_rows"
                             )
 
-                        rows.append(
-                            {
-                                "experiment": EXPERIMENT_NAME,
-                                "status": "ok",
-                                "task_kind": task_kind,
-                                "suite_name": prepared.suite_name,
-                                "prox_method": prox_method,
-                                "model_name": model_name,
-                                "random_state": random_state,
-                                "task_id": prepared.task_id,
-                                "dataset_id": prepared.dataset_id,
-                                "dataset_name": prepared.dataset_name,
-                                "train_size": prepared.train_size,
-                                "test_size": prepared.test_size,
-                                "n_features": len(prepared.feature_names),
-                                "n_categorical_features": len(prepared.categorical_indices),
-                                "test_mean_abs_diff": test_metrics["mean_abs_diff"],
-                                "test_max_abs_diff": test_metrics["max_abs_diff"],
-                                "oob_mean_abs_diff": oob_metrics["mean_abs_diff"],
-                                "oob_max_abs_diff": oob_metrics["max_abs_diff"],
-                                "oob_valid_count": oob_valid_count,
-                                "oob_total_count": int(prepared.train_size),
-                                "oob_valid_fraction": float(oob_valid_count / max(1, prepared.train_size)),
-                                "oob_missing_count": oob_missing_count,
-                                "oob_missing_fraction": oob_missing_fraction,
-                                "oob_comparison_status": oob_comparison_status,
-                                **runtime_fields,
-                                **task_metrics,
-                            }
-                        )
+                        result_row = {
+                            "experiment": EXPERIMENT_NAME,
+                            "status": "ok",
+                            "task_kind": task_kind,
+                            "suite_name": prepared.suite_name,
+                            "prox_method": prox_method,
+                            "model_name": model_name,
+                            "random_state": random_state,
+                            "task_id": prepared.task_id,
+                            "dataset_id": prepared.dataset_id,
+                            "dataset_name": prepared.dataset_name,
+                            "train_size": prepared.train_size,
+                            "test_size": prepared.test_size,
+                            "n_features": len(prepared.feature_names),
+                            "n_categorical_features": len(prepared.categorical_indices),
+                            "test_mean_abs_diff": test_metrics["mean_abs_diff"],
+                            "test_max_abs_diff": test_metrics["max_abs_diff"],
+                            "oob_mean_abs_diff": oob_metrics["mean_abs_diff"],
+                            "oob_max_abs_diff": oob_metrics["max_abs_diff"],
+                            "oob_valid_count": oob_valid_count,
+                            "oob_total_count": int(prepared.train_size),
+                            "oob_valid_fraction": float(
+                                oob_valid_count / max(1, prepared.train_size)
+                            ),
+                            "oob_missing_count": oob_missing_count,
+                            "oob_missing_fraction": oob_missing_fraction,
+                            "oob_comparison_status": oob_comparison_status,
+                            **runtime_fields,
+                            **task_metrics,
+                        }
+                        rows.extend(_save_row(store, manifest, result_row))
                     except Exception as exc:
+                        if manifest is None:
+                            manifest = build_checkpoint_manifest(
+                                experiment=EXPERIMENT_NAME,
+                                runner_file=__file__,
+                                unit=unit,
+                                scientific_config=scientific_config,
+                                data_hash=unavailable_data_hash(
+                                    task_kind=task_kind,
+                                    task_id=task_id,
+                                    dataset_id=dataset_id,
+                                ),
+                            )
+                            seed_checkpoint_unit(manifest)
                         extra_fields: dict[str, Any] = {
                             "model_name": model_name,
                             "suite_name": suite_name,
@@ -590,7 +683,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             error=exc,
                             extra_fields=extra_fields,
                         )
-                        rows.append(error_row)
+                        rows.extend(_save_row(store, manifest, error_row))
 
     return pd.DataFrame(rows)
 

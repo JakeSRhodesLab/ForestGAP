@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+import base64
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
+from functools import lru_cache
 from hashlib import sha256
 import inspect
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 import json
 import math
 import os
+import platform
 import random
+import signal
+import sqlite3
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 import time
 import traceback
 from typing import Any, Iterable, Iterator, Literal, Optional, Sequence
+from uuid import uuid4
 
 THREAD_ENV_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
@@ -92,6 +102,8 @@ OutlierLabelMode = Literal["supervised", "unsupervised", "not_applicable"]
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS_DIR = ROOT / "results"
 RAW_RESULTS_DIR = RESULTS_DIR / "raw"
+CHECKPOINT_SCHEMA_VERSION = "forestgap-experiment-checkpoints/1"
+CHECKPOINT_TERMINAL_STATUSES = frozenset({"ok", "unsupported", "excluded"})
 CLASSIFICATION_SUITE_ID = 99
 REGRESSION_SUITE_ID = 455
 REGRESSION_SUITE_NAME = "New_OpenML_Suite_2025_regression"
@@ -482,6 +494,459 @@ class MissingMaskResult:
     metadata: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CheckpointManifest:
+    """Complete identity of one resumable experiment unit."""
+
+    experiment: str
+    unit: dict[str, Any]
+    scientific_config: dict[str, Any]
+    data_hash: str
+    source_hash: str
+    environment: dict[str, Any]
+    schema_version: str = CHECKPOINT_SCHEMA_VERSION
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "experiment": self.experiment,
+            "unit": self.unit,
+            "scientific_config": self.scientific_config,
+            "data_hash": self.data_hash,
+            "source_hash": self.source_hash,
+            "environment": self.environment,
+        }
+
+    @property
+    def logical_key(self) -> str:
+        return checkpoint_value_hash({
+            "schema_version": self.schema_version,
+            "experiment": self.experiment,
+            "unit": self.unit,
+        })
+
+    @property
+    def provenance_hash(self) -> str:
+        return checkpoint_value_hash({
+            "schema_version": self.schema_version,
+            "source_hash": self.source_hash,
+            "environment": self.environment,
+        })
+
+    @property
+    def checkpoint_key(self) -> str:
+        return checkpoint_value_hash(self.to_dict())
+
+
+@dataclass(frozen=True)
+class CheckpointBundle:
+    """Rows and private artifacts committed atomically for one manifest."""
+
+    manifest: CheckpointManifest
+    summary_rows: list[dict[str, Any]]
+    detail_rows: list[dict[str, Any]]
+    artifacts: dict[str, Any]
+
+
+_CHECKPOINT_TYPE_FIELD = "__forestgap_checkpoint_type__"
+
+
+def _checkpoint_jsonable(value: Any) -> Any:
+    """Convert result payloads to deterministic, lossless JSON values."""
+
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if value is pd.NA:
+        return None
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        number = float(value)
+        if math.isnan(number):
+            return {_CHECKPOINT_TYPE_FIELD: "float", "value": "nan"}
+        if math.isinf(number):
+            return {
+                _CHECKPOINT_TYPE_FIELD: "float",
+                "value": "inf" if number > 0 else "-inf",
+            }
+        return number
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value)
+        return {
+            _CHECKPOINT_TYPE_FIELD: "ndarray",
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+            "values": _checkpoint_jsonable(array.tolist()),
+        }
+    if isinstance(value, bytes):
+        return {
+            _CHECKPOINT_TYPE_FIELD: "bytes",
+            "value": base64.b64encode(value).decode("ascii"),
+        }
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _checkpoint_jsonable(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        if isinstance(value, (set, frozenset)):
+            items = sorted(items, key=repr)
+        return [_checkpoint_jsonable(item) for item in items]
+    if isinstance(value, np.generic):
+        return _checkpoint_jsonable(value.item())
+    raise TypeError(f"Unsupported checkpoint value {type(value).__name__}: {value!r}")
+
+
+def _checkpoint_from_jsonable(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_checkpoint_from_jsonable(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    kind = value.get(_CHECKPOINT_TYPE_FIELD)
+    if kind == "float":
+        return {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}[value["value"]]
+    if kind == "bytes":
+        return base64.b64decode(value["value"].encode("ascii"))
+    if kind == "ndarray":
+        values = _checkpoint_from_jsonable(value["values"])
+        return np.asarray(values, dtype=np.dtype(value["dtype"])).reshape(value["shape"])
+    return {key: _checkpoint_from_jsonable(item) for key, item in value.items()}
+
+
+def checkpoint_json_dumps(value: Any, *, sort_keys: bool = True) -> str:
+    return json.dumps(
+        _checkpoint_jsonable(value),
+        sort_keys=sort_keys,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def checkpoint_json_loads(value: str) -> Any:
+    return _checkpoint_from_jsonable(json.loads(value))
+
+
+def checkpoint_value_hash(value: Any) -> str:
+    return sha256(checkpoint_json_dumps(value).encode("utf-8")).hexdigest()
+
+
+def _update_array_digest(digest: Any, value: Any) -> None:
+    array = np.asarray(value)
+    digest.update(checkpoint_json_dumps({
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }).encode("utf-8"))
+    if array.dtype.hasobject:
+        digest.update(checkpoint_json_dumps(array.tolist()).encode("utf-8"))
+    else:
+        digest.update(np.ascontiguousarray(array).tobytes())
+
+
+def prepared_dataset_hash(
+    prepared: PreparedDataset,
+    *,
+    extra_artifacts: Optional[dict[str, Any]] = None,
+) -> str:
+    """Hash the exact prepared split and any application-specific inputs."""
+
+    digest = sha256()
+    digest.update(checkpoint_json_dumps({
+        "task_kind": prepared.task_kind,
+        "suite_id": prepared.suite_id,
+        "suite_name": prepared.suite_name,
+        "task_id": prepared.task_id,
+        "dataset_id": prepared.dataset_id,
+        "dataset_name": prepared.dataset_name,
+        "feature_names": prepared.feature_names,
+        "categorical_indices": prepared.categorical_indices,
+        "fold_id": prepared.fold_id,
+        "repeat": prepared.repeat,
+        "fold": prepared.fold,
+        "sample": prepared.sample,
+    }).encode("utf-8"))
+    for array in (
+        prepared.X_train,
+        prepared.X_test,
+        prepared.y_train,
+        prepared.y_test,
+        prepared.train_indices,
+        prepared.test_indices,
+    ):
+        if array is None:
+            digest.update(b"<none>")
+        else:
+            _update_array_digest(digest, array)
+    digest.update(checkpoint_json_dumps(extra_artifacts or {}).encode("utf-8"))
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=None)
+def checkpoint_source_hash(runner_file: str) -> str:
+    """Hash exact experiment and package source contents, including dirty edits."""
+
+    paths = {Path(runner_file).resolve(), Path(__file__).resolve()}
+    paths.update(path.resolve() for path in (ROOT / "forestgap").rglob("*.py"))
+    digest = sha256()
+    for path in sorted(paths, key=str):
+        try:
+            relative = path.relative_to(ROOT)
+        except ValueError:
+            relative = path
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def checkpoint_environment() -> dict[str, Any]:
+    packages = (
+        "forestgap", "numpy", "scipy", "scikit-learn", "pandas", "openml",
+        "aeon", "treeple", "xgboost", "lightgbm", "catboost",
+    )
+    versions: dict[str, Optional[str]] = {}
+    for package in packages:
+        try:
+            versions[package] = version(package)
+        except PackageNotFoundError:
+            versions[package] = None
+    return {
+        "python": platform.python_version(),
+        "implementation": platform.python_implementation(),
+        "platform": sys.platform,
+        "machine": platform.machine(),
+        "packages": versions,
+    }
+
+
+def build_checkpoint_manifest(
+    *,
+    experiment: str,
+    runner_file: str,
+    unit: dict[str, Any],
+    scientific_config: dict[str, Any],
+    data_hash: str,
+) -> CheckpointManifest:
+    return CheckpointManifest(
+        experiment=experiment,
+        unit=dict(unit),
+        scientific_config=dict(scientific_config),
+        data_hash=data_hash,
+        source_hash=checkpoint_source_hash(str(Path(runner_file).resolve())),
+        environment=checkpoint_environment(),
+    )
+
+
+def unavailable_data_hash(*, task_kind: str, task_id: int, dataset_id: int) -> str:
+    """Stable sentinel for outcomes that do not depend on prepared feature data."""
+
+    return checkpoint_value_hash({
+        "kind": "data_not_applicable",
+        "task_kind": task_kind,
+        "task_id": int(task_id),
+        "dataset_id": int(dataset_id),
+    })
+
+
+def seed_checkpoint_unit(manifest: CheckpointManifest) -> int:
+    """Reset global RNGs so resumed execution is independent of skipped units."""
+
+    seed = int(manifest.checkpoint_key[:8], 16)
+    np.random.seed(seed)
+    random.seed(seed)
+    return seed
+
+
+def _annotate_checkpoint_rows(
+    rows: Iterable[dict[str, Any]],
+    manifest: CheckpointManifest,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **dict(row),
+            "checkpoint_schema_version": manifest.schema_version,
+            "checkpoint_key": manifest.checkpoint_key,
+            "checkpoint_provenance_hash": manifest.provenance_hash,
+        }
+        for row in rows
+    ]
+
+
+class ExperimentCheckpointStore:
+    """Multi-process-safe transactional storage for experiment result bundles."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        ensure_dir(self.path.parent)
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        for attempt in range(20):
+            connection = sqlite3.connect(self.path, timeout=60.0)
+            connection.execute("PRAGMA busy_timeout = 60000")
+            try:
+                row = connection.execute("PRAGMA journal_mode").fetchone()
+                current_mode = "" if row is None else str(row[0]).lower()
+                if current_mode != "wal":
+                    connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                return connection
+            except sqlite3.OperationalError as exc:
+                connection.close()
+                if "locked" not in str(exc).lower() or attempt == 19:
+                    raise
+                # PRAGMA journal_mode can fail immediately when several new
+                # worker processes initialize the same database. SQLite's
+                # busy timeout does not consistently cover that transition.
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
+        raise RuntimeError("unreachable checkpoint connection retry state")
+
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS completed_batches (
+                    checkpoint_key TEXT PRIMARY KEY,
+                    logical_key TEXT NOT NULL,
+                    experiment TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    provenance_hash TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    summary_rows_json TEXT NOT NULL,
+                    detail_rows_json TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    statuses_json TEXT NOT NULL,
+                    completed_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS completed_batches_logical_key
+                    ON completed_batches(logical_key);
+                CREATE TABLE IF NOT EXISTS checkpoint_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    checkpoint_key TEXT NOT NULL,
+                    logical_key TEXT NOT NULL,
+                    experiment TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    summary_rows_json TEXT NOT NULL,
+                    detail_rows_json TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    statuses_json TEXT NOT NULL,
+                    recorded_at REAL NOT NULL
+                );
+                """
+            )
+
+    def load(self, manifest: CheckpointManifest) -> Optional[CheckpointBundle]:
+        manifest_json = checkpoint_json_dumps(manifest.to_dict())
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT manifest_json, summary_rows_json, detail_rows_json, artifacts_json
+                FROM completed_batches WHERE checkpoint_key = ?
+                """,
+                (manifest.checkpoint_key,),
+            ).fetchone()
+        if row is None or row[0] != manifest_json:
+            return None
+        return CheckpointBundle(
+            manifest=manifest,
+            summary_rows=list(checkpoint_json_loads(row[1])),
+            detail_rows=list(checkpoint_json_loads(row[2])),
+            artifacts=dict(checkpoint_json_loads(row[3])),
+        )
+
+    def save(
+        self,
+        manifest: CheckpointManifest,
+        summary_rows: Iterable[dict[str, Any]],
+        *,
+        detail_rows: Iterable[dict[str, Any]] = (),
+        artifacts: Optional[dict[str, Any]] = None,
+    ) -> CheckpointBundle:
+        annotated_summary = _annotate_checkpoint_rows(summary_rows, manifest)
+        annotated_details = _annotate_checkpoint_rows(detail_rows, manifest)
+        artifact_values = dict(artifacts or {})
+        statuses = sorted({str(row.get("status", "ok")) for row in annotated_summary})
+        reusable = set(statuses) <= CHECKPOINT_TERMINAL_STATUSES
+        values = (
+            manifest.checkpoint_key,
+            manifest.logical_key,
+            manifest.experiment,
+            manifest.schema_version,
+            manifest.provenance_hash,
+            checkpoint_json_dumps(manifest.to_dict()),
+            checkpoint_json_dumps(annotated_summary, sort_keys=False),
+            checkpoint_json_dumps(annotated_details, sort_keys=False),
+            checkpoint_json_dumps(artifact_values, sort_keys=False),
+            checkpoint_json_dumps(statuses),
+            time.time(),
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if reusable:
+                connection.execute(
+                    """
+                    INSERT INTO completed_batches (
+                        checkpoint_key, logical_key, experiment, schema_version,
+                        provenance_hash, manifest_json, summary_rows_json,
+                        detail_rows_json, artifacts_json, statuses_json, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(checkpoint_key) DO UPDATE SET
+                        logical_key = excluded.logical_key,
+                        experiment = excluded.experiment,
+                        schema_version = excluded.schema_version,
+                        provenance_hash = excluded.provenance_hash,
+                        manifest_json = excluded.manifest_json,
+                        summary_rows_json = excluded.summary_rows_json,
+                        detail_rows_json = excluded.detail_rows_json,
+                        artifacts_json = excluded.artifacts_json,
+                        statuses_json = excluded.statuses_json,
+                        completed_at = excluded.completed_at
+                    """,
+                    values,
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO checkpoint_attempts (
+                        checkpoint_key, logical_key, experiment, manifest_json,
+                        summary_rows_json, detail_rows_json, artifacts_json,
+                        statuses_json, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        values[0], values[1], values[2], values[5], values[6],
+                        values[7], values[8], values[9], values[10],
+                    ),
+                )
+        return CheckpointBundle(
+            manifest=manifest,
+            summary_rows=annotated_summary,
+            detail_rows=annotated_details,
+            artifacts=artifact_values,
+        )
+
+
+def checkpoint_store(
+    experiment: str,
+    *,
+    root: Optional[Path] = None,
+) -> ExperimentCheckpointStore:
+    checkpoint_root = (
+        Path(root)
+        if root is not None
+        else Path(os.environ.get("FORESTGAP_CHECKPOINT_ROOT", RAW_RESULTS_DIR))
+    )
+    return ExperimentCheckpointStore(
+        checkpoint_root / experiment / "checkpoints.sqlite3",
+    )
+
+
 def parse_random_states(text: str) -> list[int]:
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
@@ -552,6 +1017,15 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
             "Number of independent experiment worker processes. The default "
             "(0) uses every CPU allowed by the process affinity mask. Models "
             "and native numerical libraries use one thread inside each worker."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse crash-safe result checkpoints that match the current data, "
+            "scientific configuration, source, and environment."
         ),
     )
 
@@ -741,6 +1215,40 @@ def _combine_parallel_results(results: Sequence[Any]) -> Any:
     return stable_result_order(pd.concat(results, ignore_index=True))
 
 
+def _parallel_resource_key(
+    item_kind: str,
+    item: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Identify work items that must not run concurrently for memory safety.
+
+    OpenML work items for different models and seeds still load the same
+    dataset and may each construct an O(n_samples**2) relation. Treat the
+    task as their shared resource so a high process count is spent across
+    datasets, not multiplied within one dataset. Extra items conventionally
+    end in a model name, so their preceding fields identify the setup.
+    """
+
+    if item_kind == "openml":
+        task_kind, task_id, _random_state, _model_name = item
+        return (item_kind, task_kind, int(task_id))
+    return (item_kind, *tuple(item[:-1])) if item else (item_kind,)
+
+
+def _format_process_exit(process: Any) -> str:
+    pid = getattr(process, "pid", None)
+    exitcode = getattr(process, "exitcode", None)
+    if exitcode is None:
+        status = "exit=pending"
+    elif exitcode < 0:
+        try:
+            status = f"signal={signal.Signals(-exitcode).name}"
+        except ValueError:
+            status = f"signal={-exitcode}"
+    else:
+        status = f"exit={exitcode}"
+    return f"pid={pid} {status}"
+
+
 def run_module_parallel(
     module_name: str,
     args: argparse.Namespace,
@@ -787,13 +1295,8 @@ def run_module_parallel(
             return tuple(stable_result_order(frame) for frame in result)
         return stable_result_order(result)
 
-    worker_count = min(workers, len(work_items))
-    log_progress(
-        f"[parallel] dispatching {len(work_items)} setup groups to "
-        f"{worker_count} single-threaded workers"
-    )
     base_values = vars(args).copy()
-    work_values = []
+    work_queues: dict[tuple[Any, ...], deque[dict[str, Any]]] = {}
     for item_kind, item in work_items:
         values = base_values.copy()
         values["workers"] = 1
@@ -815,24 +1318,112 @@ def run_module_parallel(
             values["_parallel_setups"] = []
             values["_parallel_models"] = [item[-1]] if item else []
             values["_parallel_extra_items"] = [item]
-        work_values.append(values)
+        resource_key = _parallel_resource_key(item_kind, item)
+        work_queues.setdefault(resource_key, deque()).append(values)
+
+    worker_count = min(workers, len(work_items), len(work_queues))
+    log_progress(
+        f"[parallel] dispatching {len(work_items)} setup groups to at most "
+        f"{worker_count} single-threaded OS worker processes; at most one "
+        f"group per dataset is active"
+    )
 
     if worker_count == 1:
         results = [
             _run_module_work_item(module_name, runner_name, values)
-            for values in work_values
+            for queue in work_queues.values()
+            for values in queue
         ]
     else:
-        futures = []
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            for values in work_values:
-                futures.append(executor.submit(
-                    _run_module_work_item,
-                    module_name,
-                    runner_name,
-                    values,
-                ))
-            results = [future.result() for future in futures]
+        ready_keys = deque(work_queues)
+        in_flight: dict[Any, tuple[Any, ...]] = {}
+        results = []
+        failures: list[BaseException] = []
+        completed_count = 0
+        pool_failure: Optional[BrokenProcessPool] = None
+        process_refs: list[Any] = []
+        executor = ProcessPoolExecutor(max_workers=worker_count)
+
+        def submit_ready() -> None:
+            nonlocal pool_failure
+            while ready_keys and len(in_flight) < worker_count:
+                resource_key = ready_keys.popleft()
+                values = work_queues[resource_key].popleft()
+                try:
+                    future = executor.submit(
+                        _run_module_work_item,
+                        module_name,
+                        runner_name,
+                        values,
+                    )
+                except BrokenProcessPool as exc:
+                    work_queues[resource_key].appendleft(values)
+                    ready_keys.appendleft(resource_key)
+                    pool_failure = exc
+                    return
+                in_flight[future] = resource_key
+
+        try:
+            submit_ready()
+            while in_flight and pool_failure is None:
+                done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                for future in done:
+                    resource_key = in_flight.pop(future)
+                    try:
+                        results.append(future.result())
+                    except BrokenProcessPool as exc:
+                        pool_failure = exc
+                        break
+                    except BaseException as exc:
+                        failures.append(exc)
+                        completed_count += 1
+                    else:
+                        completed_count += 1
+                    if work_queues[resource_key]:
+                        ready_keys.append(resource_key)
+                if pool_failure is not None:
+                    break
+                submit_ready()
+        finally:
+            processes = getattr(executor, "_processes", None)
+            if processes:
+                process_refs = list(processes.values())
+            executor.shutdown(
+                wait=True,
+                cancel_futures=pool_failure is not None,
+            )
+
+        if pool_failure is not None:
+            lost_count = len(work_items) - completed_count
+            abnormal = [
+                process for process in process_refs
+                if getattr(process, "exitcode", 0) not in (None, 0)
+            ]
+            exit_summary = ", ".join(
+                _format_process_exit(process) for process in abnormal[:8]
+            )
+            exit_detail = (
+                f" Worker exits: {exit_summary}."
+                if exit_summary
+                else " No nonzero worker exit code was available."
+            )
+            raise RuntimeError(
+                f"Process pool with {worker_count} OS worker processes broke "
+                f"after {completed_count}/{len(work_items)} work items returned; "
+                f"{lost_count} running or queued work items were lost. "
+                "The lost-item count is not a worker-process count."
+                f"{exit_detail}"
+            ) from pool_failure
+
+        if failures:
+            summary = "; ".join(
+                f"{type(exc).__name__}: {exc}" for exc in failures[:3]
+            )
+            raise RuntimeError(
+                f"{len(failures)} experiment work item(s) failed in a pool of "
+                f"{worker_count} OS worker processes after all remaining work "
+                f"was drained: {summary}"
+            ) from failures[0]
     return _combine_parallel_results(results)
 
 
@@ -943,7 +1534,15 @@ def unsupported_model_row(
 
 def save_dataframe(df: pd.DataFrame, path: Path) -> None:
     ensure_dir(path.parent)
-    df.to_csv(path, index=False)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        df.to_csv(temporary, index=False)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def save_plot_dataframe(
@@ -2257,5 +2856,8 @@ def aggregate_success_rows(df: pd.DataFrame, group_cols: Sequence[str], metric_c
     success = df[df["status"] == "ok"].copy()
     if success.empty:
         return pd.DataFrame(columns=list(group_cols) + list(metric_cols))
-    grouped = success.groupby(list(group_cols), dropna=False)[list(metric_cols)].mean().reset_index()
+    available_metric_cols = [column for column in metric_cols if column in success.columns]
+    if not available_metric_cols:
+        return success[list(group_cols)].drop_duplicates().reset_index(drop=True)
+    grouped = success.groupby(list(group_cols), dropna=False)[available_metric_cols].mean().reset_index()
     return grouped.sort_values(list(group_cols)).reset_index(drop=True)

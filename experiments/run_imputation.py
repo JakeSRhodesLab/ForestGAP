@@ -46,7 +46,9 @@ from experiments.common import (
     aggregate_success_rows,
     apply_missing_mask,
     available_model_names,
+    build_checkpoint_manifest,
     build_proximity_model,
+    checkpoint_store,
     compiled_output_dir,
     downstream_model_names,
     evaluate_downstream_model,
@@ -59,6 +61,7 @@ from experiments.common import (
     parse_missingness_mechanisms,
     parse_random_states,
     prepare_dataset,
+    prepared_dataset_hash,
     proximity_methods_for_model,
     log_progress,
     raw_output_path,
@@ -72,11 +75,15 @@ from experiments.common import (
     rough_fill_train_test,
     save_dataframe,
     save_lineplot_dataframe,
+    seed_checkpoint_unit,
+    unavailable_data_hash,
     unsupported_model_row,
 )
 
 
 EXPERIMENT_NAME = "imputation"
+
+
 def proximity_configurations(model_name: str) -> tuple[tuple[str, str], ...]:
     """Run every relation permitted for the legacy model family both ways."""
 
@@ -160,15 +167,126 @@ def _empty_downstream_metric_fields() -> dict[str, float]:
     }
 
 
+def _unit_manifest(
+    args: argparse.Namespace,
+    *,
+    task_kind: str,
+    task_id: int,
+    dataset_id: int,
+    random_state: int,
+    model_name: str,
+    prox_method: str,
+    variant: str,
+    missingness_mechanism: str,
+    missing_rate: float,
+    downstream_models: tuple[str, ...],
+    data_hash: str,
+) -> Any:
+    return build_checkpoint_manifest(
+        experiment=EXPERIMENT_NAME,
+        runner_file=__file__,
+        unit={
+            "task_kind": task_kind,
+            "task_id": int(task_id),
+            "dataset_id": int(dataset_id),
+            "random_state": int(random_state),
+            "model_name": model_name,
+            "prox_method": prox_method,
+            "variant": variant,
+            "missingness_mechanism": missingness_mechanism,
+            "missing_rate": float(missing_rate),
+        },
+        scientific_config={
+            "max_rows": args.max_rows,
+            "test_size": float(args.test_size),
+            "n_estimators": int(args.n_estimators),
+            "n_iterations": int(args.n_iterations),
+            "bootstrap": True,
+            "oob_score": False,
+            "single_pass_initialization": "median",
+            "downstream_models": list(downstream_models),
+        },
+        data_hash=data_hash,
+    )
+
+
+def _error_rows_for_unit(
+    *,
+    error: Exception,
+    task_kind: str,
+    random_state: int,
+    dataset_name: str,
+    dataset_id: int,
+    task_id: int,
+    model_name: str,
+    prox_method: str,
+    variant: str,
+    missingness_mechanism: str,
+    missing_rate: float,
+    downstream_models: tuple[str, ...],
+    prepared: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for downstream_model in downstream_models:
+        extra_fields: dict[str, Any] = {
+            "model_name": model_name,
+            "prox_method": prox_method,
+            "variant": variant,
+            "missingness_mechanism": missingness_mechanism,
+            "missing_rate": float(missing_rate),
+            "downstream_model": downstream_model,
+        }
+        if prepared is not None:
+            extra_fields.update(
+                _result_context(
+                    prepared=prepared,
+                    model_name=model_name,
+                    prox_method=prox_method,
+                    variant=variant,
+                    missingness_mechanism=missingness_mechanism,
+                    missing_rate=missing_rate,
+                    downstream_model=downstream_model,
+                    metadata=metadata or {},
+                )
+            )
+        result.append(
+            record_exception(
+                experiment_name=EXPERIMENT_NAME,
+                task_kind=task_kind,
+                random_state=random_state,
+                dataset_name=dataset_name,
+                dataset_id=dataset_id,
+                task_id=task_id,
+                error=error,
+                extra_fields=extra_fields,
+            )
+        )
+    return result
+
+
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    store = checkpoint_store(
+        EXPERIMENT_NAME,
+        root=getattr(args, "_checkpoint_root", None),
+    )
+    resume = bool(getattr(args, "resume", True))
     random_states = parse_random_states(args.random_states)
-    missingness_mechanisms = parse_missingness_mechanisms(args.missingness_mechanisms)
-    missing_rates = [float(args.missing_rate)] if args.missing_rate is not None else parse_missing_rates(args.missing_rates)
+    missingness_mechanisms = list(
+        dict.fromkeys(parse_missingness_mechanisms(args.missingness_mechanisms))
+    )
+    requested_missing_rates = (
+        [float(args.missing_rate)]
+        if args.missing_rate is not None
+        else parse_missing_rates(args.missing_rates)
+    )
+    missing_rates = list(dict.fromkeys(float(rate) for rate in requested_missing_rates))
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
         downstream_models = downstream_model_names(task_kind)
+        model_names = selected_model_names(args, requested_model_names())
         for task_id, task in iter_openml_suite(
             task_kind,
             args.dataset_limit,
@@ -193,102 +311,196 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         test_size=args.test_size,
                     )
                 except Exception as exc:
+                    data_hash = unavailable_data_hash(
+                        task_kind=task_kind,
+                        task_id=task_id,
+                        dataset_id=dataset_id,
+                    )
                     for missingness_mechanism in missingness_mechanisms:
                         for missing_rate in missing_rates:
-                            for model_name in selected_model_names(args, requested_model_names()):
+                            for model_name in model_names:
                                 for prox_method, variant in proximity_configurations(model_name):
-                                    for downstream_model in downstream_models:
-                                        rows.append(
-                                            record_exception(
-                                                experiment_name=EXPERIMENT_NAME,
-                                                task_kind=task_kind,
-                                                random_state=random_state,
-                                                dataset_name=dataset_name,
-                                                dataset_id=dataset_id,
-                                                task_id=task_id,
-                                                error=exc,
-                                                extra_fields={
-                                                    "model_name": model_name,
-                                                    "prox_method": prox_method,
-                                                    "variant": variant,
-                                                    "missingness_mechanism": missingness_mechanism,
-                                                    "missing_rate": float(missing_rate),
-                                                    "downstream_model": downstream_model,
-                                                },
-                                            )
-                                        )
+                                    manifest = _unit_manifest(
+                                        args,
+                                        task_kind=task_kind,
+                                        task_id=task_id,
+                                        dataset_id=dataset_id,
+                                        random_state=random_state,
+                                        model_name=model_name,
+                                        prox_method=prox_method,
+                                        variant=variant,
+                                        missingness_mechanism=missingness_mechanism,
+                                        missing_rate=missing_rate,
+                                        downstream_models=downstream_models,
+                                        data_hash=data_hash,
+                                    )
+                                    cached = store.load(manifest) if resume else None
+                                    if cached is not None:
+                                        rows.extend(cached.summary_rows)
+                                        continue
+                                    seed_checkpoint_unit(manifest)
+                                    unit_rows = _error_rows_for_unit(
+                                        error=exc,
+                                        task_kind=task_kind,
+                                        random_state=random_state,
+                                        dataset_name=dataset_name,
+                                        dataset_id=dataset_id,
+                                        task_id=task_id,
+                                        model_name=model_name,
+                                        prox_method=prox_method,
+                                        variant=variant,
+                                        missingness_mechanism=missingness_mechanism,
+                                        missing_rate=missing_rate,
+                                        downstream_models=downstream_models,
+                                    )
+                                    rows.extend(
+                                        store.save(manifest, unit_rows).summary_rows
+                                    )
                     continue
 
                 oracle_cache: dict[str, dict[str, Any]] = {}
-                for downstream_model in downstream_models:
-                    try:
-                        oracle_cache[downstream_model] = _oracle_context(
-                            task_kind=task_kind,
-                            prepared=prepared,
-                            downstream_model=downstream_model,
-                            random_state=random_state,
-                        )
-                    except Exception as exc:
-                        oracle_cache[downstream_model] = {
-                            "status": "error",
-                            "error_type": type(exc).__name__,
-                            "error_message": str(exc),
-                        }
-
                 for missingness_mechanism in missingness_mechanisms:
                     for missing_rate in missing_rates:
                         log_progress(
                             f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
                             f"missingness={missingness_mechanism} rate={float(missing_rate):.3f}"
                         )
-                        mask_result = induced_missing_masks(
-                            prepared.X_train,
-                            prepared.X_test,
-                            categorical_indices=prepared.categorical_indices,
-                            missingness_mechanism=missingness_mechanism,
-                            missing_rate=missing_rate,
-                            random_state=_mask_random_state(
-                                random_state,
-                                missingness_mechanism,
-                                missing_rate,
-                            ),
-                        )
-                        X_train_masked = apply_missing_mask(prepared.X_train, mask_result.train_mask)
-                        X_test_masked = apply_missing_mask(prepared.X_test, mask_result.test_mask)
+                        try:
+                            mask_result = induced_missing_masks(
+                                prepared.X_train,
+                                prepared.X_test,
+                                categorical_indices=prepared.categorical_indices,
+                                missingness_mechanism=missingness_mechanism,
+                                missing_rate=missing_rate,
+                                random_state=_mask_random_state(
+                                    random_state,
+                                    missingness_mechanism,
+                                    missing_rate,
+                                ),
+                            )
+                            X_train_masked = apply_missing_mask(
+                                prepared.X_train,
+                                mask_result.train_mask,
+                            )
+                            X_test_masked = apply_missing_mask(
+                                prepared.X_test,
+                                mask_result.test_mask,
+                            )
+                        except Exception as exc:
+                            data_hash = prepared_dataset_hash(
+                                prepared,
+                                extra_artifacts={
+                                    "mask_generation_status": "error",
+                                    "missingness_mechanism": missingness_mechanism,
+                                    "missing_rate": float(missing_rate),
+                                },
+                            )
+                            for model_name in model_names:
+                                for prox_method, variant in proximity_configurations(model_name):
+                                    manifest = _unit_manifest(
+                                        args,
+                                        task_kind=task_kind,
+                                        task_id=prepared.task_id,
+                                        dataset_id=prepared.dataset_id,
+                                        random_state=random_state,
+                                        model_name=model_name,
+                                        prox_method=prox_method,
+                                        variant=variant,
+                                        missingness_mechanism=missingness_mechanism,
+                                        missing_rate=missing_rate,
+                                        downstream_models=downstream_models,
+                                        data_hash=data_hash,
+                                    )
+                                    cached = store.load(manifest) if resume else None
+                                    if cached is not None:
+                                        rows.extend(cached.summary_rows)
+                                        continue
+                                    seed_checkpoint_unit(manifest)
+                                    unit_rows = _error_rows_for_unit(
+                                        error=exc,
+                                        task_kind=task_kind,
+                                        random_state=random_state,
+                                        dataset_name=prepared.dataset_name,
+                                        dataset_id=prepared.dataset_id,
+                                        task_id=prepared.task_id,
+                                        model_name=model_name,
+                                        prox_method=prox_method,
+                                        variant=variant,
+                                        missingness_mechanism=missingness_mechanism,
+                                        missing_rate=missing_rate,
+                                        downstream_models=downstream_models,
+                                        prepared=prepared,
+                                    )
+                                    rows.extend(
+                                        store.save(manifest, unit_rows).summary_rows
+                                    )
+                            continue
 
-                        for model_name in selected_model_names(args, requested_model_names()):
+                        data_hash = prepared_dataset_hash(
+                            prepared,
+                            extra_artifacts={
+                                "missing_train_mask": mask_result.train_mask,
+                                "missing_test_mask": mask_result.test_mask,
+                                "missingness_metadata": mask_result.metadata,
+                            },
+                        )
+
+                        for model_name in model_names:
                             log_progress(
                                 f"[{EXPERIMENT_NAME}] model={model_name} "
                                 f"missingness={missingness_mechanism} rate={float(missing_rate):.3f}"
                             )
-                            if model_name not in available_model_names(task_kind):
-                                for prox_method, variant in proximity_configurations(model_name):
-                                    for downstream_model in downstream_models:
-                                        rows.append(
-                                            unsupported_model_row(
-                                                experiment_name=EXPERIMENT_NAME,
-                                                task_kind=task_kind,
-                                                model_name=model_name,
-                                                dataset_name=prepared.dataset_name,
-                                                dataset_id=prepared.dataset_id,
-                                                task_id=prepared.task_id,
-                                                random_state=random_state,
-                                                reason=f"{model_name} is not available for {task_kind}.",
-                                                extra_fields=_result_context(
-                                                    prepared=prepared,
-                                                    model_name=model_name,
-                                                    prox_method=prox_method,
-                                                    variant=variant,
-                                                    missingness_mechanism=missingness_mechanism,
-                                                    missing_rate=missing_rate,
-                                                    downstream_model=downstream_model,
-                                                    metadata=mask_result.metadata,
-                                                ),
-                                            )
-                                        )
-                                continue
-
+                            model_available = model_name in available_model_names(task_kind)
                             for prox_method, variant in proximity_configurations(model_name):
+                                manifest = _unit_manifest(
+                                    args,
+                                    task_kind=task_kind,
+                                    task_id=prepared.task_id,
+                                    dataset_id=prepared.dataset_id,
+                                    random_state=random_state,
+                                    model_name=model_name,
+                                    prox_method=prox_method,
+                                    variant=variant,
+                                    missingness_mechanism=missingness_mechanism,
+                                    missing_rate=missing_rate,
+                                    downstream_models=downstream_models,
+                                    data_hash=data_hash,
+                                )
+                                cached = store.load(manifest) if resume else None
+                                if cached is not None:
+                                    rows.extend(cached.summary_rows)
+                                    continue
+
+                                seed_checkpoint_unit(manifest)
+                                if not model_available:
+                                    unit_rows = [
+                                        unsupported_model_row(
+                                            experiment_name=EXPERIMENT_NAME,
+                                            task_kind=task_kind,
+                                            model_name=model_name,
+                                            dataset_name=prepared.dataset_name,
+                                            dataset_id=prepared.dataset_id,
+                                            task_id=prepared.task_id,
+                                            random_state=random_state,
+                                            reason=f"{model_name} is not available for {task_kind}.",
+                                            extra_fields=_result_context(
+                                                prepared=prepared,
+                                                model_name=model_name,
+                                                prox_method=prox_method,
+                                                variant=variant,
+                                                missingness_mechanism=missingness_mechanism,
+                                                missing_rate=missing_rate,
+                                                downstream_model=downstream_model,
+                                                metadata=mask_result.metadata,
+                                            ),
+                                        )
+                                        for downstream_model in downstream_models
+                                    ]
+                                    rows.extend(
+                                        store.save(manifest, unit_rows).summary_rows
+                                    )
+                                    continue
+
                                 log_progress(
                                     f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
                                     f"variant={variant}"
@@ -342,8 +554,12 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             X_test_masked=X_test_masked,
                                             model_name=model_name,
                                         )
-                                        fit_runtime_seconds = float(timing_metrics["fit_runtime_seconds"])
-                                        impute_runtime_seconds = float(timing_metrics["impute_runtime_seconds"])
+                                        fit_runtime_seconds = float(
+                                            timing_metrics["fit_runtime_seconds"]
+                                        )
+                                        impute_runtime_seconds = float(
+                                            timing_metrics["impute_runtime_seconds"]
+                                        )
 
                                     train_metrics = imputation_metrics(
                                         prepared.X_train,
@@ -358,33 +574,28 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         prepared.categorical_indices,
                                     )
                                 except Exception as exc:
-                                    for downstream_model in downstream_models:
-                                        rows.append(
-                                            record_exception(
-                                                experiment_name=EXPERIMENT_NAME,
-                                                task_kind=task_kind,
-                                                random_state=random_state,
-                                                dataset_name=prepared.dataset_name,
-                                                dataset_id=prepared.dataset_id,
-                                                task_id=prepared.task_id,
-                                                error=exc,
-                                                extra_fields={
-                                                    "model_name": model_name,
-                                                    **_result_context(
-                                                        prepared=prepared,
-                                                        model_name=model_name,
-                                                        prox_method=prox_method,
-                                                        variant=variant,
-                                                        missingness_mechanism=missingness_mechanism,
-                                                        missing_rate=missing_rate,
-                                                        downstream_model=downstream_model,
-                                                        metadata=mask_result.metadata,
-                                                    ),
-                                                },
-                                            )
-                                        )
+                                    unit_rows = _error_rows_for_unit(
+                                        error=exc,
+                                        task_kind=task_kind,
+                                        random_state=random_state,
+                                        dataset_name=prepared.dataset_name,
+                                        dataset_id=prepared.dataset_id,
+                                        task_id=prepared.task_id,
+                                        model_name=model_name,
+                                        prox_method=prox_method,
+                                        variant=variant,
+                                        missingness_mechanism=missingness_mechanism,
+                                        missing_rate=missing_rate,
+                                        downstream_models=downstream_models,
+                                        prepared=prepared,
+                                        metadata=mask_result.metadata,
+                                    )
+                                    rows.extend(
+                                        store.save(manifest, unit_rows).summary_rows
+                                    )
                                     continue
 
+                                unit_rows: list[dict[str, Any]] = []
                                 for downstream_model in downstream_models:
                                     context = _result_context(
                                         prepared=prepared,
@@ -396,9 +607,23 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         downstream_model=downstream_model,
                                         metadata=mask_result.metadata,
                                     )
+                                    if downstream_model not in oracle_cache:
+                                        try:
+                                            oracle_cache[downstream_model] = _oracle_context(
+                                                task_kind=task_kind,
+                                                prepared=prepared,
+                                                downstream_model=downstream_model,
+                                                random_state=random_state,
+                                            )
+                                        except Exception as exc:
+                                            oracle_cache[downstream_model] = {
+                                                "status": "error",
+                                                "error_type": type(exc).__name__,
+                                                "error_message": str(exc),
+                                            }
                                     oracle_result = oracle_cache[downstream_model]
                                     if oracle_result["status"] != "ok":
-                                        rows.append(
+                                        unit_rows.append(
                                             {
                                                 **base_context,
                                                 **context,
@@ -421,8 +646,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             categorical_indices=prepared.categorical_indices,
                                             random_state=random_state,
                                         )
-                                        downstream_runtime_seconds = time.perf_counter() - downstream_start
-                                        rows.append(
+                                        downstream_runtime_seconds = (
+                                            time.perf_counter() - downstream_start
+                                        )
+                                        unit_rows.append(
                                             {
                                                 **base_context,
                                                 **context,
@@ -430,23 +657,47 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                                 "test_numeric_mse": test_metrics["numeric_mse"],
                                                 "train_numeric_rmse": train_metrics["numeric_rmse"],
                                                 "test_numeric_rmse": test_metrics["numeric_rmse"],
-                                                "train_categorical_accuracy": train_metrics["categorical_accuracy"],
-                                                "test_categorical_accuracy": test_metrics["categorical_accuracy"],
-                                                "n_train_numeric_masked": train_metrics["n_numeric_masked"],
-                                                "n_test_numeric_masked": test_metrics["n_numeric_masked"],
-                                                "n_train_categorical_masked": train_metrics["n_categorical_masked"],
-                                                "n_test_categorical_masked": test_metrics["n_categorical_masked"],
+                                                "train_categorical_accuracy": train_metrics[
+                                                    "categorical_accuracy"
+                                                ],
+                                                "test_categorical_accuracy": test_metrics[
+                                                    "categorical_accuracy"
+                                                ],
+                                                "n_train_numeric_masked": train_metrics[
+                                                    "n_numeric_masked"
+                                                ],
+                                                "n_test_numeric_masked": test_metrics[
+                                                    "n_numeric_masked"
+                                                ],
+                                                "n_train_categorical_masked": train_metrics[
+                                                    "n_categorical_masked"
+                                                ],
+                                                "n_test_categorical_masked": test_metrics[
+                                                    "n_categorical_masked"
+                                                ],
                                                 "test_accuracy": downstream_metrics["test_accuracy"],
                                                 "test_roc_auc": downstream_metrics["test_roc_auc"],
                                                 "test_mse": downstream_metrics["test_mse"],
                                                 "test_r2": downstream_metrics["test_r2"],
-                                                "oracle_test_accuracy": oracle_result["metrics"]["test_accuracy"],
-                                                "oracle_test_roc_auc": oracle_result["metrics"]["test_roc_auc"],
-                                                "oracle_test_mse": oracle_result["metrics"]["test_mse"],
-                                                "oracle_test_r2": oracle_result["metrics"]["test_r2"],
+                                                "oracle_test_accuracy": oracle_result["metrics"][
+                                                    "test_accuracy"
+                                                ],
+                                                "oracle_test_roc_auc": oracle_result["metrics"][
+                                                    "test_roc_auc"
+                                                ],
+                                                "oracle_test_mse": oracle_result["metrics"][
+                                                    "test_mse"
+                                                ],
+                                                "oracle_test_r2": oracle_result["metrics"][
+                                                    "test_r2"
+                                                ],
                                                 "fit_runtime_seconds": float(fit_runtime_seconds),
-                                                "impute_runtime_seconds": float(impute_runtime_seconds),
-                                                "downstream_runtime_seconds": float(downstream_runtime_seconds),
+                                                "impute_runtime_seconds": float(
+                                                    impute_runtime_seconds
+                                                ),
+                                                "downstream_runtime_seconds": float(
+                                                    downstream_runtime_seconds
+                                                ),
                                                 "total_runtime_seconds": float(
                                                     fit_runtime_seconds
                                                     + impute_runtime_seconds
@@ -455,7 +706,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             }
                                         )
                                     except Exception as exc:
-                                        rows.append(
+                                        unit_rows.append(
                                             record_exception(
                                                 experiment_name=EXPERIMENT_NAME,
                                                 task_kind=task_kind,
@@ -470,6 +721,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                                 },
                                             )
                                         )
+                                rows.extend(
+                                    store.save(manifest, unit_rows).summary_rows
+                                )
 
     return pd.DataFrame(rows)
 

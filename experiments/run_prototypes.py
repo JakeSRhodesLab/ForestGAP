@@ -33,12 +33,15 @@ from experiments.common import (
     add_common_arguments,
     aggregate_success_rows,
     available_model_names,
+    build_checkpoint_manifest,
     build_proximity_model,
+    checkpoint_store,
     compiled_output_dir,
     estimator_supports_parameter,
     iter_openml_suite,
     parse_random_states,
     prepare_dataset,
+    prepared_dataset_hash,
     proximity_methods_for_model,
     log_progress,
     raw_output_path,
@@ -53,7 +56,9 @@ from experiments.common import (
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
+    seed_checkpoint_unit,
     suite_metadata,
+    unavailable_data_hash,
     unsupported_model_row,
 )
 
@@ -933,10 +938,160 @@ def _evaluate_case(
     return rows, detail_rows
 
 
+def _prototype_checkpoint_manifest(
+    *,
+    args: argparse.Namespace,
+    prepared: PreparedDataset,
+    track: str,
+    model_name: str,
+    prox_method: str,
+    random_state: int,
+    data_hash: str,
+):
+    return build_checkpoint_manifest(
+        experiment=EXPERIMENT_NAME,
+        runner_file=__file__,
+        unit={
+            "track": track,
+            "task_kind": prepared.task_kind,
+            "suite_name": prepared.suite_name,
+            "task_id": int(prepared.task_id),
+            "dataset_id": int(prepared.dataset_id),
+            "random_state": int(random_state),
+            "model_name": model_name,
+            "prox_method": prox_method,
+        },
+        scientific_config={
+            "max_rows": args.max_rows,
+            "test_size": float(args.test_size),
+            "n_estimators": int(args.n_estimators),
+            "k": int(args.k),
+            "n_prototypes": int(args.n_prototypes),
+            "baseline_repeats": int(args.baseline_repeats),
+        },
+        data_hash=data_hash,
+    )
+
+
+def _unprepared_prototype_checkpoint_manifest(
+    *,
+    args: argparse.Namespace,
+    track: str,
+    task_kind: str,
+    suite_name: str,
+    task_id: int,
+    dataset_id: int,
+    random_state: int,
+    model_name: str,
+    prox_method: str,
+):
+    return build_checkpoint_manifest(
+        experiment=EXPERIMENT_NAME,
+        runner_file=__file__,
+        unit={
+            "track": track,
+            "task_kind": task_kind,
+            "suite_name": suite_name,
+            "task_id": int(task_id),
+            "dataset_id": int(dataset_id),
+            "random_state": int(random_state),
+            "model_name": model_name,
+            "prox_method": prox_method,
+        },
+        scientific_config={
+            "max_rows": args.max_rows,
+            "test_size": float(args.test_size),
+            "n_estimators": int(args.n_estimators),
+            "k": int(args.k),
+            "n_prototypes": int(args.n_prototypes),
+            "baseline_repeats": int(args.baseline_repeats),
+        },
+        data_hash=unavailable_data_hash(
+            task_kind=task_kind,
+            task_id=task_id,
+            dataset_id=dataset_id,
+        ),
+    )
+
+
+def _checkpointed_prototype_case(
+    *,
+    args: argparse.Namespace,
+    store: Any,
+    resume: bool,
+    prepared: PreparedDataset,
+    synthetic: Optional[SyntheticScenario],
+    track: str,
+    model_name: str,
+    prox_method: str,
+    random_state: int,
+    data_hash: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    manifest = _prototype_checkpoint_manifest(
+        args=args,
+        prepared=prepared,
+        track=track,
+        model_name=model_name,
+        prox_method=prox_method,
+        random_state=random_state,
+        data_hash=data_hash,
+    )
+    cached = store.load(manifest) if resume else None
+    if cached is not None:
+        log_progress(
+            f"[{EXPERIMENT_NAME}] resumed dataset={prepared.dataset_name} "
+            f"model={model_name} prox_method={prox_method}"
+        )
+        return cached.summary_rows, cached.detail_rows
+
+    seed_checkpoint_unit(manifest)
+    try:
+        case_rows, case_details = _evaluate_case(
+            prepared=prepared,
+            synthetic=synthetic,
+            model_name=model_name,
+            prox_method=prox_method,
+            random_state=random_state,
+            args=args,
+        )
+        expected_rows = 1 + int(args.baseline_repeats)
+        if len(case_rows) != expected_rows:
+            raise RuntimeError(
+                f"Prototype unit emitted {len(case_rows)} summary rows; "
+                f"expected {expected_rows}."
+            )
+    except Exception as exc:
+        case_rows = [record_exception(
+            experiment_name=EXPERIMENT_NAME,
+            task_kind=prepared.task_kind,
+            random_state=random_state,
+            dataset_name=prepared.dataset_name,
+            dataset_id=prepared.dataset_id,
+            task_id=prepared.task_id,
+            error=exc,
+            extra_fields={
+                "suite_name": prepared.suite_name,
+                "model_name": model_name,
+                "prox_method": prox_method,
+                "prototype_source": "learned",
+                "k": int(args.k),
+                "n_prototypes": int(args.n_prototypes),
+            },
+        )]
+        case_details = []
+    bundle = store.save(manifest, case_rows, detail_rows=case_details)
+    return bundle.summary_rows, bundle.detail_rows
+
+
 def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, Any]] = []
     detail_rows: list[dict[str, Any]] = []
-    random_states = parse_random_states(args.random_states)
+    random_states = list(dict.fromkeys(parse_random_states(args.random_states)))
+    store = checkpoint_store(
+        EXPERIMENT_NAME,
+        root=getattr(args, "_checkpoint_root", None),
+    )
+    resume = bool(getattr(args, "resume", True))
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
@@ -952,6 +1107,15 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                     test_size=args.test_size,
                 ):
                     prepared = synthetic.prepared
+                    synthetic_data_hash = prepared_dataset_hash(
+                        prepared,
+                        extra_artifacts={
+                            "train_mode_labels": synthetic.train_mode_labels,
+                            "test_mode_labels": synthetic.test_mode_labels,
+                            "mode_centers": synthetic.mode_centers,
+                            "mode_to_class": synthetic.mode_to_class,
+                        },
+                    )
                     log_progress(
                         f"[{EXPERIMENT_NAME}] synthetic dataset={prepared.dataset_name} "
                         f"random_state={random_state}"
@@ -964,8 +1128,21 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                             continue
                         if model_name not in available_model_names(task_kind):
                             for prox_method in proximity_methods_for_model(model_name):
-                                rows.append(
-                                    unsupported_model_row(
+                                manifest = _prototype_checkpoint_manifest(
+                                    args=args,
+                                    prepared=prepared,
+                                    track="synthetic",
+                                    model_name=model_name,
+                                    prox_method=prox_method,
+                                    random_state=random_state,
+                                    data_hash=synthetic_data_hash,
+                                )
+                                cached = store.load(manifest) if resume else None
+                                if cached is not None:
+                                    rows.extend(cached.summary_rows)
+                                    detail_rows.extend(cached.detail_rows)
+                                    continue
+                                unsupported_row = unsupported_model_row(
                                         experiment_name=EXPERIMENT_NAME,
                                         task_kind=task_kind,
                                         model_name=model_name,
@@ -982,6 +1159,8 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                             "n_prototypes": int(args.n_prototypes),
                                         },
                                     )
+                                rows.extend(
+                                    store.save(manifest, [unsupported_row]).summary_rows
                                 )
                             continue
 
@@ -990,37 +1169,20 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                 f"[{EXPERIMENT_NAME}] synthetic dataset={prepared.dataset_name} "
                                 f"model={model_name} prox_method={prox_method}"
                             )
-                            try:
-                                case_rows, case_details = _evaluate_case(
-                                    prepared=prepared,
-                                    synthetic=synthetic,
-                                    model_name=model_name,
-                                    prox_method=prox_method,
-                                    random_state=random_state,
-                                    args=args,
-                                )
-                                rows.extend(case_rows)
-                                detail_rows.extend(case_details)
-                            except Exception as exc:
-                                rows.append(
-                                    record_exception(
-                                        experiment_name=EXPERIMENT_NAME,
-                                        task_kind=task_kind,
-                                        random_state=random_state,
-                                        dataset_name=prepared.dataset_name,
-                                        dataset_id=prepared.dataset_id,
-                                        task_id=prepared.task_id,
-                                        error=exc,
-                                        extra_fields={
-                                            "suite_name": prepared.suite_name,
-                                            "model_name": model_name,
-                                            "prox_method": prox_method,
-                                            "prototype_source": "learned",
-                                            "k": int(args.k),
-                                            "n_prototypes": int(args.n_prototypes),
-                                        },
-                                    )
-                                )
+                            case_rows, case_details = _checkpointed_prototype_case(
+                                args=args,
+                                store=store,
+                                resume=resume,
+                                prepared=prepared,
+                                synthetic=synthetic,
+                                track="synthetic",
+                                model_name=model_name,
+                                prox_method=prox_method,
+                                random_state=random_state,
+                                data_hash=synthetic_data_hash,
+                            )
+                            rows.extend(case_rows)
+                            detail_rows.extend(case_details)
 
         if args.skip_openml:
             continue
@@ -1043,8 +1205,23 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                 if task_kind == "regression":
                     for model_name in selected_model_names(args, requested_model_names()):
                         for prox_method in proximity_methods_for_model(model_name):
-                            rows.append(
-                                unsupported_model_row(
+                            manifest = _unprepared_prototype_checkpoint_manifest(
+                                args=args,
+                                track="openml",
+                                task_kind=task_kind,
+                                suite_name=suite_metadata(task_kind)[1],
+                                task_id=task_id,
+                                dataset_id=dataset_id,
+                                random_state=random_state,
+                                model_name=model_name,
+                                prox_method=prox_method,
+                            )
+                            cached = store.load(manifest) if resume else None
+                            if cached is not None:
+                                rows.extend(cached.summary_rows)
+                                detail_rows.extend(cached.detail_rows)
+                                continue
+                            unsupported_row = unsupported_model_row(
                                     experiment_name=EXPERIMENT_NAME,
                                     task_kind=task_kind,
                                     model_name=model_name,
@@ -1061,6 +1238,8 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                         "n_prototypes": int(args.n_prototypes),
                                     },
                                 )
+                            rows.extend(
+                                store.save(manifest, [unsupported_row]).summary_rows
                             )
                     continue
 
@@ -1074,27 +1253,58 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                         test_size=args.test_size,
                     )
                 except Exception as exc:
-                    rows.append(
-                        record_exception(
-                            experiment_name=EXPERIMENT_NAME,
-                            task_kind=task_kind,
-                            random_state=random_state,
-                            dataset_name=dataset_name,
-                            dataset_id=dataset_id,
-                            task_id=task_id,
-                            error=exc,
-                            extra_fields={
-                                "suite_name": "OpenML-CC18",
-                            },
-                        )
-                    )
+                    for model_name in selected_model_names(args, requested_model_names()):
+                        for prox_method in proximity_methods_for_model(model_name):
+                            manifest = _unprepared_prototype_checkpoint_manifest(
+                                args=args,
+                                track="openml",
+                                task_kind=task_kind,
+                                suite_name="OpenML-CC18",
+                                task_id=task_id,
+                                dataset_id=dataset_id,
+                                random_state=random_state,
+                                model_name=model_name,
+                                prox_method=prox_method,
+                            )
+                            error_row = record_exception(
+                                experiment_name=EXPERIMENT_NAME,
+                                task_kind=task_kind,
+                                random_state=random_state,
+                                dataset_name=dataset_name,
+                                dataset_id=dataset_id,
+                                task_id=task_id,
+                                error=exc,
+                                extra_fields={
+                                    "suite_name": "OpenML-CC18",
+                                    "model_name": model_name,
+                                    "prox_method": prox_method,
+                                    "prototype_source": "learned",
+                                    "k": int(args.k),
+                                    "n_prototypes": int(args.n_prototypes),
+                                },
+                            )
+                            rows.extend(store.save(manifest, [error_row]).summary_rows)
                     continue
 
+                openml_data_hash = prepared_dataset_hash(prepared)
                 for model_name in selected_model_names(args, requested_model_names()):
                     if model_name not in available_model_names(task_kind):
                         for prox_method in proximity_methods_for_model(model_name):
-                            rows.append(
-                                unsupported_model_row(
+                            manifest = _prototype_checkpoint_manifest(
+                                args=args,
+                                prepared=prepared,
+                                track="openml",
+                                model_name=model_name,
+                                prox_method=prox_method,
+                                random_state=random_state,
+                                data_hash=openml_data_hash,
+                            )
+                            cached = store.load(manifest) if resume else None
+                            if cached is not None:
+                                rows.extend(cached.summary_rows)
+                                detail_rows.extend(cached.detail_rows)
+                                continue
+                            unsupported_row = unsupported_model_row(
                                     experiment_name=EXPERIMENT_NAME,
                                     task_kind=task_kind,
                                     model_name=model_name,
@@ -1111,6 +1321,8 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                                         "n_prototypes": int(args.n_prototypes),
                                     },
                                 )
+                            rows.extend(
+                                store.save(manifest, [unsupported_row]).summary_rows
                             )
                         continue
 
@@ -1119,47 +1331,45 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
                             f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
                             f"model={model_name} prox_method={prox_method}"
                         )
-                        try:
-                            case_rows, case_details = _evaluate_case(
-                                prepared=prepared,
-                                synthetic=None,
-                                model_name=model_name,
-                                prox_method=prox_method,
-                                random_state=random_state,
-                                args=args,
-                            )
-                            rows.extend(case_rows)
-                            detail_rows.extend(case_details)
-                        except Exception as exc:
-                            rows.append(
-                                record_exception(
-                                    experiment_name=EXPERIMENT_NAME,
-                                    task_kind=task_kind,
-                                    random_state=random_state,
-                                    dataset_name=prepared.dataset_name,
-                                    dataset_id=prepared.dataset_id,
-                                    task_id=prepared.task_id,
-                                    error=exc,
-                                    extra_fields={
-                                        "suite_name": prepared.suite_name,
-                                        "model_name": model_name,
-                                        "prox_method": prox_method,
-                                        "prototype_source": "learned",
-                                        "k": int(args.k),
-                                        "n_prototypes": int(args.n_prototypes),
-                                    },
-                                )
-                            )
+                        case_rows, case_details = _checkpointed_prototype_case(
+                            args=args,
+                            store=store,
+                            resume=resume,
+                            prepared=prepared,
+                            synthetic=None,
+                            track="openml",
+                            model_name=model_name,
+                            prox_method=prox_method,
+                            random_state=random_state,
+                            data_hash=openml_data_hash,
+                        )
+                        rows.extend(case_rows)
+                        detail_rows.extend(case_details)
 
     summary_df = pd.DataFrame(rows)
     detail_df = pd.DataFrame(detail_rows)
-    summary_df = _merge_stability_metrics(summary_df, detail_df)
     return summary_df, detail_df
 
 
 def compile_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame) -> None:
     if summary_df.empty or "task_kind" not in summary_df.columns:
         return
+
+    # Stability is a cross-seed property. Worker checkpoints deliberately hold
+    # pre-stability rows, so compute it once after cached and new units merge.
+    stability_columns = (
+        "stability_n_random_states",
+        "stability_mean_same_class_neighbor_fraction_std",
+        "stability_coverage_fraction_std",
+        "stability_prototype_accuracy_std",
+        "stability_center_proximity_std",
+        "stability_mode_coverage_fraction_std",
+        "stability_center_mode_jaccard",
+    )
+    summary_df = summary_df.drop(
+        columns=[column for column in stability_columns if column in summary_df.columns],
+    )
+    summary_df = _merge_stability_metrics(summary_df, detail_df)
 
     for task_kind in sorted(summary_df["task_kind"].dropna().unique()):
         task_df = summary_df[summary_df["task_kind"] == task_kind].copy()

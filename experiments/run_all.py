@@ -14,13 +14,14 @@ from typing import Any, TextIO
 
 
 SCRIPTS = [
-    "run_prediction_identity.py",
-    "run_imputation.py",
-    "run_outlier_detection.py",
+    # "run_prediction_identity.py",
+    # "run_imputation.py",
+    # "run_outlier_detection.py",
     "run_prototypes.py",
-    "run_local_feature_importance.py",
-    "run_mds_visualization.py",
+    # "run_local_feature_importance.py",
+    # "run_mds_visualization.py",
 ]
+
 THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -121,6 +122,12 @@ def main() -> None:
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse matching crash-safe checkpoints in child experiment runners.",
+    )
+    parser.add_argument(
         "--run-label",
         default=None,
         help="Append a label to launcher-only logs and runtime output names.",
@@ -163,6 +170,8 @@ def main() -> None:
         common_args.extend(["--dataset-limit", str(args.dataset_limit)])
     if args.max_rows is not None:
         common_args.extend(["--max-rows", str(args.max_rows)])
+    if not args.resume:
+        common_args.append("--no-resume")
 
     for index, script in enumerate(SCRIPTS, start=1):
         log_path = log_dir / f"{index:02d}_{Path(script).stem}.log"

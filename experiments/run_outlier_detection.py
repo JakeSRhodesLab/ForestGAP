@@ -16,7 +16,9 @@ from experiments.common import (
     OUTLIER_SCORE_METHODS,
     add_common_arguments,
     aggregate_success_rows,
+    build_checkpoint_manifest,
     build_outlier_model,
+    checkpoint_store,
     compiled_output_dir,
     corrupt_dataset,
     fit_outlier_model,
@@ -29,6 +31,7 @@ from experiments.common import (
     parse_csv_floats,
     parse_random_states,
     prepare_dataset,
+    prepared_dataset_hash,
     proximity_methods_for_model,
     log_progress,
     raw_output_path,
@@ -42,6 +45,8 @@ from experiments.common import (
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
+    seed_checkpoint_unit,
+    unavailable_data_hash,
     unsupported_model_row,
 )
 
@@ -68,7 +73,42 @@ def requested_outlier_fractions(args: argparse.Namespace) -> list[float]:
             + ", ".join(f"{value:.4f}" for value in invalid)
             + "."
         )
-    return fractions
+    return list(dict.fromkeys(float(value) for value in fractions))
+
+
+def _checkpoint_manifest(
+    *,
+    args: argparse.Namespace,
+    task_kind: str,
+    task_id: int,
+    dataset_id: int,
+    random_state: int,
+    model_name: str,
+    prox_method: str,
+    outlier_fraction: float,
+    data_hash: str,
+):
+    return build_checkpoint_manifest(
+        experiment=EXPERIMENT_NAME,
+        runner_file=__file__,
+        unit={
+            "task_kind": task_kind,
+            "task_id": int(task_id),
+            "dataset_id": int(dataset_id),
+            "random_state": int(random_state),
+            "model_name": model_name,
+            "prox_method": prox_method,
+            "outlier_fraction": float(outlier_fraction),
+        },
+        scientific_config={
+            "max_rows": args.max_rows,
+            "test_size": float(args.test_size),
+            "n_estimators": int(args.n_estimators),
+            "isolation_bootstrap": bool(args.isolation_bootstrap),
+            "score_methods": list(OUTLIER_SCORE_METHODS),
+        },
+        data_hash=data_hash,
+    )
 
 
 def config_label(row: pd.Series) -> str:
@@ -199,6 +239,12 @@ def append_proximity_row(
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     outlier_fractions = requested_outlier_fractions(args)
+    random_states = list(dict.fromkeys(parse_random_states(args.random_states)))
+    store = checkpoint_store(
+        EXPERIMENT_NAME,
+        root=getattr(args, "_checkpoint_root", None),
+    )
+    resume = bool(getattr(args, "resume", True))
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] task_kind={task_kind}")
@@ -209,7 +255,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
         ):
             dataset_name = str(getattr(task, "dataset_name", f"task_{task_id}"))
             dataset_id = int(getattr(task, "dataset_id", -1))
-            for random_state in parse_random_states(args.random_states):
+            for random_state in random_states:
                 if not setup_selected(args, task_kind, task_id, random_state):
                     continue
                 log_progress(
@@ -231,21 +277,51 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         prepared.categorical_indices,
                     )
                 except Exception as exc:
-                    for model_name in selected_model_names(args, requested_outlier_model_names()):
-                        error_row = record_exception(
-                            experiment_name=EXPERIMENT_NAME,
-                            task_kind=task_kind,
-                            random_state=random_state,
-                            dataset_name=dataset_name,
-                            dataset_id=dataset_id,
-                            task_id=task_id,
-                            error=exc,
-                            extra_fields={
-                                "suite_name": None,
-                                "model_name": model_name,
-                            },
-                        )
-                        rows.append(error_row)
+                    data_hash = unavailable_data_hash(
+                        task_kind=task_kind,
+                        task_id=task_id,
+                        dataset_id=dataset_id,
+                    )
+                    for outlier_fraction in outlier_fractions:
+                        for model_name in selected_model_names(args, requested_outlier_model_names()):
+                            prox_methods = (
+                                ("collision",)
+                                if model_name in {"IsolationForest", "ExtendedIsolationForest"}
+                                else proximity_methods_for_model(model_name)
+                            )
+                            for prox_method in prox_methods:
+                                manifest = _checkpoint_manifest(
+                                    args=args,
+                                    task_kind=task_kind,
+                                    task_id=task_id,
+                                    dataset_id=dataset_id,
+                                    random_state=random_state,
+                                    model_name=model_name,
+                                    prox_method=prox_method,
+                                    outlier_fraction=outlier_fraction,
+                                    data_hash=data_hash,
+                                )
+                                cached = store.load(manifest) if resume else None
+                                if cached is not None:
+                                    rows.extend(cached.summary_rows)
+                                    continue
+                                error_row = record_exception(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    random_state=random_state,
+                                    dataset_name=dataset_name,
+                                    dataset_id=dataset_id,
+                                    task_id=task_id,
+                                    error=exc,
+                                    extra_fields={
+                                        "suite_name": None,
+                                        "model_name": model_name,
+                                        "prox_method": prox_method,
+                                        "fit_prox_method": prox_method,
+                                        "outlier_fraction": float(outlier_fraction),
+                                    },
+                                )
+                                rows.extend(store.save(manifest, [error_row]).summary_rows)
                     continue
 
                 for outlier_fraction in outlier_fractions:
@@ -253,13 +329,59 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         f"[{EXPERIMENT_NAME}] dataset={prepared.dataset_name} "
                         f"outlier_fraction={float(outlier_fraction):.3f}"
                     )
-                    X_corrupt, corruption_labels = corrupt_dataset(
-                        X_train_filled,
-                        prepared.categorical_indices,
-                        random_state=random_state,
-                        fraction=outlier_fraction,
-                    )
+                    try:
+                        X_corrupt, corruption_labels = corrupt_dataset(
+                            X_train_filled,
+                            prepared.categorical_indices,
+                            random_state=random_state,
+                            fraction=outlier_fraction,
+                        )
+                    except Exception as exc:
+                        data_hash = prepared_dataset_hash(prepared)
+                        for model_name in selected_model_names(args, requested_outlier_model_names()):
+                            prox_methods = (
+                                ("collision",)
+                                if model_name in {"IsolationForest", "ExtendedIsolationForest"}
+                                else proximity_methods_for_model(model_name)
+                            )
+                            for prox_method in prox_methods:
+                                manifest = _checkpoint_manifest(
+                                    args=args,
+                                    task_kind=task_kind,
+                                    task_id=prepared.task_id,
+                                    dataset_id=prepared.dataset_id,
+                                    random_state=random_state,
+                                    model_name=model_name,
+                                    prox_method=prox_method,
+                                    outlier_fraction=outlier_fraction,
+                                    data_hash=data_hash,
+                                )
+                                error_row = record_exception(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    random_state=random_state,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    error=exc,
+                                    extra_fields={
+                                        "suite_name": prepared.suite_name,
+                                        "model_name": model_name,
+                                        "prox_method": prox_method,
+                                        "fit_prox_method": prox_method,
+                                        "outlier_fraction": float(outlier_fraction),
+                                    },
+                                )
+                                rows.extend(store.save(manifest, [error_row]).summary_rows)
+                        continue
                     outlier_count = int(corruption_labels.sum())
+                    data_hash = prepared_dataset_hash(
+                        prepared,
+                        extra_artifacts={
+                            "outlier_fraction": float(outlier_fraction),
+                            "corruption_labels": corruption_labels,
+                        },
+                    )
 
                     for model_name in selected_model_names(args, requested_outlier_model_names()):
                         log_progress(
@@ -267,9 +389,29 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             f"outlier_fraction={float(outlier_fraction):.3f}"
                         )
                         spec = outlier_model_spec(task_kind, model_name)
+                        prox_methods = (
+                            ("collision",)
+                            if model_name in {"IsolationForest", "ExtendedIsolationForest"}
+                            else proximity_methods_for_model(model_name)
+                        )
                         if spec is None:
-                            rows.append(
-                                unsupported_model_row(
+                            for prox_method in prox_methods:
+                                manifest = _checkpoint_manifest(
+                                    args=args,
+                                    task_kind=task_kind,
+                                    task_id=prepared.task_id,
+                                    dataset_id=prepared.dataset_id,
+                                    random_state=random_state,
+                                    model_name=model_name,
+                                    prox_method=prox_method,
+                                    outlier_fraction=outlier_fraction,
+                                    data_hash=data_hash,
+                                )
+                                cached = store.load(manifest) if resume else None
+                                if cached is not None:
+                                    rows.extend(cached.summary_rows)
+                                    continue
+                                unsupported_row = unsupported_model_row(
                                     experiment_name=EXPERIMENT_NAME,
                                     task_kind=task_kind,
                                     model_name=model_name,
@@ -285,25 +427,56 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             if model_name in UNSUPERVISED_OUTLIER_MODELS
                                             else "supervised_forest"
                                         ),
+                                        "score_source": "not_applicable",
+                                        "prox_method": prox_method,
+                                        "fit_prox_method": prox_method,
+                                        "score_method": "not_applicable",
+                                        "label_mode": "not_applicable",
                                         "outlier_fraction": outlier_fraction,
                                         "outlier_count": outlier_count,
                                     },
                                 )
-                            )
+                                rows.extend(
+                                    store.save(manifest, [unsupported_row]).summary_rows
+                                )
                             continue
 
-                        try:
-                            native_scores = None
-                            prox_methods = (
-                                ("collision",)
-                                if model_name in {"IsolationForest", "ExtendedIsolationForest"}
-                                else proximity_methods_for_model(model_name)
+                        native_scores = None
+                        for prox_index, prox_method in enumerate(prox_methods):
+                            manifest = _checkpoint_manifest(
+                                args=args,
+                                task_kind=task_kind,
+                                task_id=prepared.task_id,
+                                dataset_id=prepared.dataset_id,
+                                random_state=random_state,
+                                model_name=model_name,
+                                prox_method=prox_method,
+                                outlier_fraction=outlier_fraction,
+                                data_hash=data_hash,
                             )
-                            for prox_method in prox_methods:
+                            cached = store.load(manifest) if resume else None
+                            canonical_native_unit = prox_index == 0 and spec.supports_native_scores
+                            if (
+                                cached is not None
+                                and (not canonical_native_unit or "native_scores" in cached.artifacts)
+                            ):
+                                rows.extend(cached.summary_rows)
+                                if canonical_native_unit:
+                                    native_scores = cached.artifacts["native_scores"]
                                 log_progress(
-                                    f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
-                                    f"outlier_fraction={float(outlier_fraction):.3f}"
+                                    f"[{EXPERIMENT_NAME}] resumed model={model_name} "
+                                    f"prox_method={prox_method} fraction={float(outlier_fraction):.3f}"
                                 )
+                                continue
+
+                            log_progress(
+                                f"[{EXPERIMENT_NAME}] model={model_name} prox_method={prox_method} "
+                                f"outlier_fraction={float(outlier_fraction):.3f}"
+                            )
+                            seed_checkpoint_unit(manifest)
+                            unit_rows: list[dict[str, Any]] = []
+                            unit_artifacts: dict[str, Any] = {}
+                            try:
                                 model, spec, fit_metadata = build_outlier_model(
                                     task_kind,
                                     model_name=model_name,
@@ -317,25 +490,27 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                 fit_outlier_model(model, spec, X_corrupt, prepared.y_train)
                                 fit_runtime_seconds = time.perf_counter() - fit_start
 
-                                if native_scores is None and spec.supports_native_scores:
+                                if spec.supports_native_scores and native_scores is None:
                                     native_score_start = time.perf_counter()
                                     native_scores = native_outlier_scores(model, X_corrupt)
                                     native_score_runtime_seconds = time.perf_counter() - native_score_start
-                                    append_native_row(
-                                        rows=rows,
-                                        prepared=prepared,
-                                        spec=spec,
-                                        model_name=model_name,
-                                        random_state=random_state,
-                                        outlier_fraction=outlier_fraction,
-                                        outlier_count=outlier_count,
-                                        fit_prox_method=prox_method,
-                                        fit_runtime_seconds=fit_runtime_seconds,
-                                        score_runtime_seconds=native_score_runtime_seconds,
-                                        scores=native_scores,
-                                        labels=corruption_labels,
-                                        fit_metadata=fit_metadata,
-                                    )
+                                    if canonical_native_unit:
+                                        append_native_row(
+                                            rows=unit_rows,
+                                            prepared=prepared,
+                                            spec=spec,
+                                            model_name=model_name,
+                                            random_state=random_state,
+                                            outlier_fraction=outlier_fraction,
+                                            outlier_count=outlier_count,
+                                            fit_prox_method=prox_method,
+                                            fit_runtime_seconds=fit_runtime_seconds,
+                                            score_runtime_seconds=native_score_runtime_seconds,
+                                            scores=native_scores,
+                                            labels=corruption_labels,
+                                            fit_metadata=fit_metadata,
+                                        )
+                                        unit_artifacts["native_scores"] = native_scores
 
                                 for score_method in OUTLIER_SCORE_METHODS:
                                     for label_mode in outlier_label_modes(task_kind, model_name):
@@ -344,7 +519,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                         scores = outlier_scores(model, score_labels, method=score_method)
                                         score_runtime_seconds = time.perf_counter() - score_start
                                         append_proximity_row(
-                                            rows=rows,
+                                            rows=unit_rows,
                                             prepared=prepared,
                                             spec=spec,
                                             model_name=model_name,
@@ -361,24 +536,35 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                                             fit_metadata=fit_metadata,
                                             native_scores=native_scores,
                                         )
-                        except Exception as exc:
-                            error_row = record_exception(
-                                experiment_name=EXPERIMENT_NAME,
-                                task_kind=task_kind,
-                                random_state=random_state,
-                                dataset_name=prepared.dataset_name,
-                                dataset_id=prepared.dataset_id,
-                                task_id=prepared.task_id,
-                                error=exc,
-                                extra_fields={
-                                    "suite_name": prepared.suite_name,
-                                    "model_name": model_name,
-                                    "model_family": spec.model_family,
-                                    "outlier_fraction": outlier_fraction,
-                                    "outlier_count": outlier_count,
-                                },
+                            except Exception as exc:
+                                unit_rows = [record_exception(
+                                    experiment_name=EXPERIMENT_NAME,
+                                    task_kind=task_kind,
+                                    random_state=random_state,
+                                    dataset_name=prepared.dataset_name,
+                                    dataset_id=prepared.dataset_id,
+                                    task_id=prepared.task_id,
+                                    error=exc,
+                                    extra_fields={
+                                        "suite_name": prepared.suite_name,
+                                        "model_name": model_name,
+                                        "model_family": spec.model_family,
+                                        "score_source": "not_applicable",
+                                        "prox_method": prox_method,
+                                        "fit_prox_method": prox_method,
+                                        "score_method": "not_applicable",
+                                        "label_mode": "not_applicable",
+                                        "outlier_fraction": outlier_fraction,
+                                        "outlier_count": outlier_count,
+                                    },
+                                )]
+                                unit_artifacts = {}
+                            bundle = store.save(
+                                manifest,
+                                unit_rows,
+                                artifacts=unit_artifacts,
                             )
-                            rows.append(error_row)
+                            rows.extend(bundle.summary_rows)
 
     return pd.DataFrame(rows)
 

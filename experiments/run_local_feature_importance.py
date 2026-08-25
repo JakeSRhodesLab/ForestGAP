@@ -44,12 +44,15 @@ from experiments.common import (
     add_common_arguments,
     available_model_names,
     aggregate_success_rows,
+    build_checkpoint_manifest,
     build_proximity_model,
+    checkpoint_store,
     compiled_output_dir,
     compute_fill_values,
     iter_openml_suite,
     parse_random_states,
     prepare_dataset,
+    prepared_dataset_hash,
     proximity_methods_for_model,
     log_progress,
     raw_output_path,
@@ -63,11 +66,63 @@ from experiments.common import (
     rough_fill_train_test,
     save_dataframe,
     save_plot_dataframe,
+    seed_checkpoint_unit,
     unsupported_model_row,
+    unavailable_data_hash,
 )
 
 
 EXPERIMENT_NAME = "local_feature_importance"
+
+
+def _checkpoint_unit(
+    *,
+    task_kind: str,
+    task_id: int,
+    dataset_id: int,
+    random_state: int,
+    model_name: str,
+    prox_method: str,
+) -> dict[str, Any]:
+    return {
+        "task_kind": task_kind,
+        "task_id": int(task_id),
+        "dataset_id": int(dataset_id),
+        "random_state": int(random_state),
+        "model_name": model_name,
+        "prox_method": prox_method,
+    }
+
+
+def _checkpoint_config(args: argparse.Namespace, prox_method: str) -> dict[str, Any]:
+    return {
+        "max_rows": getattr(args, "max_rows", None),
+        "test_size": getattr(args, "test_size", 0.3),
+        "feature_cap": getattr(args, "feature_cap", 32),
+        "n_estimators": getattr(args, "n_estimators", 96),
+        "n_repeats": getattr(args, "n_repeats", 5),
+        "n_queries": getattr(args, "n_queries", 16),
+        "perturbation": "auto",
+        "bootstrap": prox_method in {"oob", "rfgap"},
+        "oob_score": prox_method == "rfgap",
+    }
+
+
+def _cached_rows(store: Any, manifest: Any, args: argparse.Namespace, prox_method: str) -> list[dict[str, Any]] | None:
+    if not getattr(args, "resume", True):
+        return None
+    cached = store.load(manifest)
+    if cached is None or not cached.summary_rows:
+        return None
+    # Older local-importance exports omitted the relation on some terminal rows.
+    # Such rows cannot prove which model/proximity unit produced them.
+    if any(row.get("prox_method") != prox_method for row in cached.summary_rows):
+        return None
+    return cached.summary_rows
+
+
+def _save_row(store: Any, manifest: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    return store.save(manifest, [row]).summary_rows
 
 
 def _probability_drop(
@@ -88,6 +143,10 @@ def _probability_drop(
 def run(args: argparse.Namespace) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     prox_method = getattr(args, "_prox_method", "original")
+    store = checkpoint_store(
+        EXPERIMENT_NAME,
+        root=getattr(args, "_checkpoint_root", None),
+    )
 
     for task_kind in requested_tasks(args.task):
         log_progress(f"[{EXPERIMENT_NAME}] prox_method={prox_method} task_kind={task_kind}")
@@ -112,52 +171,63 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     )
                     if prox_method not in proximity_methods_for_model(model_name):
                         continue
+                    unit = _checkpoint_unit(
+                        task_kind=task_kind,
+                        task_id=task_id,
+                        dataset_id=dataset_id,
+                        random_state=random_state,
+                        model_name=model_name,
+                        prox_method=prox_method,
+                    )
+                    scientific_config = _checkpoint_config(args, prox_method)
+
+                    unsupported_reason: str | None = None
                     if task_kind == "regression":
-                        rows.append(
-                            unsupported_model_row(
-                                experiment_name=EXPERIMENT_NAME,
-                                task_kind=task_kind,
-                                model_name=model_name,
-                                dataset_name=dataset_name,
-                                dataset_id=dataset_id,
-                                task_id=task_id,
-                                random_state=random_state,
-                                reason="the standalone local_feature_importance application is classification-only",
-                            )
+                        unsupported_reason = (
+                            "the standalone local_feature_importance application is "
+                            "classification-only"
                         )
-                        continue
-                    if model_name == "HonestForest":
-                        rows.append(
-                            unsupported_model_row(
-                                experiment_name=EXPERIMENT_NAME,
-                                task_kind=task_kind,
-                                model_name=model_name,
-                                dataset_name=dataset_name,
-                                dataset_id=dataset_id,
-                                task_id=task_id,
-                                random_state=random_state,
-                                reason=(
-                                    "HonestForest is unstable for local feature importance on this "
-                                    "benchmark in the current treeple build (native segfault during fit)."
-                                ),
-                            )
+                    elif model_name == "HonestForest":
+                        unsupported_reason = (
+                            "HonestForest is unstable for local feature importance on this "
+                            "benchmark in the current treeple build (native segfault during fit)."
                         )
-                        continue
-                    if model_name not in available_model_names(task_kind):
-                        rows.append(
-                            unsupported_model_row(
-                                experiment_name=EXPERIMENT_NAME,
+                    elif model_name not in available_model_names(task_kind):
+                        unsupported_reason = f"{model_name} is not available for {task_kind}."
+
+                    if unsupported_reason is not None:
+                        manifest = build_checkpoint_manifest(
+                            experiment=EXPERIMENT_NAME,
+                            runner_file=__file__,
+                            unit=unit,
+                            scientific_config=scientific_config,
+                            data_hash=unavailable_data_hash(
                                 task_kind=task_kind,
-                                model_name=model_name,
-                                dataset_name=dataset_name,
-                                dataset_id=dataset_id,
                                 task_id=task_id,
-                                random_state=random_state,
-                                reason=f"{model_name} is not available for {task_kind}.",
-                            )
+                                dataset_id=dataset_id,
+                            ),
                         )
+                        cached_rows = _cached_rows(store, manifest, args, prox_method)
+                        if cached_rows is not None:
+                            rows.extend(cached_rows)
+                            continue
+                        seed_checkpoint_unit(manifest)
+                        unsupported_row = unsupported_model_row(
+                            experiment_name=EXPERIMENT_NAME,
+                            task_kind=task_kind,
+                            model_name=model_name,
+                            dataset_name=dataset_name,
+                            dataset_id=dataset_id,
+                            task_id=task_id,
+                            random_state=random_state,
+                            reason=unsupported_reason,
+                            extra_fields={"prox_method": prox_method},
+                        )
+                        rows.extend(_save_row(store, manifest, unsupported_row))
                         continue
 
+                    manifest: Any = None
+                    prepared: Any = None
                     try:
                         prepared = prepare_dataset(
                             task_kind,
@@ -168,6 +238,18 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                             test_size=args.test_size,
                             feature_cap=args.feature_cap,
                         )
+                        manifest = build_checkpoint_manifest(
+                            experiment=EXPERIMENT_NAME,
+                            runner_file=__file__,
+                            unit=unit,
+                            scientific_config=scientific_config,
+                            data_hash=prepared_dataset_hash(prepared),
+                        )
+                        cached_rows = _cached_rows(store, manifest, args, prox_method)
+                        if cached_rows is not None:
+                            rows.extend(cached_rows)
+                            continue
+                        seed_checkpoint_unit(manifest)
                         X_train_filled, X_test_filled = rough_fill_train_test(
                             prepared.X_train,
                             prepared.X_test,
@@ -227,37 +309,51 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         evaluation_runtime_seconds = time.perf_counter() - evaluation_start
 
                         misclassified = pred_class != y_query
-                        rows.append(
-                            {
-                                "experiment": EXPERIMENT_NAME,
-                                "status": "ok",
-                                "task_kind": task_kind,
-                                "model_name": model_name,
-                                "prox_method": prox_method,
-                                "random_state": random_state,
-                                "task_id": prepared.task_id,
-                                "dataset_id": prepared.dataset_id,
-                                "dataset_name": prepared.dataset_name,
-                                "n_queries": int(n_queries),
-                                "n_features": int(X_query.shape[1]),
-                                "mean_abs_importance_pred": float(np.mean(np.abs(importance_pred))),
-                                "mean_abs_importance_true": float(np.mean(np.abs(importance_true))),
-                                "true_vs_pred_mean_abs_delta": float(np.mean(np.abs(importance_true - importance_pred))),
-                                "top_feature_drop_mean": float(np.mean(top_drop)),
-                                "random_feature_drop_mean": float(np.mean(random_drop)),
-                                "top_feature_win_rate": float(np.mean(top_drop > random_drop)),
-                                "misclassified_fraction": float(np.mean(misclassified)),
-                                "fit_runtime_seconds": float(fit_runtime_seconds),
-                                "importance_runtime_seconds": float(importance_runtime_seconds),
-                                "evaluation_runtime_seconds": float(evaluation_runtime_seconds),
-                                "total_runtime_seconds": float(
-                                    fit_runtime_seconds
-                                    + importance_runtime_seconds
-                                    + evaluation_runtime_seconds
-                                ),
-                            }
-                        )
+                        result_row = {
+                            "experiment": EXPERIMENT_NAME,
+                            "status": "ok",
+                            "task_kind": task_kind,
+                            "model_name": model_name,
+                            "prox_method": prox_method,
+                            "random_state": random_state,
+                            "task_id": prepared.task_id,
+                            "dataset_id": prepared.dataset_id,
+                            "dataset_name": prepared.dataset_name,
+                            "n_queries": int(n_queries),
+                            "n_features": int(X_query.shape[1]),
+                            "mean_abs_importance_pred": float(np.mean(np.abs(importance_pred))),
+                            "mean_abs_importance_true": float(np.mean(np.abs(importance_true))),
+                            "true_vs_pred_mean_abs_delta": float(
+                                np.mean(np.abs(importance_true - importance_pred))
+                            ),
+                            "top_feature_drop_mean": float(np.mean(top_drop)),
+                            "random_feature_drop_mean": float(np.mean(random_drop)),
+                            "top_feature_win_rate": float(np.mean(top_drop > random_drop)),
+                            "misclassified_fraction": float(np.mean(misclassified)),
+                            "fit_runtime_seconds": float(fit_runtime_seconds),
+                            "importance_runtime_seconds": float(importance_runtime_seconds),
+                            "evaluation_runtime_seconds": float(evaluation_runtime_seconds),
+                            "total_runtime_seconds": float(
+                                fit_runtime_seconds
+                                + importance_runtime_seconds
+                                + evaluation_runtime_seconds
+                            ),
+                        }
+                        rows.extend(_save_row(store, manifest, result_row))
                     except Exception as exc:
+                        if manifest is None:
+                            manifest = build_checkpoint_manifest(
+                                experiment=EXPERIMENT_NAME,
+                                runner_file=__file__,
+                                unit=unit,
+                                scientific_config=scientific_config,
+                                data_hash=unavailable_data_hash(
+                                    task_kind=task_kind,
+                                    task_id=task_id,
+                                    dataset_id=dataset_id,
+                                ),
+                            )
+                            seed_checkpoint_unit(manifest)
                         error_row = record_exception(
                             experiment_name=EXPERIMENT_NAME,
                             task_kind=task_kind,
@@ -269,7 +365,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                         )
                         error_row["model_name"] = model_name
                         error_row["prox_method"] = prox_method
-                        rows.append(error_row)
+                        rows.extend(_save_row(store, manifest, error_row))
 
     return pd.DataFrame(rows)
 
