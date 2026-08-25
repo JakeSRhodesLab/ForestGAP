@@ -213,3 +213,5 @@ __marimo__/
 .vscode
 
 # results
+
+experiments/zombies.txt
