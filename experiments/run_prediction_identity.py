@@ -689,6 +689,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
 
 def compile_outputs(df: pd.DataFrame) -> None:
+    if df.empty or "task_kind" not in df.columns:
+        return
+
     df = _ordered_raw_frame(df)
     for task_kind in sorted(df["task_kind"].dropna().unique()):
         task_df = df[df["task_kind"] == task_kind].copy()
