@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import importlib
+import os
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
@@ -536,7 +537,8 @@ def _load_dataset_via_frame_split(
     resolved_target: Union[str, Sequence[str]],
     as_frame: bool,
 ) -> tuple[Any, Any, List[bool], List[str]]:
-    frame, _, categorical_indicator, attribute_names = dataset.get_data(
+    frame, _, categorical_indicator, attribute_names = _get_openml_data(
+        dataset,
         target=None,
         dataset_format="dataframe",
     )
@@ -547,6 +549,58 @@ def _load_dataset_via_frame_split(
         target_name=resolved_target,
         as_frame=as_frame,
     )
+
+
+def _is_pyarrow_extension_registration_error(exc: BaseException) -> bool:
+    """Return whether ``exc`` is the Pandas/PyArrow registration conflict.
+
+    OpenML wraps the original PyArrow exception while reading a Parquet cache,
+    so inspect the full exception chain instead of depending on PyArrow being
+    importable here.
+    """
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        if (
+            "arrow.py_extension_type" in message
+            and "No type extension with name" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _get_openml_data(
+    dataset: Any,
+    *,
+    target: TargetName,
+    dataset_format: str,
+) -> tuple[Any, Any, Sequence[bool], Sequence[Any]]:
+    """Load OpenML data, retrying its Parquet cache through ARFF if needed."""
+
+    try:
+        return dataset.get_data(target=target, dataset_format=dataset_format)
+    except Exception as exc:
+        if not _is_pyarrow_extension_registration_error(exc):
+            raise
+
+        # Pandas can fail before it reads an otherwise valid Parquet file when
+        # PyArrow's legacy extension type is not registered. OpenML exposes
+        # this escape hatch; retrying via ARFF avoids the optional PyArrow path
+        # without constraining the user's installed versions.
+        previous_skip_parquet = os.environ.get("OPENML_SKIP_PARQUET")
+        os.environ["OPENML_SKIP_PARQUET"] = "true"
+        try:
+            dataset.parquet_file = None
+            return dataset.get_data(target=target, dataset_format=dataset_format)
+        finally:
+            if previous_skip_parquet is None:
+                os.environ.pop("OPENML_SKIP_PARQUET", None)
+            else:
+                os.environ["OPENML_SKIP_PARQUET"] = previous_skip_parquet
 
 
 def _resolve_dataset_id_by_name(openml: Any, name: str, version: Optional[int]) -> int:
@@ -630,7 +684,8 @@ def load_openml_dataset(
     else:
         dataset_format = "dataframe" if as_frame else "array"
         try:
-            X, y, categorical_indicator, attribute_names = dataset.get_data(
+            X, y, categorical_indicator, attribute_names = _get_openml_data(
+                dataset,
                 target=resolved_target,
                 dataset_format=dataset_format,
             )

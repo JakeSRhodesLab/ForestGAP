@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -167,6 +168,55 @@ class TestOpenMLDatasetLoading(unittest.TestCase):
         self.assertEqual(list(loaded.X.columns), ["A1", "A2"])
         self.assertEqual(list(loaded.y.astype(str)), ["setosa", "setosa"])
         self.assertEqual(loaded.feature_names, ["A1", "A2"])
+
+    def test_load_openml_dataset_retries_parquet_extension_error_with_arff(self):
+        fake_dataset = SimpleNamespace(
+            dataset_id=28,
+            name="optdigits",
+            version=1,
+            default_target_attribute="class",
+            description="digits",
+            url="https://www.openml.org/d/28",
+            row_id_attribute=None,
+            ignore_attribute=None,
+            citation=None,
+            creator=None,
+            collection_date=None,
+            language=None,
+            licence=None,
+            parquet_file="dataset_28.pq",
+        )
+        calls = []
+
+        def fake_get_data(target, dataset_format):
+            calls.append((target, dataset_format))
+            if len(calls) == 1:
+                try:
+                    raise Exception(
+                        "No type extension with name arrow.py_extension_type found"
+                    )
+                except Exception as arrow_error:
+                    raise Exception("File: dataset_28.pq") from arrow_error
+            self.assertIsNone(fake_dataset.parquet_file)
+            self.assertEqual(os.environ["OPENML_SKIP_PARQUET"], "true")
+            return [[1.0]], [0], [False], ["pixel_0"]
+
+        fake_dataset.get_data = fake_get_data
+        fake_openml = SimpleNamespace(
+            datasets=SimpleNamespace(
+                get_dataset=lambda **kwargs: fake_dataset,
+            ),
+        )
+
+        with patch.dict("forestgap.datasets.os.environ", {"OPENML_SKIP_PARQUET": "false"}):
+            with patch("forestgap.datasets._require_openml", return_value=fake_openml):
+                loaded = load_openml_dataset(dataset_id=28, as_frame=False)
+
+            self.assertEqual(os.environ["OPENML_SKIP_PARQUET"], "false")
+
+        self.assertEqual(calls, [("class", "array"), ("class", "array")])
+        self.assertEqual(loaded.X, [[1.0]])
+        self.assertEqual(loaded.y, [0])
 
     def test_load_openml_suite_loads_each_task_dataset(self):
         fake_suite = SimpleNamespace(
