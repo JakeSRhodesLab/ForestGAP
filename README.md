@@ -66,7 +66,7 @@ adapter registry. Relation names are the values accepted by `Proximity`.
 | --- | --- | --- |
 | scikit-learn random forest | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | `oob` and `rfgap` require bootstrap/OOB information. |
 | scikit-learn extra-trees forest | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | `oob` and `rfgap` require `bootstrap=True` and recoverable in-bag samples. |
-| aeon RotationForest | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | Requires the `aeon` extra; OOB/RF-GAP use aeon’s synchronized training-estimate contract. |
+| forestgap RotationForest | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | Included; native classifier/regressor use compiled rotations and support the complete relation contract. The optional aeon adapter remains compatible. |
 | treeple oblique/patch forest | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | Requires the `treeple` extra and bootstrap/in-bag support for `oob`/`rfgap`. |
 | treeple HonestForest classifier | `original`, `kerf`, `path`, `englund`, `random_height`, `honest_gap` | Requires the `treeple` extra; `honest_gap` requires fitted honesty-role indices. |
 | Canonical Correlation Forest (CCF) | `original`, `kerf`, `path`, `englund`, `random_height`; `oob`, `rfgap` | `oob`/`rfgap` apply to CCF-Bag (`bootstrap=True`) only. |
@@ -95,10 +95,13 @@ Native `CanonicalCorrelationForestClassifier` and
 OOB/RF-GAP and native OOB outputs. Their deterministic MATLAB-source
 conformance fixture is packaged.
 
-aeon RotationForest is supported through a compatibility adapter: it
-reconstructs aeon's training-estimate resampling roles for OOB/RF-GAP and
-uses the fitted rotation trees for external-query weights. This does not rely
-on an `estimators_samples_` attribute that aeon does not publish.
+`RotationForestClassifier` and `RotationForestRegressor` are standalone,
+sklearn-compatible forestgap estimators. They retain Rotation Forest's random
+feature grouping, per-group PCA sampling, and full-data tree fitting while
+compiling each tree's PCA blocks into one transform. The regressor supports
+multi-output targets natively. The optional aeon compatibility adapter remains
+available; for aeon estimators it reconstructs training-estimate resampling
+roles for OOB/RF-GAP without assuming an `estimators_samples_` attribute.
 
 RF-GAP, Honest-GAP, and conditional weights are directed. KeRF, boosted, path,
 Englund, random-height, original, and collision relations are symmetric kernels or

@@ -78,9 +78,11 @@ METHOD_REGISTRY: Mapping[str, MethodCapability] = {
         ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"),
     ),
     "rotation_forest": MethodCapability(
-        "rotation_forest", "optional", ("classification", "regression"),
-        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"), "aeon",
-        "OOB/RF-GAP require aeon's synchronized training-estimate contract.",
+        "rotation_forest", "available", ("classification", "regression"),
+        ("original", "oob", "rfgap", "kerf", "path", "englund", "random_height"), None,
+        "Native forestgap estimators and compatible aeon estimators expose the "
+        "rotation/OOB contracts required by these relations; legacy aeon "
+        "OOB/RF-GAP requires its synchronized training-estimate contract.",
     ),
     "treeple_oblique_forest": MethodCapability(
         "treeple_oblique_forest", "optional", ("classification", "regression"),
@@ -332,9 +334,14 @@ def capabilities_for(estimator: Any) -> EstimatorCapabilities:
         and len(getattr(estimator, "_pcas", ())) == len(estimators)
         and len(getattr(estimator, "_groups", ())) == len(estimators)
         and int(getattr(estimator, "_n_estimators", 0)) == len(estimators)
-        and (
-            callable(getattr(estimator, "_train_probas_for_estimator", None))
-            or callable(getattr(estimator, "_train_preds_for_estimator", None))
+        and callable(
+            getattr(
+                estimator,
+                "_train_probas_for_estimator"
+                if task == "classification"
+                else "_train_preds_for_estimator",
+                None,
+            )
         )
     )
 

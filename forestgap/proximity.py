@@ -1022,7 +1022,12 @@ class Proximity:
 
         y = self._y_train.astype(np.float64)
         result = P @ y
-        return np.asarray(result.todense()).ravel() if sparse.issparse(result) else np.asarray(result).ravel()
+        output = (
+            np.asarray(result.todense())
+            if sparse.issparse(result)
+            else np.asarray(result)
+        )
+        return output.ravel() if y.ndim == 1 else output
 
     def _impute(
         self,
@@ -2989,9 +2994,15 @@ class Proximity:
         in_bag_counts = np.zeros((n_samples, n_trees), dtype=np.float32)
 
         if _is_rotation_forest_instance(self):
-            train_estimate_fn = getattr(self, "_train_probas_for_estimator", None)
-            if not callable(train_estimate_fn):
-                train_estimate_fn = getattr(self, "_train_preds_for_estimator", None)
+            train_estimate_name = (
+                "_train_probas_for_estimator"
+                if hasattr(self.estimator, "classes_")
+                else "_train_preds_for_estimator"
+            )
+            train_estimate_fn = getattr(self, train_estimate_name, None)
+            native_rotation = bool(
+                getattr(self.estimator, "_forestgap_rotation_forest", False)
+            )
             required = (
                 X is not None,
                 y is not None,
@@ -3028,29 +3039,40 @@ class Proximity:
                 est_seed = int(rng.randint(max_int))
                 est_rng = check_random_state(est_seed)
 
-                # This call is the contract source of truth for aeon's OOB
-                # role assignment.  Reconstruct the matching bootstrap sample
-                # from the same seed, then refuse to continue if that private
-                # contract no longer agrees with the reconstructed roles.
-                with _suppress_base_validate_data_futurewarning():
-                    train_result = train_estimate_fn(
-                        transformed, y_arr, t, check_random_state(est_seed),
-                    )
-                if not isinstance(train_result, (tuple, list)) or len(train_result) != 2:
-                    raise RuntimeError(
-                        "RotationForest training-estimate function returned an unexpected result."
-                    )
-                oob_idx = np.asarray(train_result[1], dtype=np.int64)
-                if np.any((oob_idx < 0) | (oob_idx >= n_cases)):
-                    raise RuntimeError("RotationForest training-estimate returned invalid OOB indices.")
-
                 sampled = est_rng.choice(n_cases, size=n_cases, replace=True)
                 expected_oob = np.setdiff1d(np.arange(n_cases), np.unique(sampled))
-                if not np.array_equal(np.sort(oob_idx), expected_oob):
-                    raise RuntimeError(
-                        "RotationForest training-estimate resampling no longer matches "
-                        "the synchronized aeon seed contract."
-                    )
+                if native_rotation:
+                    # The native implementation owns this deterministic
+                    # protocol, so avoid aeon's expensive helper, which also
+                    # fits a surrogate tree whose predictions were discarded
+                    # here before the same tree was fitted again below.
+                    oob_idx = expected_oob
+                else:
+                    # This call is the contract source of truth for aeon's OOB
+                    # role assignment. Reconstruct the matching bootstrap
+                    # sample and reject private API drift explicitly.
+                    with _suppress_base_validate_data_futurewarning():
+                        train_result = train_estimate_fn(
+                            transformed, y_arr, t, check_random_state(est_seed),
+                        )
+                    if (
+                        not isinstance(train_result, (tuple, list))
+                        or len(train_result) != 2
+                    ):
+                        raise RuntimeError(
+                            "RotationForest training-estimate function returned an "
+                            "unexpected result."
+                        )
+                    oob_idx = np.asarray(train_result[1], dtype=np.int64)
+                    if np.any((oob_idx < 0) | (oob_idx >= n_cases)):
+                        raise RuntimeError(
+                            "RotationForest training-estimate returned invalid OOB indices."
+                        )
+                    if not np.array_equal(np.sort(oob_idx), expected_oob):
+                        raise RuntimeError(
+                            "RotationForest training-estimate resampling no longer matches "
+                            "the synchronized aeon seed contract."
+                        )
 
                 surrogate = clone(self._base_estimator)
                 if hasattr(surrogate, "random_state"):
@@ -3218,17 +3240,33 @@ class _RotationForestOOBAdapter:
                     results[oob_rows, class_to_col[label]] += probabilities[:, column]
             oob_decision = results / divisors[:, None]
             publish("oob_decision_function_", oob_decision)
-            publish("oob_score_", float(accuracy_score(y_arr, classes[np.argmax(oob_decision, axis=1)])))
+            publish(
+                "oob_score_",
+                float(
+                    accuracy_score(
+                        y_arr[valid],
+                        classes[np.argmax(oob_decision[valid], axis=1)],
+                    )
+                )
+                if np.any(valid)
+                else np.nan,
+            )
             return
 
-        results = np.zeros(len(y_arr), dtype=np.float64)
+        results = np.zeros_like(y_arr, dtype=np.float64)
         for tree_index, surrogate in enumerate(surrogate_estimators):
             oob_rows = np.flatnonzero(oob_mask[:, tree_index])
             if oob_rows.size:
                 results[oob_rows] += np.asarray(
                     surrogate.predict(transformed[tree_index][oob_rows]), dtype=np.float64,
                 )
-        oob_prediction = results / divisors
+        divisor_shape = (len(divisors),) + (1,) * (results.ndim - 1)
+        oob_prediction = results / divisors.reshape(divisor_shape)
         publish("oob_prediction_", oob_prediction)
-        publish("oob_score_", float(r2_score(y_arr, oob_prediction)))
+        publish(
+            "oob_score_",
+            float(r2_score(y_arr[valid], oob_prediction[valid]))
+            if np.any(valid)
+            else np.nan,
+        )
         return

@@ -33,6 +33,7 @@ from forestgap.applications import (
     split_conformal_regression,
 )
 from forestgap.proximity import Proximity
+from forestgap.rotation import RotationForestClassifier, RotationForestRegressor
 from forestgap.datasets import (
     OpenMLBenchmarkSuite,
     OpenMLDataset,
@@ -65,6 +66,8 @@ __all__ = [
     "Proximity",
     "CanonicalCorrelationForestClassifier",
     "CanonicalCorrelationForestRegressor",
+    "RotationForestClassifier",
+    "RotationForestRegressor",
     "ProximityKernelPredictor",
     "SyntheticNullForest",
     "UnsupportedRelationError",

@@ -37,6 +37,7 @@ from .ccf import (
 from .quantile import native_quantiles, proximity_counts
 from .survival import censoring_safe_survival_metrics, native_survival_outputs
 from .treeple import patch_treeple_regressor_tags, patch_treeple_sample_weight_signature
+from forestgap.rotation import RotationForestClassifier, RotationForestRegressor
 
 patch_treeple_regressor_tags()
 patch_treeple_sample_weight_signature()
@@ -50,6 +51,8 @@ __all__ = [
     "CCFConformance",
     "CanonicalCorrelationForestClassifier",
     "CanonicalCorrelationForestRegressor",
+    "RotationForestClassifier",
+    "RotationForestRegressor",
     "MethodCapability",
     "LightGBMAdapter",
     "SklearnGradientBoostingAdapter",

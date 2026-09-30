@@ -1,9 +1,11 @@
-"""aeon RotationForest adapters.
+"""RotationForest transformation adapters.
 
 aeon deliberately does not persist ``estimators_samples_`` for RotationForest.
 The OOB/RF-GAP adapter in :mod:`forestgap.proximity` reconstructs its private
 training-estimate resampling protocol; this module owns the public-facing
-rotation, leaf, and path transformations shared by that adapter.
+rotation, leaf, and path transformations shared by that adapter.  Forestgap's
+native implementation exposes a compiled transformation fast path while
+retaining this same relation contract.
 """
 
 from __future__ import annotations
@@ -15,7 +17,11 @@ from scipy import sparse
 
 
 def rotation_forest_transforms(estimator: Any, X: Any) -> list[np.ndarray]:
-    """Return each fitted aeon RotationForest tree's rotated feature matrix."""
+    """Return each fitted RotationForest tree's rotated feature matrix."""
+
+    transform_all = getattr(estimator, "_transform_all", None)
+    if callable(transform_all):
+        return [np.asarray(values) for values in transform_all(X)]
 
     X_proc = estimator._check_X(X)
     validate = getattr(estimator, "_validate_data", None)
